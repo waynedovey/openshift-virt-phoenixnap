@@ -1,0 +1,285 @@
+---
+- name: Set EVPN site facts
+  ansible.builtin.set_fact:
+    managed_kubeconfig: "artifacts/kubeconfigs/{{ site_item.value.cluster_name }}.kubeconfig"
+    evpn_peer_address: "{{ evpn.peers[site_item.key] }}"
+
+- name: Enable FRR and route advertisements in Cluster Network Operator
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: operator.openshift.io/v1
+      kind: Network
+      metadata:
+        name: cluster
+      spec:
+        additionalRoutingCapabilities:
+          providers:
+            - FRR
+        defaultNetwork:
+          ovnKubernetesConfig:
+            routeAdvertisements: Enabled
+            gatewayConfig:
+              routingViaHost: true
+              ipForwarding: Global
+
+- name: Install Kubernetes NMState Operator namespace
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ nmstate.namespace }}"
+
+- name: Create NMState OperatorGroup
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: operators.coreos.com/v1
+      kind: OperatorGroup
+      metadata:
+        name: openshift-nmstate
+        namespace: "{{ nmstate.namespace }}"
+      spec:
+        targetNamespaces:
+          - "{{ nmstate.namespace }}"
+
+- name: Subscribe to Kubernetes NMState Operator
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: operators.coreos.com/v1alpha1
+      kind: Subscription
+      metadata:
+        name: "{{ nmstate.subscription }}"
+        namespace: "{{ nmstate.namespace }}"
+      spec:
+        channel: "{{ nmstate.channel }}"
+        installPlanApproval: Automatic
+        name: "{{ nmstate.subscription }}"
+        source: "{{ nmstate.source }}"
+        sourceNamespace: "{{ nmstate.source_namespace }}"
+
+- name: Wait for NMState installedCSV
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: operators.coreos.com/v1alpha1
+    kind: Subscription
+    name: "{{ nmstate.subscription }}"
+    namespace: "{{ nmstate.namespace }}"
+  register: nmstate_subscription
+  until:
+    - nmstate_subscription.resources | length == 1
+    - nmstate_subscription.resources[0].status.installedCSV is defined
+  retries: "{{ (wait.operator_seconds / 15) | int }}"
+  delay: 15
+
+- name: Wait for NMState CSV to succeed
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: operators.coreos.com/v1alpha1
+    kind: ClusterServiceVersion
+    name: "{{ nmstate_subscription.resources[0].status.installedCSV }}"
+    namespace: "{{ nmstate.namespace }}"
+  register: nmstate_csv
+  until:
+    - nmstate_csv.resources | length == 1
+    - nmstate_csv.resources[0].status.phase | default('') == 'Succeeded'
+  retries: "{{ (wait.operator_seconds / 15) | int }}"
+  delay: 15
+
+- name: Create NMState singleton
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: nmstate.io/v1
+      kind: NMState
+      metadata:
+        name: nmstate
+
+- name: Wait for NMState CRD used by NNCP
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: apiextensions.k8s.io/v1
+    kind: CustomResourceDefinition
+    name: nodenetworkconfigurationpolicies.nmstate.io
+  register: nncp_crd
+  until: nncp_crd.resources | length == 1
+  retries: 60
+  delay: 10
+
+- name: Create dummy VTEP interface
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: nmstate.io/v1
+      kind: NodeNetworkConfigurationPolicy
+      metadata:
+        name: evpn-vtep
+      spec:
+        nodeSelector: {}
+        desiredState:
+          interfaces:
+            - name: evpn-vtep0
+              type: dummy
+              state: up
+              ipv4:
+                enabled: true
+                address:
+                  - ip: "{{ site_item.value.vtep_ip }}"
+                    prefix-length: 32
+                dhcp: false
+              ipv6:
+                enabled: false
+
+- name: Wait for dummy VTEP interface policy
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: nmstate.io/v1
+    kind: NodeNetworkConfigurationPolicy
+    name: evpn-vtep
+  register: nncp_status
+  until: >-
+    nncp_status.resources | length == 1 and
+    (nncp_status.resources[0].status.conditions | default([])
+      | selectattr('type', 'equalto', 'Available')
+      | selectattr('status', 'equalto', 'True')
+      | list | length) > 0
+  retries: 90
+  delay: 10
+
+- name: Create workload namespace
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ evpn.namespace }}"
+
+- name: Configure external EVPN BGP peer
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: frrk8s.metallb.io/v1beta1
+      kind: FRRConfiguration
+      metadata:
+        name: evpn-fabric
+        namespace: openshift-frr-k8s
+        labels:
+          digitaldovey.net/evpn-fabric: enabled
+      spec:
+        nodeSelector: {}
+        bgp:
+          routers:
+            - asn: "{{ site_item.value.bgp_asn }}"
+              neighbors:
+                - address: "{{ evpn_peer_address }}"
+                  asn: "{{ evpn.peer_asn }}"
+
+- name: Create unmanaged VTEP definition
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: k8s.ovn.org/v1
+      kind: VTEP
+      metadata:
+        name: evpn-vtep
+      spec:
+        mode: Unmanaged
+        cidrs:
+          - "{{ evpn.vtep_cidr }}"
+
+- name: Wait for VTEP acceptance
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: k8s.ovn.org/v1
+    kind: VTEP
+    name: evpn-vtep
+  register: vtep_status
+  until: >-
+    vtep_status.resources | length == 1 and
+    (vtep_status.resources[0].status.conditions | default([])
+      | selectattr('type', 'equalto', 'Accepted')
+      | selectattr('status', 'equalto', 'True')
+      | list | length) > 0
+  retries: 90
+  delay: 10
+
+- name: Create shared Layer2 EVPN ClusterUserDefinedNetwork
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: k8s.ovn.org/v1
+      kind: ClusterUserDefinedNetwork
+      metadata:
+        name: "{{ evpn.network_name }}"
+        labels:
+          digitaldovey.net/evpn: enabled
+      spec:
+        namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: "{{ evpn.namespace }}"
+        network:
+          topology: Layer2
+          layer2:
+            role: Primary
+            subnets:
+              - "{{ evpn.vm_subnet }}"
+          transport: EVPN
+          evpn:
+            vtep: evpn-vtep
+            macVRF:
+              vni: "{{ evpn.vni }}"
+              routeTarget: "{{ evpn.route_target }}"
+
+- name: Create RouteAdvertisements selecting FRR and EVPN CUDN labels
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: k8s.ovn.org/v1
+      kind: RouteAdvertisements
+      metadata:
+        name: evpn-vm-routes
+      spec:
+        targetVRF: auto
+        advertisements:
+          - PodNetwork
+        nodeSelector: {}
+        frrConfigurationSelector:
+          matchLabels:
+            digitaldovey.net/evpn-fabric: enabled
+        networkSelectors:
+          - networkSelectionType: ClusterUserDefinedNetworks
+            clusterUserDefinedNetworkSelector:
+              networkSelector:
+                matchLabels:
+                  digitaldovey.net/evpn: enabled
+
+- name: Wait for RouteAdvertisements acceptance
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: k8s.ovn.org/v1
+    kind: RouteAdvertisements
+    name: evpn-vm-routes
+  register: route_advertisements_status
+  until: >-
+    route_advertisements_status.resources | length == 1 and
+    (route_advertisements_status.resources[0].status.conditions | default([])
+      | selectattr('type', 'equalto', 'Accepted')
+      | selectattr('status', 'equalto', 'True')
+      | list | length) > 0
+  retries: 90
+  delay: 10

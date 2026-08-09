@@ -1,0 +1,102 @@
+---
+- name: Set managed cluster kubeconfig path
+  ansible.builtin.set_fact:
+    managed_kubeconfig: "artifacts/kubeconfigs/{{ site_item.value.cluster_name }}.kubeconfig"
+
+- name: Create OpenShift Virtualization namespace
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ virtualization.namespace }}"
+
+- name: Create OpenShift Virtualization OperatorGroup
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: operators.coreos.com/v1
+      kind: OperatorGroup
+      metadata:
+        name: kubevirt-hyperconverged-group
+        namespace: "{{ virtualization.namespace }}"
+      spec:
+        targetNamespaces:
+          - "{{ virtualization.namespace }}"
+
+- name: Subscribe to OpenShift Virtualization
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: operators.coreos.com/v1alpha1
+      kind: Subscription
+      metadata:
+        name: "{{ virtualization.subscription }}"
+        namespace: "{{ virtualization.namespace }}"
+      spec:
+        channel: "{{ virtualization.channel }}"
+        installPlanApproval: Automatic
+        name: "{{ virtualization.subscription }}"
+        source: "{{ virtualization.source }}"
+        sourceNamespace: "{{ virtualization.source_namespace }}"
+
+- name: Wait for Virtualization installedCSV
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: operators.coreos.com/v1alpha1
+    kind: Subscription
+    name: "{{ virtualization.subscription }}"
+    namespace: "{{ virtualization.namespace }}"
+  register: virt_subscription
+  until:
+    - virt_subscription.resources | length == 1
+    - virt_subscription.resources[0].status.installedCSV is defined
+  retries: "{{ (wait.operator_seconds / 15) | int }}"
+  delay: 15
+
+- name: Wait for Virtualization CSV to succeed
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: operators.coreos.com/v1alpha1
+    kind: ClusterServiceVersion
+    name: "{{ virt_subscription.resources[0].status.installedCSV }}"
+    namespace: "{{ virtualization.namespace }}"
+  register: virt_csv
+  until:
+    - virt_csv.resources | length == 1
+    - virt_csv.resources[0].status.phase | default('') == 'Succeeded'
+  retries: "{{ (wait.operator_seconds / 15) | int }}"
+  delay: 15
+
+- name: Create HyperConverged instance
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: hco.kubevirt.io/v1beta1
+      kind: HyperConverged
+      metadata:
+        name: kubevirt-hyperconverged
+        namespace: "{{ virtualization.namespace }}"
+      spec: {}
+
+- name: Wait for HyperConverged Available condition
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: hco.kubevirt.io/v1beta1
+    kind: HyperConverged
+    name: kubevirt-hyperconverged
+    namespace: "{{ virtualization.namespace }}"
+  register: hco_status
+  until: >-
+    hco_status.resources | length == 1 and
+    (hco_status.resources[0].status.conditions | default([])
+      | selectattr('type', 'equalto', 'Available')
+      | selectattr('status', 'equalto', 'True')
+      | list | length) > 0
+  retries: "{{ (wait.operator_seconds / 20) | int }}"
+  delay: 20

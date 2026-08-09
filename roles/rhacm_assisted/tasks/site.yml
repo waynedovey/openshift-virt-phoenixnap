@@ -1,0 +1,164 @@
+---
+- name: Set per-site facts
+  ansible.builtin.set_fact:
+    site_key: "{{ site_item.key }}"
+    site: "{{ site_item.value }}"
+
+- name: Create cluster namespace
+  kubernetes.core.k8s:
+    kubeconfig: "{{ rhacm.kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ site.cluster_name }}"
+
+- name: Create pull secret in cluster namespace
+  kubernetes.core.k8s:
+    kubeconfig: "{{ rhacm.kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: assisted-pull-secret
+        namespace: "{{ site.cluster_name }}"
+      type: kubernetes.io/dockerconfigjson
+      stringData:
+        .dockerconfigjson: "{{ lab_pull_secret }}"
+  no_log: true
+
+- name: Create ManagedCluster
+  kubernetes.core.k8s:
+    kubeconfig: "{{ rhacm.kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: cluster.open-cluster-management.io/v1
+      kind: ManagedCluster
+      metadata:
+        name: "{{ site.cluster_name }}"
+        labels:
+          cloud: phoenixnap
+          region: "{{ site.location | lower }}"
+          site: "{{ site_key }}"
+      spec:
+        hubAcceptsClient: true
+
+- name: Create KlusterletAddonConfig
+  kubernetes.core.k8s:
+    kubeconfig: "{{ rhacm.kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: agent.open-cluster-management.io/v1
+      kind: KlusterletAddonConfig
+      metadata:
+        name: "{{ site.cluster_name }}"
+        namespace: "{{ site.cluster_name }}"
+      spec:
+        clusterName: "{{ site.cluster_name }}"
+        clusterNamespace: "{{ site.cluster_name }}"
+        clusterLabels:
+          cloud: phoenixnap
+          site: "{{ site_key }}"
+        applicationManager:
+          enabled: true
+        certPolicyController:
+          enabled: true
+        policyController:
+          enabled: true
+        searchCollector:
+          enabled: true
+
+- name: Create AgentClusterInstall
+  kubernetes.core.k8s:
+    kubeconfig: "{{ rhacm.kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: extensions.hive.openshift.io/v1beta1
+      kind: AgentClusterInstall
+      metadata:
+        name: "{{ site.cluster_name }}"
+        namespace: "{{ site.cluster_name }}"
+      spec:
+        platformType: BareMetal
+        clusterDeploymentRef:
+          name: "{{ site.cluster_name }}"
+        imageSetRef:
+          name: "{{ ocp_imageset_name }}"
+        networking:
+          clusterNetwork:
+            - cidr: "{{ site.cluster_network }}"
+              hostPrefix: "{{ site.host_prefix }}"
+          serviceNetwork:
+            - "{{ site.service_network }}"
+          userManagedNetworking: true
+        provisionRequirements:
+          controlPlaneAgents: 1
+          workerAgents: 0
+        sshPublicKey: "{{ lab_ssh_public_key }}"
+
+- name: Create ClusterDeployment
+  kubernetes.core.k8s:
+    kubeconfig: "{{ rhacm.kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: hive.openshift.io/v1
+      kind: ClusterDeployment
+      metadata:
+        name: "{{ site.cluster_name }}"
+        namespace: "{{ site.cluster_name }}"
+      spec:
+        baseDomain: "{{ base_domain }}"
+        clusterName: "{{ site.cluster_name }}"
+        controlPlaneConfig:
+          servingCertificates: {}
+        installed: false
+        clusterInstallRef:
+          group: extensions.hive.openshift.io
+          kind: AgentClusterInstall
+          name: "{{ site.cluster_name }}"
+          version: v1beta1
+        platform:
+          agentBareMetal: {}
+        pullSecretRef:
+          name: assisted-pull-secret
+
+- name: Create InfraEnv
+  kubernetes.core.k8s:
+    kubeconfig: "{{ rhacm.kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: agent-install.openshift.io/v1beta1
+      kind: InfraEnv
+      metadata:
+        name: "{{ site.cluster_name }}"
+        namespace: "{{ site.cluster_name }}"
+      spec:
+        clusterRef:
+          name: "{{ site.cluster_name }}"
+          namespace: "{{ site.cluster_name }}"
+        pullSecretRef:
+          name: assisted-pull-secret
+        sshAuthorizedKey: "{{ lab_ssh_public_key }}"
+        cpuArchitecture: x86_64
+        ipxeScriptType: "{{ rhacm.infraenv_ipxe_script_type }}"
+        agentLabels:
+          cluster-name: "{{ site.cluster_name }}"
+
+- name: Wait for RHACM iPXE boot artifact
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ rhacm.kubeconfig }}"
+    api_version: agent-install.openshift.io/v1beta1
+    kind: InfraEnv
+    name: "{{ site.cluster_name }}"
+    namespace: "{{ site.cluster_name }}"
+  register: infraenv_info
+  until:
+    - infraenv_info.resources | length == 1
+    - infraenv_info.resources[0].status is defined
+    - infraenv_info.resources[0].status.bootArtifacts is defined
+    - infraenv_info.resources[0].status.bootArtifacts.ipxeScript is defined
+    - infraenv_info.resources[0].status.bootArtifacts.ipxeScript | length > 0
+  retries: 60
+  delay: 10

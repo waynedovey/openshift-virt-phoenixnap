@@ -1,0 +1,122 @@
+---
+- name: Read {{ site_item.key }} InfraEnv iPXE URL
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ rhacm.kubeconfig }}"
+    api_version: agent-install.openshift.io/v1beta1
+    kind: InfraEnv
+    name: "{{ site_item.value.cluster_name }}"
+    namespace: "{{ site_item.value.cluster_name }}"
+  register: site_infraenv
+
+- name: Require iPXE script URL
+  ansible.builtin.assert:
+    that:
+      - site_infraenv.resources | length == 1
+      - site_infraenv.resources[0].status.bootArtifacts.ipxeScript | default('') | length > 0
+      - site_infraenv.resources[0].status.bootArtifacts.ipxeScript | length <= 1000
+    fail_msg: "InfraEnv iPXE URL is missing or exceeds the phoenixNAP 1000-character iPXE URL limit for {{ site_item.key }}."
+
+- name: Find existing server by hostname
+  ansible.builtin.set_fact:
+    existing_site_server: >-
+      {{ (pnap_servers_existing.json
+          | selectattr('hostname', 'equalto', site_item.value.node_hostname)
+          | list | first) | default({}) }}
+
+- name: Provision hourly {{ phoenixnap.server_type }} using RHACM iPXE
+  ansible.builtin.uri:
+    url: "{{ phoenixnap.api_base }}/bmc/v1/servers"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ pnap_token }}"
+      Content-Type: application/json
+    body_format: json
+    body:
+      hostname: "{{ site_item.value.node_hostname }}"
+      description: "OpenShift {{ ocp_minor }} SNO {{ site_item.key }} - {{ project_name }}"
+      location: "{{ site_item.value.location }}"
+      os: ipxe
+      type: "{{ phoenixnap.server_type }}"
+      pricingModel: "{{ phoenixnap.pricing_model }}"
+      networkType: "{{ phoenixnap.network_type }}"
+      installDefaultSshKeys: "{{ phoenixnap.install_default_ssh_keys | bool }}"
+      osConfiguration:
+        iPXE:
+          url: "{{ site_infraenv.resources[0].status.bootArtifacts.ipxeScript }}"
+    return_content: true
+    status_code: [200, 201, 202]
+  register: site_server_create
+  when: existing_site_server | length == 0
+  no_log: true
+
+- name: Determine server ID
+  ansible.builtin.set_fact:
+    site_server_id: >-
+      {{ existing_site_server.id
+         if existing_site_server | length > 0
+         else site_server_create.json.id }}
+
+- name: Wait for public IP and powered-on state
+  ansible.builtin.uri:
+    url: "{{ phoenixnap.api_base }}/bmc/v1/servers/{{ site_server_id }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ pnap_token }}"
+    return_content: true
+    status_code: 200
+  register: site_server_info
+  until:
+    - site_server_info.json.status in ['powered-on', 'powered-off']
+    - site_server_info.json.publicIpAddresses | default([]) | length > 0
+  retries: "{{ (wait.server_seconds / 15) | int }}"
+  delay: 15
+  no_log: true
+
+- name: Wait for RHACM Agent discovered by iPXE
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ rhacm.kubeconfig }}"
+    api_version: agent-install.openshift.io/v1beta1
+    kind: Agent
+    namespace: "{{ site_item.value.cluster_name }}"
+  register: discovered_agents
+  until:
+    - discovered_agents.resources | length >= 1
+  retries: 120
+  delay: 10
+
+- name: Approve discovered Agent and assign SNO master role
+  kubernetes.core.k8s:
+    kubeconfig: "{{ rhacm.kubeconfig }}"
+    state: patched
+    api_version: agent-install.openshift.io/v1beta1
+    kind: Agent
+    name: "{{ item.metadata.name }}"
+    namespace: "{{ site_item.value.cluster_name }}"
+    definition:
+      spec:
+        approved: true
+        role: master
+  loop: "{{ discovered_agents.resources }}"
+
+- name: Create local artifact directory
+  ansible.builtin.file:
+    path: artifacts/servers
+    state: directory
+    mode: '0700'
+
+- name: Save non-secret server state
+  ansible.builtin.copy:
+    dest: "artifacts/servers/{{ site_item.key }}.yml"
+    mode: '0600'
+    content: |
+      server_id: {{ site_server_info.json.id }}
+      hostname: {{ site_server_info.json.hostname }}
+      location: {{ site_server_info.json.location }}
+      public_ip: {{ site_server_info.json.publicIpAddresses[0] }}
+      status: {{ site_server_info.json.status }}
+
+- name: Report server endpoint
+  ansible.builtin.debug:
+    msg: >-
+      {{ site_item.key }}: {{ site_server_info.json.hostname }} ->
+      {{ site_server_info.json.publicIpAddresses[0] }} ({{ site_server_info.json.status }})

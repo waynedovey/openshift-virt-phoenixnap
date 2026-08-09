@@ -1,0 +1,7 @@
+---
+- name: Configure OpenShift 4.22 BGP EVPN when external fabric is confirmed
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - role: openshift_evpn
+      when: evpn.enabled | bool

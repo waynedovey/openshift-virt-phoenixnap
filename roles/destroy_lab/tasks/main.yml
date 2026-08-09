@@ -1,0 +1,42 @@
+---
+- name: List phoenixNAP servers before teardown
+  ansible.builtin.uri:
+    url: "{{ phoenixnap.api_base }}/bmc/v1/servers"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ pnap_token }}"
+    return_content: true
+    status_code: 200
+  register: destroy_servers
+  no_log: true
+
+- name: Resolve Cloudflare zone for teardown
+  ansible.builtin.uri:
+    url: "https://api.cloudflare.com/client/v4/zones?name={{ cloudflare.zone }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ lookup('env', 'CLOUDFLARE_API_TOKEN') }}"
+    return_content: true
+    status_code: 200
+  register: destroy_cf_zone
+  when: cloudflare.enabled | bool
+  no_log: true
+
+- name: Remove site resources
+  ansible.builtin.include_tasks: site.yml
+  loop: "{{ sites | dict2items }}"
+  loop_control:
+    loop_var: site_item
+
+- name: Check project BGP ownership files
+  ansible.builtin.stat:
+    path: "artifacts/bgp/{{ item.key }}.yml"
+  loop: "{{ sites | dict2items }}"
+  register: bgp_state_files
+
+- name: Delete only BGP groups created by this repository
+  ansible.builtin.include_tasks: delete_bgp.yml
+  loop: "{{ bgp_state_files.results }}"
+  loop_control:
+    loop_var: bgp_file
+  when: bgp_file.stat.exists | bool

@@ -1,0 +1,71 @@
+---
+- name: Find {{ site_item.key }} server
+  ansible.builtin.set_fact:
+    destroy_site_server: >-
+      {{ (destroy_servers.json
+          | selectattr('hostname', 'equalto', site_item.value.node_hostname)
+          | list | first) | default({}) }}
+
+- name: Deprovision hourly server and optionally relinquish IP block
+  ansible.builtin.uri:
+    url: "{{ phoenixnap.api_base }}/bmc/v1/servers/{{ destroy_site_server.id }}/actions/deprovision"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ pnap_token }}"
+      Content-Type: application/json
+    body_format: json
+    body:
+      deleteIpBlocks: "{{ phoenixnap.delete_ip_blocks_on_destroy | bool }}"
+    status_code: [200, 202, 404]
+  when: destroy_site_server | length > 0
+  no_log: true
+
+- name: Discover matching Cloudflare records
+  ansible.builtin.uri:
+    url: "https://api.cloudflare.com/client/v4/zones/{{ destroy_cf_zone.json.result[0].id }}/dns_records?per_page=5000"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ lookup('env', 'CLOUDFLARE_API_TOKEN') }}"
+    return_content: true
+    status_code: 200
+  register: destroy_cf_records
+  when:
+    - cloudflare.enabled | bool
+    - destroy_cf_zone.json.result | length == 1
+  no_log: true
+
+- name: Delete Cloudflare records for {{ site_item.key }}
+  ansible.builtin.uri:
+    url: "https://api.cloudflare.com/client/v4/zones/{{ destroy_cf_zone.json.result[0].id }}/dns_records/{{ item.id }}"
+    method: DELETE
+    headers:
+      Authorization: "Bearer {{ lookup('env', 'CLOUDFLARE_API_TOKEN') }}"
+    status_code: [200, 204, 404]
+  loop: >-
+    {{ destroy_cf_records.json.result | default([])
+       | selectattr('name', 'in', [
+         'api.' + site_item.value.cluster_name + '.' + base_domain,
+         'api-int.' + site_item.value.cluster_name + '.' + base_domain,
+         '*.apps.' + site_item.value.cluster_name + '.' + base_domain,
+         site_item.value.node_hostname
+       ]) | list }}
+  when: cloudflare.enabled | bool
+  no_log: true
+
+- name: Delete RHACM managed cluster namespace
+  kubernetes.core.k8s:
+    kubeconfig: "{{ rhacm.kubeconfig }}"
+    api_version: v1
+    kind: Namespace
+    name: "{{ site_item.value.cluster_name }}"
+    state: absent
+    wait: false
+
+- name: Delete RHACM ManagedCluster
+  kubernetes.core.k8s:
+    kubeconfig: "{{ rhacm.kubeconfig }}"
+    api_version: cluster.open-cluster-management.io/v1
+    kind: ManagedCluster
+    name: "{{ site_item.value.cluster_name }}"
+    state: absent
+    wait: false

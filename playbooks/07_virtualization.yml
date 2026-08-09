@@ -1,0 +1,7 @@
+---
+- name: Install OpenShift Virtualization on both SNO clusters
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - role: openshift_virtualization
+      when: virtualization.enabled | bool

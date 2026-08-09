@@ -1,0 +1,105 @@
+---
+project_name: phoenixnap-ocp422-evpn
+base_domain: digitaldovey.net
+ocp_minor: "4.22"
+
+rhacm:
+  existing_hub: true
+  api: "https://api.acm.sandbox5165.opentlc.com:6443"
+  kubeconfig: "{{ lookup('env', 'RHACM_KUBECONFIG') }}"
+  # iPXE firmware often has limited HTTPS cipher support. This patches the
+  # hub-wide AgentServiceConfig to expose iPXE artifacts over HTTP.
+  enable_http_ipxe_route: true
+  infraenv_ipxe_script_type: BootOrderControl
+
+phoenixnap:
+  api_base: "https://api.phoenixnap.com"
+  auth_url: "https://auth.phoenixnap.com/auth/realms/BMC/protocol/openid-connect/token"
+  server_type: s2.c1.small
+  pricing_model: HOURLY
+  network_type: PUBLIC_ONLY
+  install_default_ssh_keys: false
+  delete_ip_blocks_on_destroy: true
+  # OCP 4.22 supports a 4-vCPU SNO minimum, while 8 vCPU is the recommended
+  # topology. This 6-core SKU is intentionally allowed but preflight warns.
+  recommended_server_type: s2.c2.small
+  bgp:
+    enabled: true
+    asn: 65401
+    advertised_routes: NONE
+
+ssh_public_key:
+  path: "{{ lookup('env', 'HOME') }}/.ssh/id_ed25519.pub"
+
+openshift_pull_secret_file: >-
+  {{ lookup('env', 'OPENSHIFT_PULL_SECRET_FILE') }}
+
+sites:
+  sw1:
+    cluster_name: sw1
+    location: PHX
+    node_hostname: sno-sw1.digitaldovey.net
+    cluster_network: 10.128.0.0/14
+    host_prefix: 23
+    service_network: 172.30.0.0/16
+    bgp_asn: 65011
+    vtep_ip: 10.255.50.11
+  c1:
+    cluster_name: c1
+    location: CHI
+    node_hostname: sno-c1.digitaldovey.net
+    cluster_network: 10.132.0.0/14
+    host_prefix: 23
+    service_network: 172.31.0.0/16
+    bgp_asn: 65021
+    vtep_ip: 10.255.50.21
+
+cloudflare:
+  enabled: true
+  zone: digitaldovey.net
+  proxied: false
+  ttl: 1
+
+dns_record_prefixes:
+  - api
+  - api-int
+  - "*.apps"
+
+virtualization:
+  enabled: true
+  namespace: openshift-cnv
+  subscription: kubevirt-hyperconverged
+  channel: stable
+  source: redhat-operators
+  source_namespace: openshift-marketplace
+
+nmstate:
+  enabled: true
+  namespace: openshift-nmstate
+  subscription: kubernetes-nmstate-operator
+  channel: stable
+  source: redhat-operators
+  source_namespace: openshift-marketplace
+
+# IMPORTANT: phoenixNAP BGP peer groups are ordinary IP BGP. They are not
+# treated here as an EVPN fabric. EVPN application is gated until the actual
+# external EVPN peer addresses are known and reachable from both SNO nodes.
+evpn:
+  enabled: true
+  apply: false
+  fabric_confirmed: false
+  namespace: evpn-vms
+  network_name: evpn-vm-net
+  vm_subnet: 10.50.50.0/24
+  vtep_cidr: 10.255.50.0/24
+  vni: 5050
+  route_target: "65000:5050"
+  peer_asn: 65000
+  peers:
+    sw1: ""
+    c1: ""
+
+wait:
+  server_seconds: 1800
+  install_seconds: 7200
+  operator_seconds: 1800

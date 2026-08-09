@@ -1,0 +1,7 @@
+---
+- name: Wait for both SNO installs and export kubeconfigs
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - role: wait_install
+    - role: export_kubeconfigs

@@ -1,0 +1,22 @@
+---
+- name: Wait for admin kubeconfig secret for {{ site_item.key }}
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ rhacm.kubeconfig }}"
+    api_version: v1
+    kind: Secret
+    name: "{{ site_item.value.cluster_name }}-admin-kubeconfig"
+    namespace: "{{ site_item.value.cluster_name }}"
+  register: admin_kubeconfig_secret
+  until:
+    - admin_kubeconfig_secret.resources | length == 1
+    - admin_kubeconfig_secret.resources[0].data.kubeconfig is defined
+  retries: 120
+  delay: 10
+  no_log: true
+
+- name: Write {{ site_item.key }} kubeconfig
+  ansible.builtin.copy:
+    dest: "artifacts/kubeconfigs/{{ site_item.value.cluster_name }}.kubeconfig"
+    mode: '0600'
+    content: "{{ admin_kubeconfig_secret.resources[0].data.kubeconfig | b64decode }}"
+  no_log: true

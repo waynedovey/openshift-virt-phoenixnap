@@ -1,0 +1,7 @@
+---
+- name: Provision phoenixNAP hourly iPXE servers
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - role: pnap_auth
+    - role: pnap_servers

@@ -1,0 +1,7 @@
+---
+- name: Show lab status
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - role: pnap_auth
+    - role: status

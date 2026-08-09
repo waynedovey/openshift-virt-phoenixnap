@@ -1,0 +1,9 @@
+---
+# Optional alternative to environment variables. Encrypt a copy with:
+#   ansible-vault encrypt inventories/lab/vault.yml
+#
+# This repository does not load vault.yml automatically. If you choose Vault,
+# reference the values from group_vars/all.yml or pass -e @... explicitly.
+pnap_client_id: ""
+pnap_client_secret: ""
+cloudflare_api_token: ""

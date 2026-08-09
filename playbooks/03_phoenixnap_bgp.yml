@@ -1,0 +1,8 @@
+---
+- name: Enable phoenixNAP BGP peer groups in both regions
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - role: pnap_auth
+    - role: pnap_bgp
+      when: phoenixnap.bgp.enabled | bool

@@ -1,0 +1,17 @@
+---
+- name: List phoenixNAP BGP peer groups
+  ansible.builtin.uri:
+    url: "{{ phoenixnap.api_base }}/networks/v1/bgp-peer-groups"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ pnap_token }}"
+    return_content: true
+    status_code: 200
+  register: pnap_bgp_groups
+  no_log: true
+
+- name: Ensure BGP peer group exists in each region
+  ansible.builtin.include_tasks: site.yml
+  loop: "{{ sites | dict2items }}"
+  loop_control:
+    loop_var: site_item

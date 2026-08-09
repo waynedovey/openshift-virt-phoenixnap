@@ -1,0 +1,57 @@
+---
+- name: Read SSH public key
+  ansible.builtin.set_fact:
+    lab_ssh_public_key: "{{ lookup('file', ssh_public_key.path) | trim }}"
+
+- name: Read Red Hat pull secret
+  ansible.builtin.set_fact:
+    lab_pull_secret: "{{ lookup('file', openshift_pull_secret_file) | trim }}"
+  no_log: true
+
+- name: Query 4.22 ClusterImageSets from hub
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ rhacm.kubeconfig }}"
+    api_version: hive.openshift.io/v1
+    kind: ClusterImageSet
+  register: image_sets
+
+- name: Find OpenShift 4.22 ClusterImageSet candidates
+  ansible.builtin.set_fact:
+    ocp_imageset_candidates: >-
+      {{ image_sets.resources
+         | selectattr('metadata.name', 'search', '4[.-]22')
+         | list }}
+
+- name: Require OpenShift 4.22 ClusterImageSet on hub
+  ansible.builtin.assert:
+    that:
+      - ocp_imageset_candidates | length > 0
+    fail_msg: >-
+      No ClusterImageSet matching OpenShift 4.22 was found on the RHACM hub.
+      Add the 4.22 ClusterImageSet before provisioning.
+
+- name: Select most recently created OpenShift 4.22 ClusterImageSet
+  ansible.builtin.set_fact:
+    ocp_imageset_name: >-
+      {{ (ocp_imageset_candidates
+          | sort(attribute='metadata.creationTimestamp')
+          | last).metadata.name }}
+
+- name: Optionally expose iPXE artifacts over HTTP on the hub
+  kubernetes.core.k8s:
+    kubeconfig: "{{ rhacm.kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: agent-install.openshift.io/v1beta1
+      kind: AgentServiceConfig
+      metadata:
+        name: agent
+      spec:
+        iPXEHTTPRoute: enabled
+  when: rhacm.enable_http_ipxe_route | bool
+
+- name: Create Host Inventory resources for each site
+  ansible.builtin.include_tasks: site.yml
+  loop: "{{ sites | dict2items }}"
+  loop_control:
+    loop_var: site_item

@@ -1,0 +1,26 @@
+---
+- name: Validate local configuration
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Validate static project settings
+      ansible.builtin.assert:
+        that:
+          - base_domain == 'digitaldovey.net'
+          - ocp_minor == '4.22'
+          - rhacm.existing_hub | bool
+          - rhacm.api | length > 0
+          - phoenixnap.server_type | length > 0
+          - sites.sw1.location == 'PHX'
+          - sites.c1.location == 'CHI'
+          - sites.sw1.cluster_network != sites.c1.cluster_network
+          - sites.sw1.service_network != sites.c1.service_network
+          - evpn.vm_subnet | length > 0
+        fail_msg: "Review inventories/lab/group_vars/all.yml."
+
+    - name: Explain EVPN safety gate
+      ansible.builtin.debug:
+        msg: >-
+          EVPN apply={{ evpn.apply }}. PhoenixNAP BGP peer groups are provisioned
+          independently. OpenShift EVPN is only applied when evpn.apply=true,
+          evpn.fabric_confirmed=true and both evpn.peers values are populated.

@@ -1,0 +1,6 @@
+---
+- name: Wait for AgentClusterInstall completion at each site
+  ansible.builtin.include_tasks: site.yml
+  loop: "{{ sites | dict2items }}"
+  loop_control:
+    loop_var: site_item
