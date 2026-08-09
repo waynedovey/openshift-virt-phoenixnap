@@ -70,34 +70,6 @@
         searchCollector:
           enabled: true
 
-- name: Create AgentClusterInstall
-  kubernetes.core.k8s:
-    kubeconfig: "{{ rhacm.kubeconfig }}"
-    state: present
-    definition:
-      apiVersion: extensions.hive.openshift.io/v1beta1
-      kind: AgentClusterInstall
-      metadata:
-        name: "{{ site.cluster_name }}"
-        namespace: "{{ site.cluster_name }}"
-      spec:
-        platformType: BareMetal
-        clusterDeploymentRef:
-          name: "{{ site.cluster_name }}"
-        imageSetRef:
-          name: "{{ ocp_imageset_name }}"
-        networking:
-          clusterNetwork:
-            - cidr: "{{ site.cluster_network }}"
-              hostPrefix: "{{ site.host_prefix }}"
-          serviceNetwork:
-            - "{{ site.service_network }}"
-          userManagedNetworking: true
-        provisionRequirements:
-          controlPlaneAgents: 1
-          workerAgents: 0
-        sshPublicKey: "{{ lab_ssh_public_key }}"
-
 - name: Create ClusterDeployment
   kubernetes.core.k8s:
     kubeconfig: "{{ rhacm.kubeconfig }}"
@@ -120,9 +92,61 @@
           name: "{{ site.cluster_name }}"
           version: v1beta1
         platform:
-          agentBareMetal: {}
+          agentBareMetal:
+            agentSelector:
+              matchLabels:
+                cluster-name: "{{ site.cluster_name }}"
         pullSecretRef:
           name: assisted-pull-secret
+
+- name: Create AgentClusterInstall
+  kubernetes.core.k8s:
+    kubeconfig: "{{ rhacm.kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: extensions.hive.openshift.io/v1beta1
+      kind: AgentClusterInstall
+      metadata:
+        name: "{{ site.cluster_name }}"
+        namespace: "{{ site.cluster_name }}"
+      spec:
+        # SNO with Assisted Installer requires userManagedNetworking=true.
+        # Current Assisted Service rejects BareMetal + userManagedNetworking=true,
+        # so use platform None for provider-neutral PhoenixNAP/iPXE SNO installs.
+        platformType: None
+        clusterDeploymentRef:
+          name: "{{ site.cluster_name }}"
+        imageSetRef:
+          name: "{{ ocp_imageset_name }}"
+        networking:
+          clusterNetwork:
+            - cidr: "{{ site.cluster_network }}"
+              hostPrefix: "{{ site.host_prefix }}"
+          serviceNetwork:
+            - "{{ site.service_network }}"
+          userManagedNetworking: true
+        provisionRequirements:
+          controlPlaneAgents: 1
+          workerAgents: 0
+        sshPublicKey: "{{ lab_ssh_public_key }}"
+
+- name: Verify AgentClusterInstall exists after creation
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ rhacm.kubeconfig }}"
+    api_version: extensions.hive.openshift.io/v1beta1
+    kind: AgentClusterInstall
+    name: "{{ site.cluster_name }}"
+    namespace: "{{ site.cluster_name }}"
+  register: aci_verify
+
+- name: Require AgentClusterInstall before creating InfraEnv
+  ansible.builtin.assert:
+    that:
+      - aci_verify.resources | length == 1
+    fail_msg: >-
+      AgentClusterInstall {{ site.cluster_name }} was not created.
+      Check ClusterDeployment {{ site.cluster_name }} and the Hive/Assisted admission webhooks
+      before waiting for InfraEnv boot artifacts.
 
 - name: Create InfraEnv
   kubernetes.core.k8s:

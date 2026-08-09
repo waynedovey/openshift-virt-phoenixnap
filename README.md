@@ -166,3 +166,32 @@ docs/                                 # design and operations notes
 ## First thing to review
 
 Open `inventories/lab/group_vars/all.yml`. The remaining unresolved design input is the **actual external EVPN peer address at each site**. Everything before EVPN can be automated now.
+
+## macOS / Python interpreter note
+
+All Make targets intentionally run Ansible from the project `.venv`. The inventory also pins
+`localhost` modules to `{{ ansible_playbook_python }}` so modules such as
+`kubernetes.core.k8s_info` execute with the same Python environment that launched Ansible.
+
+If an older checkout reports `Failed to import the required Python library (kubernetes)`, rebuild
+the project environment:
+
+```bash
+rm -rf .venv
+make bootstrap
+make preflight
+```
+
+Useful verification:
+
+```bash
+.venv/bin/ansible-playbook --version
+.venv/bin/python -c 'import kubernetes; print(kubernetes.__version__)'
+```
+
+## Troubleshooting
+
+### SNO Assisted Installer platform
+
+For these PhoenixNAP SNO clusters the `AgentClusterInstall` intentionally uses `platformType: None` with `userManagedNetworking: true`. The `ClusterDeployment` still uses `platform.agentBareMetal.agentSelector` to bind Host Inventory Agents. Do not change the ACI to `BareMetal`: current Assisted Service rejects `BareMetal + userManagedNetworking=true`, while SNO requires user-managed networking.
+
