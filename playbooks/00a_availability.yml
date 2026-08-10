@@ -1,34 +1,28 @@
 ---
-- name: Show phoenixNAP server availability for requested regions
+- name: Show phoenixNAP budget-aware live server choices
   hosts: localhost
   gather_facts: false
   roles:
     - role: pnap_auth
+    - role: pnap_select_sku
+      when: phoenixnap.auto_select.enabled | bool
   tasks:
-    - name: Query all currently available server SKUs per site
-      ansible.builtin.uri:
-        url: >-
-          {{ phoenixnap.api_base }}/billing/v1/product-availability?productCategory=SERVER&location={{ item.value.location }}&minQuantity=1&showOnlyMinQuantityAvailable=true
-        method: GET
-        headers:
-          Authorization: "Bearer {{ pnap_token }}"
-        return_content: true
-        status_code: 200
-      loop: "{{ sites | dict2items }}"
-      register: availability_by_site
-      no_log: true
-
-    - name: Display available server SKUs
+    - name: Display top budget-qualified candidates per site
       ansible.builtin.debug:
         msg: >-
-          {{ item.item.key | upper }} / {{ item.item.value.location }} available SKUs:
-          {{ item.json | map(attribute='productCode') | unique | sort | join(', ') }}
-      loop: "{{ availability_by_site.results }}"
+          {{ item.key | upper }} / {{ sites[item.key].location }} candidates under
+          ${{ '%.2f' | format(phoenixnap.auto_select.max_hourly_price | float) }}/h:
+          {% for c in item.value %}{{ c.productCode }}=${{ '%.3f' | format(c.hourlyPrice | float) }}/h
+          ({{ c.ramInGb }}GB/{{ c.cores }} cores, stock={{ c.availableQuantity }}){% if not loop.last %}; {% endif %}{% endfor %}
+      loop: "{{ pnap_sku_selection.candidates | dict2items }}"
       loop_control:
-        label: "{{ item.item.key }} / {{ item.item.value.location }}"
+        label: "{{ item.key }} / {{ sites[item.key].location }}"
+      when: phoenixnap.auto_select.enabled | bool
 
-    - name: Display configured choices
+    - name: Display final dynamic choice
       ansible.builtin.debug:
         msg: >-
-          Configured: SW1={{ sites.sw1.server_type | default(phoenixnap.server_type) }} in {{ sites.sw1.location }};
-          C1={{ sites.c1.server_type | default(phoenixnap.server_type) }} in {{ sites.c1.location }}.
+          Selected: SW1={{ pnap_selected_skus.sw1.productCode }} @ ${{ '%.3f' | format(pnap_selected_skus.sw1.hourlyPrice | float) }}/h;
+          C1={{ pnap_selected_skus.c1.productCode }} @ ${{ '%.3f' | format(pnap_selected_skus.c1.hourlyPrice | float) }}/h;
+          common SKU={{ pnap_sku_selection.commonSkuSelected }}.
+      when: phoenixnap.auto_select.enabled | bool

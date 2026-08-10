@@ -2,37 +2,52 @@
 
 GitHub-ready Ansible automation for a two-region OpenShift Virtualization lab on phoenixNAP Bare Metal Cloud.
 
-### Region-specific server types and availability
+### Dynamic server selection under $0.30/hour
 
-phoenixNAP inventory is location-specific and can change at any time. The repo now supports a different server type per site while retaining `phoenixnap.server_type` as the default.
+The lab now selects the server shape at runtime instead of hard-coding a SKU. It combines
+phoenixNAP's live product catalog, hourly pricing and live stock for PHX and CHI.
+
+Default policy:
 
 ```yaml
 phoenixnap:
-  server_type: s1.c1.medium
-
-sites:
-  sw1:
-    location: PHX
-    server_type: s1.c1.medium
-  c1:
-    location: CHI
-    server_type: s1.c1.medium
+  pricing_model: HOURLY
+  auto_select:
+    enabled: true
+    max_hourly_price: 0.30   # strict: selected price must be < $0.30/h
+    min_ram_gb: 64
+    min_cores: 6
+    preferred_ram_gb: 128
+    preferred_cores: 8
+    prefer_common_sku: true
+    require_common_sku: false
 ```
 
-Before deployment, run:
+Selection order is deliberately cost-aware:
+
+1. Must have live stock in the target region.
+2. Must use a `HOURLY` / `HOUR` pricing plan strictly below the configured cap.
+3. Must satisfy the hard RAM/core minimums.
+4. Prefer a SKU closest to the preferred 128 GB / 8-core lab target.
+5. Among equally suitable shapes, choose the lower hourly price.
+6. Prefer the same SKU in PHX and CHI. If no common SKU qualifies, select independently per site unless `require_common_sku: true`.
+
+Run:
 
 ```bash
 make availability
 make preflight
 ```
 
-`make availability` lists server product codes that the phoenixNAP Billing API currently reports as available in PHX and CHI. If the preferred SKU is out of stock in one region, change only that site's `server_type`. The automation never silently selects a more expensive fallback.
+The output shows the top qualifying choices and the selected SKU/price for each site. A concrete
+SKU can still be used by setting `phoenixnap.auto_select.enabled: false` and configuring
+`sites.<site>.server_type`.
 
 ## What it builds
 
 - **PHX / US SW1**: `sw1.digitaldovey.net`
 - **CHI / US C1**: `c1.digitaldovey.net`
-- phoenixNAP `s1.c1.medium` billed **HOURLY**
+- dynamically selected phoenixNAP server below **$0.30/hour per site**, billed **HOURLY**
 - RHACM Host Inventory / Assisted Installer `InfraEnv` per site
 - phoenixNAP iPXE boot directly from the RHACM InfraEnv boot artifact
 - OpenShift Container Platform **4.22** Single Node OpenShift at each site
@@ -46,11 +61,11 @@ make preflight
 
 ## Deliberate safety decisions
 
-### 1. `s1.c1.medium` is the requested server shape
+### 1. Server shape is selected dynamically within a hard hourly budget
 
-The project now validates `s1.c1.medium` availability in both PHX and CHI before provisioning.
-Server type is immutable in BMC, so an existing `s2.c1.small` server is never silently reused.
-Use the explicit one-time replacement workflow:
+The project selects a live SKU under the configured hourly cap and sizing policy immediately before
+provisioning. Existing incompatible servers are never silently resized or destroyed. Use the explicit
+replacement workflow when you intentionally want the selected shape to replace an existing server:
 
 ```bash
 make private-networks
@@ -256,3 +271,8 @@ Useful verification:
 
 For these PhoenixNAP SNO clusters the `AgentClusterInstall` intentionally uses `platformType: None` with `userManagedNetworking: true`. The `ClusterDeployment` still uses `platform.agentBareMetal.agentSelector` to bind Host Inventory Agents. Do not change the ACI to `BareMetal`: current Assisted Service rejects `BareMetal + userManagedNetworking=true`, while SNO requires user-managed networking.
 
+
+
+### Private VM Layer 2
+
+Each site gets a phoenixNAP private **NO-CIDR** VLAN. The OpenShift host does not consume an IP on this VLAN; NMState/OVS exposes it as an OVN Localnet secondary network for VMs. Inventory `private_l2.cidr` values are guest-addressing conventions only.

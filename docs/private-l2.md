@@ -9,8 +9,8 @@ The automation creates:
 
 | Site | phoenixNAP location | Private network | CIDR | Purpose |
 |---|---|---|---|---|
-| SW1 | PHX | `ocp-sw1-vm-l2` | `10.60.10.0/24` | site-local VM L2 |
-| C1 | CHI | `ocp-c1-vm-l2` | `10.60.20.0/24` | site-local VM L2 |
+| SW1 | PHX | `ocp-sw1-vm-l2` | `10.60.10.0/24 (guest addressing; provider VLAN is NO-CIDR)` | site-local VM L2 |
+| C1 | CHI | `ocp-c1-vm-l2` | `10.60.20.0/24 (guest addressing; provider VLAN is NO-CIDR)` | site-local VM L2 |
 
 phoenixNAP dynamically assigns the VLAN IDs. The server is attached at provisioning with
 `networkType: PUBLIC_AND_PRIVATE`, a purchased public IP block, and the site private network.
@@ -79,7 +79,7 @@ The separate EVPN design remains responsible for the portable `10.50.50.0/24` VM
 
 ```text
 PHX local private VLAN                      CHI local private VLAN
-10.60.10.0/24                               10.60.20.0/24
+10.60.10.0/24 (guest addressing; provider VLAN is NO-CIDR)                               10.60.20.0/24 (guest addressing; provider VLAN is NO-CIDR)
        |                                           |
        +--- OCP SNO --- external EVPN/VXLAN --- OCP SNO ---+
                                |
@@ -89,3 +89,8 @@ PHX local private VLAN                      CHI local private VLAN
 
 phoenixNAP standard BGP peering remains on public addresses; BMC does not support BGP peering
 over private IP addresses.
+
+
+## Pure Layer 2 provider network
+
+The phoenixNAP private networks are created with no provider CIDR (`force=true`). This is intentional. The SNO host receives no IP address on the private VLAN. OpenShift NMState creates the VLAN subinterface and OVS bridge with IPv4/IPv6 disabled, and OVN Localnet passes Layer-2 traffic to VM interfaces. The `private_l2.cidr` values in inventory are guest addressing conventions only.

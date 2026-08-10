@@ -1,0 +1,65 @@
+---
+- name: Build phoenixNAP dynamic SKU selector command
+  ansible.builtin.set_fact:
+    pnap_selector_argv: >-
+      {{
+        [
+          ansible_playbook_python,
+          role_path ~ '/../../scripts/select_pnap_sku.py',
+          '--api-base', phoenixnap.api_base,
+          '--site', 'sw1=' ~ sites.sw1.location,
+          '--site', 'c1=' ~ sites.c1.location,
+          '--max-hourly-price', phoenixnap.auto_select.max_hourly_price | string,
+          '--min-ram-gb', phoenixnap.auto_select.min_ram_gb | string,
+          '--min-cores', phoenixnap.auto_select.min_cores | string,
+          '--preferred-ram-gb', phoenixnap.auto_select.preferred_ram_gb | string,
+          '--preferred-cores', phoenixnap.auto_select.preferred_cores | string,
+          '--top', phoenixnap.auto_select.show_top_candidates | string
+        ]
+        + (['--prefer-common'] if phoenixnap.auto_select.prefer_common_sku | bool else [])
+        + (['--require-common'] if phoenixnap.auto_select.require_common_sku | bool else [])
+      }}
+  when: phoenixnap.auto_select.enabled | bool
+
+- name: Select live phoenixNAP SKUs under the hourly budget
+  ansible.builtin.command:
+    argv: "{{ pnap_selector_argv }}"
+  environment:
+    PNAP_ACCESS_TOKEN: "{{ pnap_token }}"
+  register: pnap_selector_raw
+  changed_when: false
+  failed_when: false
+  no_log: true
+  when: phoenixnap.auto_select.enabled | bool
+
+- name: Parse sanitized phoenixNAP SKU selection
+  ansible.builtin.set_fact:
+    pnap_sku_selection: "{{ pnap_selector_raw.stdout | from_json }}"
+  when: phoenixnap.auto_select.enabled | bool
+
+- name: Require a safe dynamic SKU selection
+  ansible.builtin.assert:
+    that:
+      - pnap_sku_selection.ok | bool
+      - pnap_sku_selection.sites.sw1.productCode | default('') | length > 0
+      - pnap_sku_selection.sites.c1.productCode | default('') | length > 0
+    fail_msg: "{{ pnap_sku_selection.error | default('No phoenixNAP SKU satisfied the configured budget/sizing policy.') }}"
+  when: phoenixnap.auto_select.enabled | bool
+
+- name: Publish effective selected SKUs
+  ansible.builtin.set_fact:
+    pnap_selected_skus: "{{ pnap_sku_selection.sites }}"
+  when: phoenixnap.auto_select.enabled | bool
+
+- name: Report dynamically selected server shapes
+  ansible.builtin.debug:
+    msg: >-
+      Dynamic SKU policy (< ${{ '%.2f' | format(phoenixnap.auto_select.max_hourly_price | float) }}/hour,
+      min={{ phoenixnap.auto_select.min_ram_gb }}GB/{{ phoenixnap.auto_select.min_cores }} cores,
+      preferred={{ phoenixnap.auto_select.preferred_ram_gb }}GB/{{ phoenixnap.auto_select.preferred_cores }} cores):
+      SW1={{ pnap_selected_skus.sw1.productCode }} @ ${{ '%.3f' | format(pnap_selected_skus.sw1.hourlyPrice | float) }}/h
+      ({{ pnap_selected_skus.sw1.ramInGb }}GB/{{ pnap_selected_skus.sw1.cores }} cores, stock={{ pnap_selected_skus.sw1.availableQuantity }});
+      C1={{ pnap_selected_skus.c1.productCode }} @ ${{ '%.3f' | format(pnap_selected_skus.c1.hourlyPrice | float) }}/h
+      ({{ pnap_selected_skus.c1.ramInGb }}GB/{{ pnap_selected_skus.c1.cores }} cores, stock={{ pnap_selected_skus.c1.availableQuantity }});
+      common-SKU={{ pnap_sku_selection.commonSkuSelected }}.
+  when: phoenixnap.auto_select.enabled | bool

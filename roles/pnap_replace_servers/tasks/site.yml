@@ -1,7 +1,10 @@
 ---
 - name: Set desired replacement server type for {{ site_item.key }}
   ansible.builtin.set_fact:
-    replace_site_server_type: "{{ site_item.value.server_type | default(phoenixnap.server_type) }}"
+    replace_site_server_type: >-
+      {{ pnap_selected_skus[site_item.key].productCode
+         if phoenixnap.auto_select.enabled | bool
+         else site_item.value.server_type | default(phoenixnap.server_type) }}
 
 - name: Find current {{ site_item.key }} server for replacement
   ansible.builtin.set_fact:

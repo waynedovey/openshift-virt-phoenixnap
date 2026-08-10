@@ -4,6 +4,8 @@
   gather_facts: false
   roles:
     - role: pnap_auth
+    - role: pnap_select_sku
+      when: phoenixnap.auto_select.enabled | bool
   tasks:
     - name: Require secret environment variables and files
       ansible.builtin.assert:
@@ -40,26 +42,53 @@
         return_content: true
         status_code: 200
       loop: "{{ sites | dict2items }}"
-      register: pnap_site_availability
+      register: pnap_site_availability_raw
       no_log: true
+      when: not (phoenixnap.auto_select.enabled | bool)
+
+    - name: Build sanitized requested-SKU availability map
+      ansible.builtin.set_fact:
+        pnap_site_availability: >-
+          {{ pnap_site_availability | default({}) | combine({
+            item.item.key: {
+              'server_type': item.item.value.server_type | default(phoenixnap.server_type),
+              'location': item.item.value.location,
+              'available': (
+                item.json | default([])
+                | selectattr('productCode', 'equalto', item.item.value.server_type | default(phoenixnap.server_type))
+                | map(attribute='locationAvailabilityDetails') | list | flatten
+                | selectattr('location', 'equalto', item.item.value.location)
+                | selectattr('minQuantityAvailable', 'equalto', true)
+                | list | length > 0
+              ),
+              'available_quantity': (
+                item.json | default([])
+                | selectattr('productCode', 'equalto', item.item.value.server_type | default(phoenixnap.server_type))
+                | map(attribute='locationAvailabilityDetails') | list | flatten
+                | selectattr('location', 'equalto', item.item.value.location)
+                | map(attribute='availableQuantity') | list | first | default(0)
+              )
+            }
+          }) }}
+      loop: "{{ pnap_site_availability_raw.results }}"
+      loop_control:
+        label: "{{ item.item.key }}"
+      no_log: true
+      when: not (phoenixnap.auto_select.enabled | bool)
 
     - name: Require requested SKU in each region
       ansible.builtin.assert:
         that:
-          - >-
-            (item.json | default([])
-            | selectattr('productCode', 'equalto', item.item.value.server_type | default(phoenixnap.server_type))
-            | map(attribute='locationAvailabilityDetails') | list | flatten
-            | selectattr('location', 'equalto', item.item.value.location)
-            | selectattr('minQuantityAvailable', 'equalto', true)
-            | list | length) > 0
+          - pnap_site_availability[item.key].available | bool
         fail_msg: >-
-          {{ item.item.value.server_type | default(phoenixnap.server_type) }} is not currently available in
-          {{ item.item.value.location }} for {{ item.item.key }}. Run `make availability` to list currently
-          available server SKUs, then set sites.{{ item.item.key }}.server_type to an approved alternative.
-      loop: "{{ pnap_site_availability.results }}"
+          {{ item.value.server_type | default(phoenixnap.server_type) }} is not currently available in
+          {{ item.value.location }} for {{ item.key }} (availableQuantity={{ pnap_site_availability[item.key].available_quantity }}).
+          Run `make availability` to list SKUs with actual live stock, then set sites.{{ item.key }}.server_type
+          to an approved alternative.
+      loop: "{{ sites | dict2items }}"
       loop_control:
-        label: "{{ item.item.key }}={{ item.item.value.server_type | default(phoenixnap.server_type) }}@{{ item.item.value.location }}"
+        label: "{{ item.key }}={{ item.value.server_type | default(phoenixnap.server_type) }}@{{ item.value.location }}"
+      when: not (phoenixnap.auto_select.enabled | bool)
 
     - name: Display requested OpenShift Virtualization server shapes
       ansible.builtin.debug:
@@ -67,6 +96,15 @@
           Requested server types are available: SW1={{ sites.sw1.server_type | default(phoenixnap.server_type) }} in {{ sites.sw1.location }},
           C1={{ sites.c1.server_type | default(phoenixnap.server_type) }} in {{ sites.c1.location }}. Servers are
           provisioned HOURLY with explicit public management plus a site-local phoenixNAP private Layer2 VLAN.
+      when: not (phoenixnap.auto_select.enabled | bool)
+
+    - name: Display dynamically selected OpenShift Virtualization server shapes
+      ansible.builtin.debug:
+        msg: >-
+          Dynamic selection passed: SW1={{ pnap_selected_skus.sw1.productCode }} (${{ '%.3f' | format(pnap_selected_skus.sw1.hourlyPrice | float) }}/h) in {{ sites.sw1.location }},
+          C1={{ pnap_selected_skus.c1.productCode }} (${{ '%.3f' | format(pnap_selected_skus.c1.hourlyPrice | float) }}/h) in {{ sites.c1.location }}.
+          Both are below the strict ${{ '%.2f' | format(phoenixnap.auto_select.max_hourly_price | float) }}/h per-server cap.
+      when: phoenixnap.auto_select.enabled | bool
 
     - name: Verify RHACM hub access
       kubernetes.core.k8s_info:

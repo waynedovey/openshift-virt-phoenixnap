@@ -1,7 +1,10 @@
 ---
 - name: Set desired server type for {{ site_item.key }}
   ansible.builtin.set_fact:
-    site_server_type: "{{ site_item.value.server_type | default(phoenixnap.server_type) }}"
+    site_server_type: >-
+      {{ pnap_selected_skus[site_item.key].productCode
+         if phoenixnap.auto_select.enabled | bool
+         else site_item.value.server_type | default(phoenixnap.server_type) }}
 
 - name: Read {{ site_item.key }} InfraEnv iPXE URL
   kubernetes.core.k8s_info:
@@ -99,10 +102,9 @@
         privateNetworkConfiguration:
           configurationType: USER_DEFINED
           privateNetworks:
+            # Pure L2 NO-CIDR network: do not assign an IP to the OpenShift host.
+            # The spare NIC/VLAN is bridged later and guest VMs own their addressing.
             - id: "{{ site_private_network.id }}"
-              ips:
-                - "{{ site_item.value.private_l2.server_ip }}"
-              dhcp: false
       osConfiguration:
         iPXE:
           url: "{{ site_infraenv.resources[0].status.bootArtifacts.ipxeScript }}"
@@ -190,7 +192,8 @@
       public_ip: {{ site_server_info.json.publicIpAddresses[0] }}
       private_l2_network_id: {{ site_private_network.id }}
       private_l2_vlan_id: {{ site_private_network.vlanId }}
-      private_l2_server_ip: {{ site_item.value.private_l2.server_ip }}
+      private_l2_host_ip: none
+      private_l2_guest_cidr: {{ site_item.value.private_l2.cidr }}
       status: {{ site_server_info.json.status }}
 
 - name: Report server endpoint
@@ -198,5 +201,6 @@
     msg: >-
       {{ site_item.key }}: {{ site_server_info.json.hostname }} ->
       public={{ site_server_info.json.publicIpAddresses[0] }},
-      private-L2={{ site_item.value.private_l2.server_ip }}/VLAN{{ site_private_network.vlanId }}
+      private-L2=NO-CIDR/VLAN{{ site_private_network.vlanId }},
+      guest-CIDR={{ site_item.value.private_l2.cidr }}
       ({{ site_server_info.json.status }})

@@ -68,9 +68,10 @@
 - name: Show site-local private Layer2 network state
   ansible.builtin.debug:
     msg: >-
-      {{ item.key }}: requested server={{ phoenixnap.server_type }},
+      {{ item.key }}: server={{ ((status_servers.json | selectattr('hostname', 'equalto', item.value.node_hostname) | list | first).type) | default('not-created') }},
+      selection-mode={{ 'auto' if phoenixnap.auto_select.enabled | bool else 'static' }},
       private-L2={{ item.value.private_l2.name }},
-      CIDR={{ item.value.private_l2.cidr }},
+      provider-CIDR=none, guest-CIDR={{ item.value.private_l2.cidr }},
       VLAN={{ ((status_private_networks.json
         | selectattr('name', 'equalto', item.value.private_l2.name)
         | selectattr('location', 'equalto', item.value.location)

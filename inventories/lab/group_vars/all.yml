@@ -15,9 +15,26 @@ rhacm:
 phoenixnap:
   api_base: "https://api.phoenixnap.com"
   auth_url: "https://auth.phoenixnap.com/auth/realms/BMC/protocol/openid-connect/token"
-  # Default server type. Each site can override this independently.
-  server_type: s1.c1.medium
+  # Static fallback only. With auto_select.enabled=true, the selector chooses
+  # a live in-stock SKU per site under the hourly budget before provisioning.
+  server_type: auto
   pricing_model: HOURLY
+  auto_select:
+    enabled: true
+    # Strictly less than this amount per server, per hour. Pricing is read live
+    # from the phoenixNAP Billing /products endpoint at execution time.
+    max_hourly_price: 0.30
+    # Hard minimum for this OpenShift Virtualization lab.
+    min_ram_gb: 64
+    min_cores: 6
+    # Prefer a shape around this size, then choose the cheapest qualifying SKU.
+    preferred_ram_gb: 128
+    preferred_cores: 8
+    # Same SKU in PHX and CHI is preferred for a clean two-site comparison.
+    # If none exists, select the best valid SKU independently at each site.
+    prefer_common_sku: true
+    require_common_sku: false
+    show_top_candidates: 8
   # Public management/iPXE plus an explicit site-local private L2 VLAN.
   # The private network list itself is USER_DEFINED in networkConfiguration.
   network_type: PUBLIC_AND_PRIVATE
@@ -41,8 +58,8 @@ openshift_pull_secret_file: >-
 sites:
   sw1:
     cluster_name: sw1
-    # Override per site when a SKU is temporarily unavailable in a location.
-    server_type: s1.c1.medium
+    # Set a concrete SKU only when auto_select.enabled=false.
+    server_type: auto
     location: PHX
     node_hostname: sno-sw1.digitaldovey.net
     cluster_network: 10.128.0.0/14
@@ -52,14 +69,14 @@ sites:
     vtep_ip: 10.255.50.11
     private_l2:
       name: ocp-sw1-vm-l2
+      # Guest VM addressing only. phoenixNAP VLAN itself is created NO-CIDR.
       cidr: 10.60.10.0/24
-      server_ip: 10.60.10.10
       # auto = choose an UP Ethernet NIC that is not carrying the default route.
       # Set explicitly if your SNO interface naming differs.
       uplink_interface: auto
   c1:
     cluster_name: c1
-    server_type: s1.c1.medium
+    server_type: auto
     location: CHI
     node_hostname: sno-c1.digitaldovey.net
     cluster_network: 10.132.0.0/14
@@ -69,8 +86,8 @@ sites:
     vtep_ip: 10.255.50.21
     private_l2:
       name: ocp-c1-vm-l2
+      # Guest VM addressing only. phoenixNAP VLAN itself is created NO-CIDR.
       cidr: 10.60.20.0/24
-      server_ip: 10.60.20.10
       uplink_interface: auto
 
 cloudflare:

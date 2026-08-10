@@ -10,8 +10,10 @@
           - ocp_minor == '4.22'
           - rhacm.existing_hub | bool
           - rhacm.api | length > 0
-          - (sites.sw1.server_type | default(phoenixnap.server_type)) | length > 0
-          - (sites.c1.server_type | default(phoenixnap.server_type)) | length > 0
+          - phoenixnap.auto_select.max_hourly_price | float > 0
+          - phoenixnap.auto_select.max_hourly_price | float <= 0.30
+          - phoenixnap.auto_select.min_ram_gb | int >= 32
+          - phoenixnap.auto_select.min_cores | int >= 4
           - phoenixnap.network_type == 'PUBLIC_AND_PRIVATE'
           - sites.sw1.location == 'PHX'
           - sites.c1.location == 'CHI'

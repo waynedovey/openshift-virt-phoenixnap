@@ -1,3 +1,22 @@
+## 1.2.1
+
+- Create phoenixNAP VM transport networks as pure Layer-2 NO-CIDR private VLANs using `force=true`.
+- Do not assign a private IP to the SNO host; the secondary NIC/VLAN remains unnumbered and is bridged to OVN Localnet for VMs.
+- Preserve `private_l2.cidr` only as a guest VM addressing convention.
+- Surface phoenixNAP private-network validation errors without exposing OAuth headers/tokens.
+
+# Changelog
+
+## 1.2.0
+
+- Added live phoenixNAP SKU selection from Billing `/products` plus `/product-availability`.
+- Enforced a strict `< $0.30/hour` per-server budget by default.
+- Added hard 64 GB RAM / 6-core minimums and preferred 128 GB / 8-core sizing.
+- Prefer the same qualifying SKU in PHX and CHI, with per-site fallback when a common SKU is unavailable.
+- `make availability` now shows only budget- and sizing-qualified live candidates with price, RAM, cores and stock.
+- Provision and explicit replacement workflows use the dynamic selection automatically.
+- Selector output is sanitized and never prints the phoenixNAP bearer token.
+
 ## 1.1.1
 
 - Add per-site phoenixNAP server type overrides.
@@ -37,3 +56,8 @@
 - Set localhost `ansible_python_interpreter` to `{{ ansible_playbook_python }}`.
 - Make `bootstrap` verify the Kubernetes Python client is importable.
 - Add `clean-venv` and macOS interpreter troubleshooting guidance.
+
+## 1.1.2
+- Fixed `make availability` so it filters on live `minQuantityAvailable` / `availableQuantity`, rather than listing catalog SKUs with zero stock.
+- Added a common-live-SKU intersection for PHX and CHI.
+- Sanitized preflight availability assertions so failed checks no longer dump phoenixNAP OAuth Bearer tokens.
