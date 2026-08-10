@@ -1,0 +1,187 @@
+---
+project_name: phoenixnap-ocp422-evpn
+base_domain: digitaldovey.net
+ocp_minor: "4.22"
+
+rhacm:
+  existing_hub: true
+  api: "https://api.acm.sandbox5165.opentlc.com:6443"
+  kubeconfig: "{{ lookup('env', 'RHACM_KUBECONFIG') }}"
+  # iPXE firmware often has limited HTTPS cipher support. This patches the
+  # hub-wide AgentServiceConfig to expose iPXE artifacts over HTTP.
+  enable_http_ipxe_route: true
+  infraenv_ipxe_script_type: BootOrderControl
+  # The OpenTLC ingress path truncates the ~1.2 GiB Assisted Image Service
+  # rootfs stream. Append the authoritative AgentServiceConfig rootFSUrl as
+  # a later kernel argument so dracut fetches the large image directly.
+  direct_rootfs:
+    enabled: true
+  # Explicit NTP sources for discovery. DHCP/NTP is unreliable on the raw
+  # dual-NIC iPXE network until the phoenixNAP bond is established.
+  additional_ntp_sources:
+    - time.google.com
+    - time.cloudflare.com
+
+phoenixnap:
+  api_base: "https://api.phoenixnap.com"
+  auth_url: "https://auth.phoenixnap.com/auth/realms/BMC/protocol/openid-connect/token"
+  # Static fallback only. With auto_select.enabled=true, the selector chooses
+  # a live in-stock SKU per site under the hourly budget before provisioning.
+  server_type: auto
+  pricing_model: HOURLY
+  auto_select:
+    enabled: true
+    # Strictly less than this amount per server, per hour. Pricing is read live
+    # from the phoenixNAP Billing /products endpoint at execution time.
+    max_hourly_price: 0.30
+    # Hard minimum for this OpenShift Virtualization lab.
+    min_ram_gb: 64
+    min_cores: 6
+    # Prefer a shape around this size, then choose the cheapest qualifying SKU.
+    preferred_ram_gb: 128
+    preferred_cores: 8
+    # Same SKU across both iPXE-capable sites is preferred for a clean
+    # two-site comparison. If none exists, select the best valid SKU per site.
+    prefer_common_sku: true
+    require_common_sku: false
+    show_top_candidates: 8
+  # phoenixNAP currently supports custom iPXE provisioning only in these
+  # locations. Keep this explicit so unsupported sites fail before provisioning.
+  ipxe_supported_locations:
+    - PHX
+    - ASH
+    - NLD
+  # Public management/iPXE plus an explicit site-local private L2 VLAN.
+  # The private network list itself is USER_DEFINED in networkConfiguration.
+  network_type: PUBLIC_AND_PRIVATE
+  install_default_ssh_keys: false
+  # phoenixNAP iPXE presents two physical data NICs. During the first discovery
+  # both can obtain the same native-VLAN DHCP address, which Assisted Installer
+  # rejects as overlapping. Build the provider-recommended LACP bond from the
+  # discovered MAC addresses, clone the active NIC MAC for DHCP, then reboot iPXE.
+  ipxe_network:
+    configure_lacp_bond: true
+    bond_name: bond0
+    bond_mode: 802.3ad
+    mtu: 1500
+    miimon: 100
+    lacp_rate: fast
+    xmit_hash_policy: layer3+4
+    updelay: 200
+    downdelay: 200
+  delete_ip_blocks_on_destroy: true
+  delete_private_networks_on_destroy: false
+  # Server type cannot be resized in place. Existing mismatched servers are
+  # never silently destroyed; use `make replace-servers` explicitly.
+  fail_on_existing_server_mismatch: true
+  bgp:
+    enabled: true
+    asn: 65401
+    advertised_routes: NONE
+
+ssh_public_key:
+  path: "{{ lookup('env', 'HOME') }}/.ssh/id_ed25519.pub"
+
+openshift_pull_secret_file: >-
+  {{ lookup('env', 'OPENSHIFT_PULL_SECRET_FILE') }}
+
+sites:
+  sw1:
+    cluster_name: sw1
+    # Set a concrete SKU only when auto_select.enabled=false.
+    server_type: auto
+    location: PHX
+    node_hostname: sno-sw1.digitaldovey.net
+    cluster_network: 10.128.0.0/14
+    host_prefix: 23
+    service_network: 172.30.0.0/16
+    bgp_asn: 65011
+    vtep_ip: 10.255.50.11
+    private_l2:
+      name: ocp-sw1-vm-l2
+      # Guest VM addressing only. phoenixNAP VLAN itself is created NO-CIDR.
+      cidr: 10.60.10.0/24
+      # Private VLAN is trunked over the phoenixNAP dual-NIC LACP bond.
+      uplink_interface: bond0
+  c1:
+    cluster_name: c1
+    server_type: auto
+    location: ASH
+    node_hostname: sno-c1.digitaldovey.net
+    cluster_network: 10.132.0.0/14
+    host_prefix: 23
+    service_network: 172.31.0.0/16
+    bgp_asn: 65021
+    vtep_ip: 10.255.50.21
+    private_l2:
+      name: ocp-c1-ash-vm-l2
+      # Guest VM addressing only. phoenixNAP VLAN itself is created NO-CIDR.
+      cidr: 10.60.20.0/24
+      uplink_interface: bond0
+
+cloudflare:
+  enabled: true
+  zone: digitaldovey.net
+  proxied: false
+  ttl: 1
+
+dns_record_prefixes:
+  - api
+  - api-int
+  - "*.apps"
+
+virtualization:
+  enabled: true
+  namespace: openshift-cnv
+  subscription: kubevirt-hyperconverged
+  channel: stable
+  source: redhat-operators
+  source_namespace: openshift-marketplace
+
+nmstate:
+  enabled: true
+  namespace: openshift-nmstate
+  subscription: kubernetes-nmstate-operator
+  channel: stable
+  source: redhat-operators
+  source_namespace: openshift-marketplace
+
+# Site-local physical/L2 VM access. phoenixNAP assigns a private VLAN in each
+# region. The SNO exposes that VLAN through an OVN-Kubernetes Localnet CUDN.
+# These two VLANs are NOT a cross-region L2 stretch.
+vm_l2:
+  enabled: true
+  apply: true
+  namespace: vm-workloads
+  network_name: pnap-vm-localnet
+  physical_network_name: pnap-vm-l2
+  bridge_name: br-pnap-vm
+  namespace_label_key: digitaldovey.net/vm-l2
+  namespace_label_value: "true"
+  # The tagged private VLAN intentionally rides the same LACP bond as the
+  # native/public management VLAN; it is isolated by 802.1Q tagging.
+  require_non_management_interface: false
+
+# IMPORTANT: phoenixNAP BGP peer groups are ordinary IP BGP. They are not
+# treated here as an EVPN fabric. EVPN application is gated until the actual
+# external EVPN peer addresses are known and reachable from both SNO nodes.
+evpn:
+  enabled: true
+  apply: false
+  fabric_confirmed: false
+  namespace: evpn-vms
+  network_name: evpn-vm-net
+  vm_subnet: 10.50.50.0/24
+  vtep_cidr: 10.255.50.0/24
+  vni: 5050
+  route_target: "65000:5050"
+  peer_asn: 65000
+  peers:
+    sw1: ""
+    c1: ""
+
+wait:
+  server_seconds: 1800
+  network_seconds: 900
+  install_seconds: 7200
+  operator_seconds: 1800

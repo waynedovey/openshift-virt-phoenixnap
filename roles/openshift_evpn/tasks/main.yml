@@ -1,0 +1,27 @@
+---
+- name: Explain staged EVPN configuration
+  ansible.builtin.debug:
+    msg: >-
+      OpenShift EVPN is staged but not applied. Set evpn.apply=true only after
+      an external BGP EVPN fabric exists between the configured phoenixNAP sites; then set
+      evpn.fabric_confirmed=true and populate evpn.peers.sw1/c1.
+  when: not evpn.apply | bool
+
+- name: Validate external EVPN fabric inputs
+  ansible.builtin.assert:
+    that:
+      - evpn.fabric_confirmed | bool
+      - evpn.peers.sw1 | length > 0
+      - evpn.peers.c1 | length > 0
+      - evpn.peer_asn | int > 0
+    fail_msg: >-
+      Refusing to configure OpenShift EVPN without confirmed external EVPN peers.
+      PhoenixNAP standard BGP peer groups alone are not treated as EVPN transport.
+  when: evpn.apply | bool
+
+- name: Configure EVPN per managed cluster
+  ansible.builtin.include_tasks: site.yml
+  loop: "{{ sites | dict2items }}"
+  loop_control:
+    loop_var: site_item
+  when: evpn.apply | bool

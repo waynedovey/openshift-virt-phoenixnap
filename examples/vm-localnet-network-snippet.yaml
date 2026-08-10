@@ -1,0 +1,19 @@
+# Add these interface/network entries to a VM in namespace vm-workloads.
+# The guest OS must configure an address from the site's private subnet
+# (SW1 10.60.10.0/24 or C1 10.60.20.0/24) or use external DHCP/IPAM.
+spec:
+  template:
+    spec:
+      domain:
+        devices:
+          interfaces:
+            - name: default
+              masquerade: {}
+            - name: site-private-l2
+              bridge: {}
+      networks:
+        - name: default
+          pod: {}
+        - name: site-private-l2
+          multus:
+            networkName: pnap-vm-localnet

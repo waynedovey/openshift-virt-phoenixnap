@@ -1,0 +1,136 @@
+---
+- name: Find existing {{ site_item.key }} private L2 network
+  ansible.builtin.set_fact:
+    existing_private_network: >-
+      {{ (pnap_private_networks_state
+          | selectattr('name', 'equalto', site_item.value.private_l2.name)
+          | selectattr('location', 'equalto', site_item.value.location)
+          | list | first) | default({}) }}
+
+- name: Determine whether this location already has a private network
+  ansible.builtin.set_fact:
+    location_private_networks: >-
+      {{ pnap_private_networks_state
+         | selectattr('location', 'equalto', site_item.value.location)
+         | list }}
+    site_location_default_required: >-
+      {{ (pnap_private_networks_state
+          | selectattr('location', 'equalto', site_item.value.location)
+          | list
+          | length) == 0 }}
+
+- name: Require an existing lab network to be a pure Layer2 NO-CIDR network
+  ansible.builtin.assert:
+    that:
+      - existing_private_network.cidr | default('') | length == 0
+    fail_msg: >-
+      Existing private network {{ site_item.value.private_l2.name }} in
+      {{ site_item.value.location }} has provider CIDR {{ existing_private_network.cidr | default('unknown') }}.
+      This lab now uses a NO-CIDR phoenixNAP private VLAN so OpenShift/VMs own the guest addressing.
+      Remove or rename the old network before continuing.
+  when: existing_private_network | length > 0
+
+- name: Create {{ site_item.key }} pure Layer2 NO-CIDR private network
+  ansible.builtin.uri:
+    url: "{{ phoenixnap.api_base }}/networks/v1/private-networks?force=true"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ pnap_token }}"
+      Content-Type: application/json
+    body_format: json
+    body:
+      name: "{{ site_item.value.private_l2.name }}"
+      description: "{{ project_name }} OpenShift Virtualization site-local L2 - {{ site_item.key }}"
+      location: "{{ site_item.value.location }}"
+      # phoenixNAP requires the first owned private network in each location
+      # to be marked as that location's default network. Later networks stay non-default.
+      locationDefault: "{{ site_location_default_required | bool }}"
+    return_content: true
+    status_code: [200, 201, 202, 400, 409]
+  register: private_network_create
+  when: existing_private_network | length == 0
+  no_log: true
+
+- name: Add newly created network to in-play private-network state
+  ansible.builtin.set_fact:
+    pnap_private_networks_state: "{{ pnap_private_networks_state + [private_network_create.json] }}"
+  when:
+    - existing_private_network | length == 0
+    - (private_network_create.status | int) in [200, 201, 202]
+
+- name: Publish sanitized private-network API error
+  ansible.builtin.set_fact:
+    private_network_create_error: >-
+      {{ private_network_create.json.message | default('phoenixNAP rejected the private network request') }}
+      {{ private_network_create.json.validationErrors | default([]) | to_json }}
+  when:
+    - existing_private_network | length == 0
+    - (private_network_create.status | int) not in [200, 201, 202]
+
+- name: Require private Layer2 network creation to succeed
+  ansible.builtin.assert:
+    that:
+      - existing_private_network | length > 0 or (private_network_create.status | int) in [200, 201, 202]
+    fail_msg: >-
+      phoenixNAP could not create {{ site_item.key }} NO-CIDR private L2 network in
+      {{ site_item.value.location }}: {{ private_network_create_error | default('unknown API error') }}.
+      The OAuth token and request headers remain hidden.
+
+- name: Determine private network ID
+  ansible.builtin.set_fact:
+    private_network_id: >-
+      {{ existing_private_network.id
+         if existing_private_network | length > 0
+         else private_network_create.json.id }}
+
+- name: Wait for private network VLAN allocation
+  ansible.builtin.uri:
+    url: "{{ phoenixnap.api_base }}/networks/v1/private-networks/{{ private_network_id }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ pnap_token }}"
+    return_content: true
+    status_code: 200
+  register: private_network_info
+  until:
+    - private_network_info.json.id | default('') | length > 0
+    - private_network_info.json.vlanId is defined
+    - private_network_info.json.status | default('READY') == 'READY'
+  retries: "{{ (wait.network_seconds / 10) | int }}"
+  delay: 10
+  no_log: true
+
+- name: Require phoenixNAP network to remain NO-CIDR
+  ansible.builtin.assert:
+    that:
+      - private_network_info.json.cidr | default('') | length == 0
+    fail_msg: >-
+      {{ site_item.key }} private network unexpectedly has CIDR
+      {{ private_network_info.json.cidr | default('unknown') }}; expected a pure Layer2 NO-CIDR VLAN.
+
+- name: Create local private-network state directory
+  ansible.builtin.file:
+    path: artifacts/networks
+    state: directory
+    mode: '0700'
+
+- name: Save site-local private network state
+  ansible.builtin.copy:
+    dest: "artifacts/networks/{{ site_item.key }}.yml"
+    mode: '0600'
+    content: |
+      network_id: {{ private_network_info.json.id }}
+      name: {{ private_network_info.json.name }}
+      location: {{ private_network_info.json.location }}
+      provider_cidr: none
+      guest_cidr: {{ site_item.value.private_l2.cidr }}
+      vlan_id: {{ private_network_info.json.vlanId }}
+      location_default: {{ private_network_info.json.locationDefault | default(site_location_default_required | bool) }}
+
+- name: Report private Layer2 network
+  ansible.builtin.debug:
+    msg: >-
+      {{ site_item.key }} private L2: {{ private_network_info.json.name }}
+      provider-CIDR=none, guest-CIDR={{ site_item.value.private_l2.cidr }},
+      VLAN={{ private_network_info.json.vlanId }},
+      location-default={{ private_network_info.json.locationDefault | default(site_location_default_required | bool) }}.

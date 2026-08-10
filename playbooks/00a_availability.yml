@@ -1,0 +1,43 @@
+---
+- name: Show phoenixNAP budget-aware live server choices
+  hosts: localhost
+  gather_facts: false
+  vars:
+    # Availability is an explicit capacity-planning command, so always query
+    # live stock even when the configured lab servers already exist.
+    pnap_sku_force_live_selection: true
+  pre_tasks:
+    - name: Require phoenixNAP iPXE-capable site locations
+      ansible.builtin.assert:
+        that:
+          - item.value.location in phoenixnap.ipxe_supported_locations
+        fail_msg: >-
+          {{ item.key }} uses {{ item.value.location }}, but phoenixNAP custom iPXE
+          provisioning is supported only in {{ phoenixnap.ipxe_supported_locations | join(', ') }}.
+      loop: "{{ sites | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}@{{ item.value.location }}"
+  roles:
+    - role: pnap_auth
+    - role: pnap_select_sku
+      when: phoenixnap.auto_select.enabled | bool
+  tasks:
+    - name: Display top budget-qualified candidates per site
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.key | upper }} / {{ sites[item.key].location }} candidates under
+          ${{ '%.2f' | format(phoenixnap.auto_select.max_hourly_price | float) }}/h:
+          {% for c in item.value %}{{ c.productCode }}=${{ '%.3f' | format(c.hourlyPrice | float) }}/h
+          ({{ c.ramInGb }}GB/{{ c.cores }} cores, stock={{ c.availableQuantity }}){% if not loop.last %}; {% endif %}{% endfor %}
+      loop: "{{ pnap_sku_selection.candidates | dict2items }}"
+      loop_control:
+        label: "{{ item.key }} / {{ sites[item.key].location }}"
+      when: phoenixnap.auto_select.enabled | bool
+
+    - name: Display final dynamic choice
+      ansible.builtin.debug:
+        msg: >-
+          Selected: SW1={{ pnap_selected_skus.sw1.productCode }} @ ${{ '%.3f' | format(pnap_selected_skus.sw1.hourlyPrice | float) }}/h;
+          C1={{ pnap_selected_skus.c1.productCode }} @ ${{ '%.3f' | format(pnap_selected_skus.c1.hourlyPrice | float) }}/h;
+          common SKU={{ pnap_sku_selection.commonSkuSelected }}.
+      when: phoenixnap.auto_select.enabled | bool

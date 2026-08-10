@@ -1,0 +1,145 @@
+---
+- name: Require iPXE-capable locations before selecting server SKUs
+  ansible.builtin.assert:
+    that:
+      - item.value.location in phoenixnap.ipxe_supported_locations
+    fail_msg: >-
+      {{ item.key }} location {{ item.value.location }} cannot provision os=ipxe.
+      Supported phoenixNAP iPXE locations: {{ phoenixnap.ipxe_supported_locations | join(', ') }}.
+  loop: "{{ sites | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}@{{ item.value.location }}"
+
+- name: List existing phoenixNAP servers before live SKU selection
+  ansible.builtin.uri:
+    url: "{{ phoenixnap.api_base }}/bmc/v1/servers"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ pnap_token }}"
+    return_content: true
+    status_code: 200
+  register: pnap_sku_existing_servers_raw
+  no_log: true
+
+- name: Initialize existing-server and selector state
+  ansible.builtin.set_fact:
+    pnap_existing_site_servers: {}
+    pnap_selector_site_args: []
+
+- name: Map existing phoenixNAP servers by configured site
+  ansible.builtin.set_fact:
+    pnap_existing_site_servers: >-
+      {{ pnap_existing_site_servers | combine({
+           item.key: (
+             pnap_sku_existing_servers_raw.json
+             | selectattr('hostname', 'equalto', item.value.node_hostname)
+             | list | first | default({})
+           )
+         }) }}
+  loop: "{{ sites | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}={{ item.value.node_hostname }}"
+
+- name: Build selector arguments only for sites without an existing server
+  ansible.builtin.set_fact:
+    pnap_selector_site_args: >-
+      {{ pnap_selector_site_args + ['--site', item.key ~ '=' ~ item.value.location] }}
+  loop: "{{ sites | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}@{{ item.value.location }}"
+  when: (pnap_sku_force_live_selection | default(false) | bool) or (pnap_existing_site_servers[item.key] | length == 0)
+
+- name: Build phoenixNAP dynamic SKU selector command
+  ansible.builtin.set_fact:
+    pnap_selector_argv: >-
+      {{
+        [
+          ansible_playbook_python,
+          role_path ~ '/../../scripts/select_pnap_sku.py',
+          '--api-base', phoenixnap.api_base
+        ]
+        + pnap_selector_site_args
+        + [
+          '--max-hourly-price', phoenixnap.auto_select.max_hourly_price | string,
+          '--min-ram-gb', phoenixnap.auto_select.min_ram_gb | string,
+          '--min-cores', phoenixnap.auto_select.min_cores | string,
+          '--preferred-ram-gb', phoenixnap.auto_select.preferred_ram_gb | string,
+          '--preferred-cores', phoenixnap.auto_select.preferred_cores | string,
+          '--top', phoenixnap.auto_select.show_top_candidates | string
+        ]
+        + (['--prefer-common'] if phoenixnap.auto_select.prefer_common_sku | bool else [])
+        + (['--require-common'] if phoenixnap.auto_select.require_common_sku | bool else [])
+      }}
+  when:
+    - phoenixnap.auto_select.enabled | bool
+    - pnap_selector_site_args | length > 0
+
+- name: Select live phoenixNAP SKUs under the hourly budget
+  ansible.builtin.command:
+    argv: "{{ pnap_selector_argv }}"
+  environment:
+    PNAP_ACCESS_TOKEN: "{{ pnap_token }}"
+  register: pnap_selector_raw
+  changed_when: false
+  failed_when: false
+  no_log: true
+  when:
+    - phoenixnap.auto_select.enabled | bool
+    - pnap_selector_site_args | length > 0
+
+- name: Parse sanitized phoenixNAP SKU selection
+  ansible.builtin.set_fact:
+    pnap_sku_selection: "{{ pnap_selector_raw.stdout | from_json }}"
+  when:
+    - phoenixnap.auto_select.enabled | bool
+    - pnap_selector_site_args | length > 0
+
+- name: Require a safe dynamic SKU selection
+  ansible.builtin.assert:
+    that:
+      - pnap_sku_selection.ok | bool
+      - pnap_sku_selection.sites | default({}) | length > 0
+    fail_msg: "{{ pnap_sku_selection.error | default('No phoenixNAP SKU satisfied the configured budget/sizing policy.') }}"
+  when:
+    - phoenixnap.auto_select.enabled | bool
+    - pnap_selector_site_args | length > 0
+
+- name: Publish effective selected SKUs
+  ansible.builtin.set_fact:
+    pnap_selected_skus: "{{ pnap_sku_selection.sites }}"
+  when:
+    - phoenixnap.auto_select.enabled | bool
+    - pnap_selector_site_args | length > 0
+
+- name: Publish empty SKU selection when all configured servers already exist
+  ansible.builtin.set_fact:
+    pnap_selected_skus: {}
+  when:
+    - phoenixnap.auto_select.enabled | bool
+    - pnap_selector_site_args | length == 0
+
+- name: Report dynamically selected server shapes
+  ansible.builtin.debug:
+    msg: >-
+      Dynamic SKU policy selected {{ item.key }}={{ item.value.productCode }} @
+      ${{ '%.3f' | format(item.value.hourlyPrice | float) }}/h
+      ({{ item.value.ramInGb }}GB/{{ item.value.cores }} cores,
+      stock={{ item.value.availableQuantity }}) for {{ item.value.location }}.
+  loop: "{{ pnap_selected_skus | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}={{ item.value.productCode }}"
+  when: phoenixnap.auto_select.enabled | bool
+
+- name: Report existing servers preserved without live stock dependency
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.key }} already has phoenixNAP server {{ item.value.hostname }}
+      (type={{ item.value.type }}, location={{ item.value.location }}). Live SKU stock
+      selection is skipped for this site so a day-2 rerun does not depend on spare inventory.
+  loop: "{{ pnap_existing_site_servers | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  when:
+    - phoenixnap.auto_select.enabled | bool
+    - not (pnap_sku_force_live_selection | default(false) | bool)
+    - item.value | length > 0

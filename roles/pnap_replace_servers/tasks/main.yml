@@ -1,0 +1,34 @@
+---
+- name: Require explicit replacement confirmation
+  ansible.builtin.assert:
+    that:
+      - confirm_replace | default(false) | bool
+    fail_msg: "Refusing destructive server replacement without confirm_replace=true."
+
+- name: List current phoenixNAP servers
+  ansible.builtin.uri:
+    url: "{{ phoenixnap.api_base }}/bmc/v1/servers"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ pnap_token }}"
+    return_content: true
+    status_code: 200
+  register: replace_servers
+  no_log: true
+
+- name: List current phoenixNAP private networks
+  ansible.builtin.uri:
+    url: "{{ phoenixnap.api_base }}/networks/v1/private-networks"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ pnap_token }}"
+    return_content: true
+    status_code: 200
+  register: replace_private_networks
+  no_log: true
+
+- name: Replace incompatible project servers
+  ansible.builtin.include_tasks: site.yml
+  loop: "{{ sites | dict2items }}"
+  loop_control:
+    loop_var: site_item

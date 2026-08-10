@@ -1,0 +1,6 @@
+---
+- name: Create RHACM Host Inventory resources
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - role: rhacm_assisted

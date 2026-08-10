@@ -1,0 +1,104 @@
+---
+- name: Read SSH public key
+  ansible.builtin.set_fact:
+    lab_ssh_public_key: "{{ lookup('file', ssh_public_key.path) | trim }}"
+
+- name: Read Red Hat pull secret
+  ansible.builtin.set_fact:
+    lab_pull_secret: "{{ lookup('file', openshift_pull_secret_file) | trim }}"
+  no_log: true
+
+- name: Query 4.22 ClusterImageSets from hub
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ rhacm.kubeconfig }}"
+    api_version: hive.openshift.io/v1
+    kind: ClusterImageSet
+  register: image_sets
+
+- name: Find OpenShift 4.22 ClusterImageSet candidates
+  ansible.builtin.set_fact:
+    ocp_imageset_candidates: >-
+      {{ image_sets.resources
+         | selectattr('metadata.name', 'search', '4[.-]22')
+         | list }}
+
+- name: Require OpenShift 4.22 ClusterImageSet on hub
+  ansible.builtin.assert:
+    that:
+      - ocp_imageset_candidates | length > 0
+    fail_msg: >-
+      No ClusterImageSet matching OpenShift 4.22 was found on the RHACM hub.
+      Add the 4.22 ClusterImageSet before provisioning.
+
+- name: Select most recently created OpenShift 4.22 ClusterImageSet
+  ansible.builtin.set_fact:
+    ocp_imageset_name: >-
+      {{ (ocp_imageset_candidates
+          | sort(attribute='metadata.creationTimestamp')
+          | last).metadata.name }}
+
+- name: Optionally expose iPXE artifacts over HTTP on the hub
+  kubernetes.core.k8s:
+    kubeconfig: "{{ rhacm.kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: agent-install.openshift.io/v1beta1
+      kind: AgentServiceConfig
+      metadata:
+        name: agent
+      spec:
+        iPXEHTTPRoute: enabled
+  when: rhacm.enable_http_ipxe_route | bool
+
+- name: Read AgentServiceConfig for the direct RHCOS rootfs source
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ rhacm.kubeconfig }}"
+    api_version: agent-install.openshift.io/v1beta1
+    kind: AgentServiceConfig
+    name: agent
+  register: agent_service_config
+  when: rhacm.direct_rootfs.enabled | bool
+
+- name: Require AgentServiceConfig before selecting the direct rootfs
+  ansible.builtin.assert:
+    that:
+      - agent_service_config.resources | length == 1
+    fail_msg: "AgentServiceConfig agent was not found on the RHACM hub."
+  when: rhacm.direct_rootfs.enabled | bool
+
+- name: Select the matching RHCOS rootfs URL
+  ansible.builtin.set_fact:
+    rhacm_rootfs_url: >-
+      {{ (agent_service_config.resources[0].spec.osImages
+          | selectattr('openshiftVersion', 'equalto', ocp_minor)
+          | selectattr('cpuArchitecture', 'equalto', 'x86_64')
+          | selectattr('rootFSUrl', 'defined')
+          | rejectattr('rootFSUrl', 'equalto', '')
+          | map(attribute='rootFSUrl')
+          | list
+          | first) | default('') }}
+  when: rhacm.direct_rootfs.enabled | bool
+
+- name: Require a direct RHCOS rootfs URL
+  ansible.builtin.assert:
+    that:
+      - rhacm_rootfs_url | length > 0
+      - rhacm_rootfs_url is match('^https?://')
+    fail_msg: >-
+      AgentServiceConfig agent does not contain a non-empty x86_64 OpenShift
+      {{ ocp_minor }} rootFSUrl. The PhoenixNAP iPXE flow cannot bypass the
+      hub ingress rootfs stream until spec.osImages[].rootFSUrl is populated.
+  when: rhacm.direct_rootfs.enabled | bool
+
+- name: Report direct rootfs bypass
+  ansible.builtin.debug:
+    msg: >-
+      Discovery iPXE will append coreos.live.rootfs_url={{ rhacm_rootfs_url }}
+      so the large RHCOS rootfs bypasses the RHACM ingress route.
+  when: rhacm.direct_rootfs.enabled | bool
+
+- name: Create Host Inventory resources for each site
+  ansible.builtin.include_tasks: site.yml
+  loop: "{{ sites | dict2items }}"
+  loop_control:
+    loop_var: site_item

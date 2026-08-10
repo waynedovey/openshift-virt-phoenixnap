@@ -1,0 +1,49 @@
+---
+- name: Find existing Cloudflare record {{ dns_record.name }}
+  ansible.builtin.uri:
+    url: "https://api.cloudflare.com/client/v4/zones/{{ cf_zone_id }}/dns_records?type=A&name={{ dns_record.name | urlencode }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ lookup('env', 'CLOUDFLARE_API_TOKEN') }}"
+    return_content: true
+    status_code: 200
+  register: cf_record_lookup
+  no_log: true
+
+- name: Create Cloudflare record {{ dns_record.name }}
+  ansible.builtin.uri:
+    url: "https://api.cloudflare.com/client/v4/zones/{{ cf_zone_id }}/dns_records"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ lookup('env', 'CLOUDFLARE_API_TOKEN') }}"
+      Content-Type: application/json
+    body_format: json
+    body:
+      type: A
+      name: "{{ dns_record.name }}"
+      content: "{{ dns_record.content }}"
+      ttl: "{{ cloudflare.ttl }}"
+      proxied: "{{ cloudflare.proxied | bool }}"
+    return_content: true
+    status_code: [200, 201]
+  when: cf_record_lookup.json.result | length == 0
+  no_log: true
+
+- name: Update Cloudflare record {{ dns_record.name }}
+  ansible.builtin.uri:
+    url: "https://api.cloudflare.com/client/v4/zones/{{ cf_zone_id }}/dns_records/{{ cf_record_lookup.json.result[0].id }}"
+    method: PUT
+    headers:
+      Authorization: "Bearer {{ lookup('env', 'CLOUDFLARE_API_TOKEN') }}"
+      Content-Type: application/json
+    body_format: json
+    body:
+      type: A
+      name: "{{ dns_record.name }}"
+      content: "{{ dns_record.content }}"
+      ttl: "{{ cloudflare.ttl }}"
+      proxied: "{{ cloudflare.proxied | bool }}"
+    return_content: true
+    status_code: 200
+  when: cf_record_lookup.json.result | length > 0
+  no_log: true

@@ -1,0 +1,202 @@
+---
+- name: Set Localnet site facts
+  ansible.builtin.set_fact:
+    managed_kubeconfig: "artifacts/kubeconfigs/{{ site_item.value.cluster_name }}.kubeconfig"
+
+- name: Query phoenixNAP private network for VLAN ID
+  ansible.builtin.uri:
+    url: "{{ phoenixnap.api_base }}/networks/v1/private-networks"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ pnap_token }}"
+    return_content: true
+    status_code: 200
+  register: localnet_pnap_networks
+  no_log: true
+
+- name: Select site private network
+  ansible.builtin.set_fact:
+    localnet_private_network: >-
+      {{ (localnet_pnap_networks.json
+          | selectattr('name', 'equalto', site_item.value.private_l2.name)
+          | selectattr('location', 'equalto', site_item.value.location)
+          | list | first) | default({}) }}
+
+- name: Require private VLAN allocation
+  ansible.builtin.assert:
+    that:
+      - localnet_private_network | length > 0
+      - localnet_private_network.vlanId is defined
+    fail_msg: "No private VLAN found for {{ site_item.key }}. Run `make private-networks`."
+
+- name: Get SNO node
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: v1
+    kind: Node
+  register: localnet_nodes
+
+- name: Require exactly one node for SNO
+  ansible.builtin.assert:
+    that:
+      - localnet_nodes.resources | length == 1
+    fail_msg: "Expected exactly one Node in {{ site_item.value.cluster_name }}."
+
+- name: Set SNO node name
+  ansible.builtin.set_fact:
+    localnet_node_name: "{{ localnet_nodes.resources[0].metadata.name }}"
+
+- name: Read NMState current node network state
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: nmstate.io/v1beta1
+    kind: NodeNetworkState
+    name: "{{ localnet_node_name }}"
+  register: localnet_nns
+  until:
+    - localnet_nns.resources | length == 1
+    - localnet_nns.resources[0].status.currentState.interfaces is defined
+  retries: 60
+  delay: 10
+
+- name: Find phoenixNAP primary LACP bond
+  ansible.builtin.set_fact:
+    localnet_uplink_interface: "{{ site_item.value.private_l2.uplink_interface | default(phoenixnap.ipxe_network.bond_name) }}"
+    localnet_bond_state: >-
+      {{ (localnet_nns.resources[0].status.currentState.interfaces | default([])
+          | selectattr('name', 'equalto', site_item.value.private_l2.uplink_interface | default(phoenixnap.ipxe_network.bond_name))
+          | list | first) | default({}) }}
+
+- name: Require the discovery-time LACP bond before exposing VM VLAN
+  ansible.builtin.assert:
+    that:
+      - localnet_bond_state | length > 0
+      - localnet_bond_state.type == 'bond'
+      - localnet_bond_state.state == 'up'
+    fail_msg: >-
+      {{ site_item.key }} does not have the expected phoenixNAP LACP bond
+      {{ localnet_uplink_interface }}. Current interface names={{ localnet_nns.resources[0].status.currentState.interfaces
+      | default([]) | map(attribute='name') | list }}. The private VLAN must be
+      consumed on the bond, not on one physical NIC.
+
+- name: Report selected physical wiring before apply
+  ansible.builtin.debug:
+    msg: >-
+      {{ site_item.key }}: native/public management={{ localnet_uplink_interface }},
+      tagged VM private VLAN={{ localnet_private_network.vlanId }} on {{ localnet_uplink_interface }},
+      bridge={{ vm_l2.bridge_name }}.
+
+- name: Build VM workload namespace selector labels
+  ansible.builtin.set_fact:
+    localnet_namespace_labels: >-
+      {{ dict([[vm_l2.namespace_label_key, vm_l2.namespace_label_value | string]]) }}
+
+- name: Require rendered VM workload namespace selector label
+  ansible.builtin.assert:
+    that:
+      - localnet_namespace_labels is mapping
+      - localnet_namespace_labels | length == 1
+      - vm_l2.namespace_label_key in localnet_namespace_labels
+      - vm_l2.namespace_label_key | length > 0
+    fail_msg: >-
+      Invalid vm_l2 namespace label configuration: key={{ vm_l2.namespace_label_key }}.
+      The label key must be rendered before it is sent to the Kubernetes API.
+
+- name: Create VM workload namespace
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ vm_l2.namespace }}"
+        labels: "{{ localnet_namespace_labels }}"
+
+- name: Map phoenixNAP private VLAN on bond to an OVS Localnet bridge
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: nmstate.io/v1
+      kind: NodeNetworkConfigurationPolicy
+      metadata:
+        name: pnap-vm-localnet
+      spec:
+        nodeSelector:
+          kubernetes.io/hostname: "{{ localnet_node_name }}"
+        desiredState:
+          interfaces:
+            - name: "{{ localnet_uplink_interface }}.{{ localnet_private_network.vlanId }}"
+              type: vlan
+              state: up
+              mtu: "{{ phoenixnap.ipxe_network.mtu | int }}"
+              ipv4:
+                enabled: false
+              ipv6:
+                enabled: false
+              vlan:
+                base-iface: "{{ localnet_uplink_interface }}"
+                id: "{{ localnet_private_network.vlanId | int }}"
+            - name: "{{ vm_l2.bridge_name }}"
+              type: ovs-bridge
+              state: up
+              bridge:
+                options:
+                  stp: false
+                port:
+                  - name: "{{ localnet_uplink_interface }}.{{ localnet_private_network.vlanId }}"
+          ovn:
+            bridge-mappings:
+              - localnet: "{{ vm_l2.physical_network_name }}"
+                bridge: "{{ vm_l2.bridge_name }}"
+                state: present
+
+- name: Wait for private VLAN/OVS NNCP to become Available
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: nmstate.io/v1
+    kind: NodeNetworkConfigurationPolicy
+    name: pnap-vm-localnet
+  register: localnet_nncp
+  until: >-
+    localnet_nncp.resources | length == 1 and
+    (localnet_nncp.resources[0].status.conditions | default([])
+      | selectattr('type', 'equalto', 'Available')
+      | selectattr('status', 'equalto', 'True')
+      | list | length) > 0
+  retries: 90
+  delay: 10
+
+- name: Create secondary Localnet ClusterUserDefinedNetwork for VMs
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: k8s.ovn.org/v1
+      kind: ClusterUserDefinedNetwork
+      metadata:
+        name: "{{ vm_l2.network_name }}"
+      spec:
+        namespaceSelector:
+          matchLabels: "{{ localnet_namespace_labels }}"
+        network:
+          topology: Localnet
+          localnet:
+            role: Secondary
+            physicalNetworkName: "{{ vm_l2.physical_network_name }}"
+            ipam:
+              mode: Disabled
+
+- name: Save discovered SNO Localnet wiring
+  ansible.builtin.copy:
+    dest: "artifacts/networks/{{ site_item.key }}-localnet.yml"
+    mode: '0600'
+    content: |
+      node: {{ localnet_node_name }}
+      primary_bond: {{ localnet_uplink_interface }}
+      vlan_id: {{ localnet_private_network.vlanId }}
+      bridge: {{ vm_l2.bridge_name }}
+      physical_network_name: {{ vm_l2.physical_network_name }}
+      cudn: {{ vm_l2.network_name }}
+      vm_cidr: {{ site_item.value.private_l2.cidr }}

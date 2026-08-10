@@ -1,0 +1,116 @@
+---
+- name: Set desired replacement server type for {{ site_item.key }}
+  ansible.builtin.set_fact:
+    replace_site_server_type: >-
+      {{ pnap_selected_skus[site_item.key].productCode
+         if phoenixnap.auto_select.enabled | bool
+         else site_item.value.server_type | default(phoenixnap.server_type) }}
+
+- name: Find current {{ site_item.key }} server for replacement
+  ansible.builtin.set_fact:
+    replace_site_server: >-
+      {{ (replace_servers.json
+          | selectattr('hostname', 'equalto', site_item.value.node_hostname)
+          | list | first) | default({}) }}
+
+- name: Find requested {{ site_item.key }} private Layer2 network
+  ansible.builtin.set_fact:
+    replace_site_private_network: >-
+      {{ (replace_private_networks.json
+          | selectattr('name', 'equalto', site_item.value.private_l2.name)
+          | selectattr('location', 'equalto', site_item.value.location)
+          | list | first) | default({}) }}
+
+- name: Require requested private Layer2 network before replacement
+  ansible.builtin.assert:
+    that:
+      - replace_site_private_network | length > 0
+      - replace_site_private_network.id | default('') | length > 0
+    fail_msg: >-
+      Private L2 network {{ site_item.value.private_l2.name }} is missing in
+      {{ site_item.value.location }}. Run `make private-networks` first.
+
+- name: Read current server details
+  ansible.builtin.uri:
+    url: "{{ phoenixnap.api_base }}/bmc/v1/servers/{{ replace_site_server.id }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ pnap_token }}"
+    return_content: true
+    status_code: 200
+  register: replace_site_detail
+  when: replace_site_server | length > 0
+  no_log: true
+
+- name: Decide whether {{ site_item.key }} requires replacement
+  ansible.builtin.set_fact:
+    replace_site_required: >-
+      {{ replace_site_server | length > 0 and
+         (replace_site_server.type != replace_site_server_type or
+          (replace_site_detail.json.networkType | default('')) != phoenixnap.network_type or
+          (replace_site_detail.json.networkConfiguration.privateNetworkConfiguration.privateNetworks | default([])
+           | selectattr('id', 'equalto', replace_site_private_network.id)
+           | list | length) != 1) }}
+
+- name: Report matching server replacement
+  ansible.builtin.debug:
+    msg: >-
+      Deprovisioning {{ replace_site_server.hostname }} type={{ replace_site_server.type }},
+      networkType={{ replace_site_detail.json.networkType | default('unknown') }} so it can be recreated as
+      {{ replace_site_server_type }} with explicit public management + private Layer2 VLAN.
+  when: replace_site_required | bool
+
+- name: Deprovision incompatible hourly server
+  ansible.builtin.uri:
+    url: "{{ phoenixnap.api_base }}/bmc/v1/servers/{{ replace_site_server.id }}/actions/deprovision"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ pnap_token }}"
+      Content-Type: application/json
+    body_format: json
+    body:
+      deleteIpBlocks: true
+    status_code: [200, 202, 404]
+  when: replace_site_required | bool
+  no_log: true
+
+- name: Wait until incompatible server is removed
+  ansible.builtin.uri:
+    url: "{{ phoenixnap.api_base }}/bmc/v1/servers/{{ replace_site_server.id }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ pnap_token }}"
+    status_code: [200, 404]
+    return_content: false
+  register: replace_site_gone
+  until: replace_site_gone.status == 404
+  retries: 90
+  delay: 10
+  when: replace_site_required | bool
+  no_log: true
+
+- name: Find stale Host Inventory Agents
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ rhacm.kubeconfig }}"
+    api_version: agent-install.openshift.io/v1beta1
+    kind: Agent
+    namespace: "{{ site_item.value.cluster_name }}"
+  register: replace_agents
+  when: replace_site_required | bool
+
+- name: Delete stale Agent objects
+  kubernetes.core.k8s:
+    kubeconfig: "{{ rhacm.kubeconfig }}"
+    state: absent
+    api_version: agent-install.openshift.io/v1beta1
+    kind: Agent
+    name: "{{ item.metadata.name }}"
+    namespace: "{{ site_item.value.cluster_name }}"
+  loop: "{{ replace_agents.resources | default([]) }}"
+  when: replace_site_required | bool
+
+- name: Report no replacement required
+  ansible.builtin.debug:
+    msg: >-
+      {{ site_item.key }} has no existing incompatible server to replace.
+  when: not replace_site_required | bool

@@ -1,0 +1,72 @@
+---
+- name: Find existing BGP peer group in {{ site_item.value.location }}
+  ansible.builtin.set_fact:
+    existing_bgp_group: >-
+      {{ (pnap_bgp_groups.json
+          | selectattr('location', 'equalto', site_item.value.location)
+          | list | first) | default({}) }}
+
+- name: Create BGP peer group in {{ site_item.value.location }}
+  ansible.builtin.uri:
+    url: "{{ phoenixnap.api_base }}/networks/v1/bgp-peer-groups"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ pnap_token }}"
+      Content-Type: application/json
+    body_format: json
+    body:
+      location: "{{ site_item.value.location }}"
+      asn: "{{ phoenixnap.bgp.asn }}"
+      advertisedRoutes: "{{ phoenixnap.bgp.advertised_routes }}"
+    return_content: true
+    status_code: [200, 201, 202]
+  register: created_bgp_group
+  when: existing_bgp_group | length == 0
+  no_log: true
+
+- name: Select BGP peer group ID
+  ansible.builtin.set_fact:
+    bgp_group_id: >-
+      {{ existing_bgp_group.id
+         if existing_bgp_group | length > 0
+         else created_bgp_group.json.id }}
+
+- name: Wait for BGP peer group to become READY
+  ansible.builtin.uri:
+    url: "{{ phoenixnap.api_base }}/networks/v1/bgp-peer-groups/{{ bgp_group_id }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ pnap_token }}"
+    return_content: true
+    status_code: 200
+  register: bgp_group_ready
+  until: bgp_group_ready.json.status == 'READY'
+  retries: 60
+  delay: 10
+  no_log: true
+
+- name: Create BGP state directory
+  ansible.builtin.file:
+    path: artifacts/bgp
+    state: directory
+    mode: '0700'
+
+- name: Save non-secret BGP ownership and peering state
+  ansible.builtin.copy:
+    dest: "artifacts/bgp/{{ site_item.key }}.yml"
+    mode: '0600'
+    content: |
+      id: {{ bgp_group_ready.json.id }}
+      location: {{ site_item.value.location }}
+      managed_by_project: {{ 'false' if existing_bgp_group | length > 0 else 'true' }}
+      status: {{ bgp_group_ready.json.status }}
+      asn: {{ bgp_group_ready.json.activeAsnDetails.asn | default(bgp_group_ready.json.targetAsnDetails.asn) }}
+      peering_loopbacks_v4: {{ bgp_group_ready.json.peeringLoopbacksV4 | default([]) | to_json }}
+
+- name: Report BGP peer group
+  ansible.builtin.debug:
+    msg: >-
+      BGP peer group for {{ site_item.key }} ({{ site_item.value.location }}) is READY;
+      ASN={{ bgp_group_ready.json.activeAsnDetails.asn | default(bgp_group_ready.json.targetAsnDetails.asn) }},
+      loopbacks={{ bgp_group_ready.json.peeringLoopbacksV4 | default([]) }}.
+      This is standard IP BGP and is not used as proof of an EVPN L2VPN fabric.

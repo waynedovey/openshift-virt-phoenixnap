@@ -1,0 +1,39 @@
+---
+- name: Refuse server provisioning in phoenixNAP locations without iPXE
+  ansible.builtin.assert:
+    that:
+      - item.value.location in phoenixnap.ipxe_supported_locations
+    fail_msg: >-
+      {{ item.key }} location {{ item.value.location }} does not support phoenixNAP os=ipxe.
+      Supported locations: {{ phoenixnap.ipxe_supported_locations | join(', ') }}.
+  loop: "{{ sites | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}@{{ item.value.location }}"
+
+- name: List existing phoenixNAP servers
+  ansible.builtin.uri:
+    url: "{{ phoenixnap.api_base }}/bmc/v1/servers"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ pnap_token }}"
+    return_content: true
+    status_code: 200
+  register: pnap_servers_existing
+  no_log: true
+
+- name: List phoenixNAP private networks for server attachment
+  ansible.builtin.uri:
+    url: "{{ phoenixnap.api_base }}/networks/v1/private-networks"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ pnap_token }}"
+    return_content: true
+    status_code: 200
+  register: pnap_private_networks_for_servers
+  no_log: true
+
+- name: Provision each SNO site
+  ansible.builtin.include_tasks: site.yml
+  loop: "{{ sites | dict2items }}"
+  loop_control:
+    loop_var: site_item

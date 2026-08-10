@@ -1,0 +1,7 @@
+---
+- name: Create phoenixNAP site-local private Layer2 VM networks
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - role: pnap_auth
+    - role: pnap_private_networks

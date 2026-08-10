@@ -1,0 +1,14 @@
+---
+- name: Explain staged Localnet configuration
+  ansible.builtin.debug:
+    msg: >-
+      Site-local VM Layer2 is staged but not applied. Set vm_l2.apply=true to
+      map each phoenixNAP private VLAN into OpenShift as a secondary Localnet CUDN.
+  when: not vm_l2.apply | bool
+
+- name: Configure site-local VM Layer2 on each SNO
+  ansible.builtin.include_tasks: site.yml
+  loop: "{{ sites | dict2items }}"
+  loop_control:
+    loop_var: site_item
+  when: vm_l2.apply | bool

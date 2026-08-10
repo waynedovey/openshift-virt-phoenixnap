@@ -1,0 +1,8 @@
+---
+- name: Publish OpenShift SNO DNS records in Cloudflare
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - role: pnap_auth
+    - role: cloudflare_dns
+      when: cloudflare.enabled | bool

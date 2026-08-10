@@ -1,0 +1,7 @@
+---
+- name: Remove Cloudflare records, RHACM resources, BGP groups, and hourly servers
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - role: pnap_auth
+    - role: destroy_lab

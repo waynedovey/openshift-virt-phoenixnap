@@ -1,0 +1,32 @@
+---
+- name: Find server for {{ site_item.key }}
+  ansible.builtin.set_fact:
+    cf_site_server: >-
+      {{ (pnap_servers_dns.json
+          | selectattr('hostname', 'equalto', site_item.value.node_hostname)
+          | list | first) | default({}) }}
+
+- name: Require server public IP for {{ site_item.key }}
+  ansible.builtin.assert:
+    that:
+      - cf_site_server | length > 0
+      - cf_site_server.publicIpAddresses | default([]) | length > 0
+    fail_msg: "No phoenixNAP public IP found for {{ site_item.value.node_hostname }}."
+
+- name: Build desired DNS records
+  ansible.builtin.set_fact:
+    cf_desired_records:
+      - name: "api.{{ site_item.value.cluster_name }}.{{ base_domain }}"
+        content: "{{ cf_site_server.publicIpAddresses[0] }}"
+      - name: "api-int.{{ site_item.value.cluster_name }}.{{ base_domain }}"
+        content: "{{ cf_site_server.publicIpAddresses[0] }}"
+      - name: "*.apps.{{ site_item.value.cluster_name }}.{{ base_domain }}"
+        content: "{{ cf_site_server.publicIpAddresses[0] }}"
+      - name: "{{ site_item.value.node_hostname }}"
+        content: "{{ cf_site_server.publicIpAddresses[0] }}"
+
+- name: Upsert Cloudflare A records
+  ansible.builtin.include_tasks: upsert.yml
+  loop: "{{ cf_desired_records }}"
+  loop_control:
+    loop_var: dns_record

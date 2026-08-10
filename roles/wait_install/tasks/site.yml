@@ -1,0 +1,39 @@
+---
+- name: Read {{ site_item.key }} ClusterDeployment install state
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ rhacm.kubeconfig }}"
+    api_version: hive.openshift.io/v1
+    kind: ClusterDeployment
+    name: "{{ site_item.value.cluster_name }}"
+    namespace: "{{ site_item.value.cluster_name }}"
+  register: wait_clusterdeployment
+
+- name: Record completed ClusterDeployment state
+  ansible.builtin.set_fact:
+    wait_cluster_already_installed: >-
+      {{ (wait_clusterdeployment.resources | length == 1) and
+         (wait_clusterdeployment.resources[0].spec.installed | default(false) | bool) }}
+
+- name: Wait for {{ site_item.key }} installation to complete
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ rhacm.kubeconfig }}"
+    api_version: extensions.hive.openshift.io/v1beta1
+    kind: AgentClusterInstall
+    name: "{{ site_item.value.cluster_name }}"
+    namespace: "{{ site_item.value.cluster_name }}"
+  register: aci_status
+  until: >-
+    aci_status.resources | length == 1 and
+    (aci_status.resources[0].status.conditions | default([])
+      | selectattr('type', 'equalto', 'Completed')
+      | selectattr('status', 'equalto', 'True')
+      | list | length) > 0
+  retries: "{{ (wait.install_seconds / 30) | int }}"
+  delay: 30
+  when: not (wait_cluster_already_installed | bool)
+
+- name: Report completed site
+  ansible.builtin.debug:
+    msg: >-
+      OpenShift install completed for {{ site_item.value.cluster_name }}.
+      {{ 'ClusterDeployment was already installed; install wait skipped.' if wait_cluster_already_installed | bool else '' }}

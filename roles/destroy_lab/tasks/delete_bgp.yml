@@ -1,0 +1,15 @@
+---
+- name: Load BGP ownership state
+  ansible.builtin.include_vars:
+    file: "artifacts/bgp/{{ bgp_file.item.key }}.yml"
+    name: project_bgp_state
+
+- name: Delete project-owned phoenixNAP BGP peer group
+  ansible.builtin.uri:
+    url: "{{ phoenixnap.api_base }}/networks/v1/bgp-peer-groups/{{ project_bgp_state.id }}"
+    method: DELETE
+    headers:
+      Authorization: "Bearer {{ pnap_token }}"
+    status_code: [200, 202, 204, 404]
+  when: project_bgp_state.managed_by_project | bool
+  no_log: true

@@ -1,0 +1,14 @@
+---
+- name: Destructive teardown guard
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Require explicit destroy confirmation
+      ansible.builtin.assert:
+        that:
+          - confirm_destroy | default(false) | bool
+        fail_msg: >-
+          Destruction is irreversible and releases the hourly servers. Re-run
+          with -e confirm_destroy=true.
+
+- import_playbook: playbooks/99_destroy.yml

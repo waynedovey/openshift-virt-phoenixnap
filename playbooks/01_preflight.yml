@@ -1,0 +1,149 @@
+---
+- name: Preflight external services and capacity
+  hosts: localhost
+  gather_facts: false
+  pre_tasks:
+    - name: Require phoenixNAP iPXE-capable site locations
+      ansible.builtin.assert:
+        that:
+          - item.value.location in phoenixnap.ipxe_supported_locations
+        fail_msg: >-
+          {{ item.key }} uses {{ item.value.location }}, but phoenixNAP custom iPXE
+          provisioning is supported only in {{ phoenixnap.ipxe_supported_locations | join(', ') }}.
+          Move the site to an iPXE-capable location before provisioning.
+      loop: "{{ sites | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}@{{ item.value.location }}"
+  roles:
+    - role: pnap_auth
+    - role: pnap_select_sku
+      when: phoenixnap.auto_select.enabled | bool
+  tasks:
+    - name: Require secret environment variables and files
+      ansible.builtin.assert:
+        that:
+          - lookup('env', 'PNAP_CLIENT_ID') | length > 0
+          - lookup('env', 'PNAP_CLIENT_SECRET') | length > 0
+          - lookup('env', 'CLOUDFLARE_API_TOKEN') | length > 0
+          - rhacm.kubeconfig | length > 0
+          - openshift_pull_secret_file | length > 0
+        fail_msg: "Source .env (copied from .env.example) and provide the required paths/secrets."
+
+    - name: Check local credential files
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ rhacm.kubeconfig }}"
+        - "{{ openshift_pull_secret_file }}"
+        - "{{ ssh_public_key.path }}"
+      register: credential_files
+
+    - name: Require local credential files to exist
+      ansible.builtin.assert:
+        that:
+          - credential_files.results | map(attribute='stat.exists') | min
+        fail_msg: "RHACM kubeconfig, pull secret, and SSH public key must all exist."
+
+    - name: Query requested phoenixNAP SKU availability per site
+      ansible.builtin.uri:
+        url: >-
+          {{ phoenixnap.api_base }}/billing/v1/product-availability?productCategory=SERVER&productCode={{ item.value.server_type | default(phoenixnap.server_type) }}&location={{ item.value.location }}&minQuantity=1&showOnlyMinQuantityAvailable=false
+        method: GET
+        headers:
+          Authorization: "Bearer {{ pnap_token }}"
+        return_content: true
+        status_code: 200
+      loop: "{{ sites | dict2items }}"
+      register: pnap_site_availability_raw
+      no_log: true
+      when: not (phoenixnap.auto_select.enabled | bool)
+
+    - name: Build sanitized requested-SKU availability map
+      ansible.builtin.set_fact:
+        pnap_site_availability: >-
+          {{ pnap_site_availability | default({}) | combine({
+            item.item.key: {
+              'server_type': item.item.value.server_type | default(phoenixnap.server_type),
+              'location': item.item.value.location,
+              'available': (
+                item.json | default([])
+                | selectattr('productCode', 'equalto', item.item.value.server_type | default(phoenixnap.server_type))
+                | map(attribute='locationAvailabilityDetails') | list | flatten
+                | selectattr('location', 'equalto', item.item.value.location)
+                | selectattr('minQuantityAvailable', 'equalto', true)
+                | list | length > 0
+              ),
+              'available_quantity': (
+                item.json | default([])
+                | selectattr('productCode', 'equalto', item.item.value.server_type | default(phoenixnap.server_type))
+                | map(attribute='locationAvailabilityDetails') | list | flatten
+                | selectattr('location', 'equalto', item.item.value.location)
+                | map(attribute='availableQuantity') | list | first | default(0)
+              )
+            }
+          }) }}
+      loop: "{{ pnap_site_availability_raw.results }}"
+      loop_control:
+        label: "{{ item.item.key }}"
+      no_log: true
+      when: not (phoenixnap.auto_select.enabled | bool)
+
+    - name: Require requested SKU in each region
+      ansible.builtin.assert:
+        that:
+          - pnap_site_availability[item.key].available | bool
+        fail_msg: >-
+          {{ item.value.server_type | default(phoenixnap.server_type) }} is not currently available in
+          {{ item.value.location }} for {{ item.key }} (availableQuantity={{ pnap_site_availability[item.key].available_quantity }}).
+          Run `make availability` to list SKUs with actual live stock, then set sites.{{ item.key }}.server_type
+          to an approved alternative.
+      loop: "{{ sites | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}={{ item.value.server_type | default(phoenixnap.server_type) }}@{{ item.value.location }}"
+      when: not (phoenixnap.auto_select.enabled | bool)
+
+    - name: Display requested OpenShift Virtualization server shapes
+      ansible.builtin.debug:
+        msg: >-
+          Requested server types are available: SW1={{ sites.sw1.server_type | default(phoenixnap.server_type) }} in {{ sites.sw1.location }},
+          C1={{ sites.c1.server_type | default(phoenixnap.server_type) }} in {{ sites.c1.location }}. Servers are
+          provisioned HOURLY with explicit public management plus a site-local phoenixNAP private Layer2 VLAN.
+      when: not (phoenixnap.auto_select.enabled | bool)
+
+    - name: Display dynamically selected OpenShift Virtualization server shapes
+      ansible.builtin.debug:
+        msg: >-
+          Dynamic selection passed for {{ item.key }}={{ item.value.productCode }}
+          (${{ '%.3f' | format(item.value.hourlyPrice | float) }}/h) in {{ item.value.location }},
+          below the strict ${{ '%.2f' | format(phoenixnap.auto_select.max_hourly_price | float) }}/h per-server cap.
+      loop: "{{ pnap_selected_skus | default({}) | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}={{ item.value.productCode }}"
+      when: phoenixnap.auto_select.enabled | bool
+
+    - name: Display existing phoenixNAP servers reused by preflight
+      ansible.builtin.debug:
+        msg: >-
+          Existing {{ item.key }} server {{ item.value.hostname }}
+          ({{ item.value.type }} in {{ item.value.location }}) will be preserved;
+          no live replacement stock is required for this site.
+      loop: "{{ pnap_existing_site_servers | default({}) | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      when:
+        - phoenixnap.auto_select.enabled | bool
+        - item.value | length > 0
+
+    - name: Verify RHACM hub access
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ rhacm.kubeconfig }}"
+        api_version: config.openshift.io/v1
+        kind: ClusterVersion
+        name: version
+      register: hub_version
+
+    - name: Require a reachable OpenShift hub
+      ansible.builtin.assert:
+        that:
+          - hub_version.resources | length == 1
+        fail_msg: "Cannot query the RHACM hub with RHACM_KUBECONFIG."

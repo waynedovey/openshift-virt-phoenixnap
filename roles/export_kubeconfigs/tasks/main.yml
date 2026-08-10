@@ -1,0 +1,12 @@
+---
+- name: Create kubeconfig artifact directory
+  ansible.builtin.file:
+    path: artifacts/kubeconfigs
+    state: directory
+    mode: '0700'
+
+- name: Export each managed cluster kubeconfig
+  ansible.builtin.include_tasks: site.yml
+  loop: "{{ sites | dict2items }}"
+  loop_control:
+    loop_var: site_item

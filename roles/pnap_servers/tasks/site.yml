@@ -1,0 +1,26 @@
+---
+- name: Read {{ site_item.key }} ClusterDeployment lifecycle state
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ rhacm.kubeconfig }}"
+    api_version: hive.openshift.io/v1
+    kind: ClusterDeployment
+    name: "{{ site_item.value.cluster_name }}"
+    namespace: "{{ site_item.value.cluster_name }}"
+  register: pnap_site_clusterdeployment
+
+- name: Record whether {{ site_item.key }} is already installed
+  ansible.builtin.set_fact:
+    pnap_site_cluster_installed: >-
+      {{ (pnap_site_clusterdeployment.resources | length == 1) and
+         (pnap_site_clusterdeployment.resources[0].spec.installed | default(false) | bool) }}
+
+- name: Preserve running phoenixNAP server for installed cluster
+  ansible.builtin.debug:
+    msg: >-
+      {{ site_item.key }} is already installed. Skipping iPXE provisioning, InfraEnv
+      recreation, discovery reboot and Agent approval for {{ site_item.value.node_hostname }}.
+  when: pnap_site_cluster_installed | bool
+
+- name: Run phoenixNAP discovery/provisioning lifecycle for non-installed cluster
+  ansible.builtin.include_tasks: provision_site.yml
+  when: not (pnap_site_cluster_installed | bool)
