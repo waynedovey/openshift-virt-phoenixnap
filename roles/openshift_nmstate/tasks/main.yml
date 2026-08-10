@@ -1,0 +1,6 @@
+---
+- name: Install Kubernetes NMState on each managed cluster
+  ansible.builtin.include_tasks: site.yml
+  loop: "{{ sites | dict2items }}"
+  loop_control:
+    loop_var: site_item

@@ -30,41 +30,43 @@
           - credential_files.results | map(attribute='stat.exists') | min
         fail_msg: "RHACM kubeconfig, pull secret, and SSH public key must all exist."
 
-    - name: Query phoenixNAP product availability
+    - name: Query requested phoenixNAP SKU availability per site
       ansible.builtin.uri:
         url: >-
-          {{ phoenixnap.api_base }}/billing/v1/product-availability?productCategory=SERVER&productCode={{ phoenixnap.server_type }}&minQuantity=1
+          {{ phoenixnap.api_base }}/billing/v1/product-availability?productCategory=SERVER&productCode={{ item.value.server_type | default(phoenixnap.server_type) }}&location={{ item.value.location }}&minQuantity=1&showOnlyMinQuantityAvailable=false
         method: GET
         headers:
           Authorization: "Bearer {{ pnap_token }}"
         return_content: true
         status_code: 200
-      register: pnap_availability
+      loop: "{{ sites | dict2items }}"
+      register: pnap_site_availability
       no_log: true
 
-    - name: Extract requested product availability
-      ansible.builtin.set_fact:
-        pnap_product: >-
-          {{ (pnap_availability.json | selectattr('productCode', 'equalto', phoenixnap.server_type) | list | first) | default({}) }}
-
-    - name: Require requested SKU in both regions
+    - name: Require requested SKU in each region
       ansible.builtin.assert:
         that:
           - >-
-            (pnap_product.locationAvailabilityDetails | default([])
-            | selectattr('location', 'equalto', item.value.location)
+            (item.json | default([])
+            | selectattr('productCode', 'equalto', item.item.value.server_type | default(phoenixnap.server_type))
+            | map(attribute='locationAvailabilityDetails') | list | flatten
+            | selectattr('location', 'equalto', item.item.value.location)
             | selectattr('minQuantityAvailable', 'equalto', true)
             | list | length) > 0
-        fail_msg: "{{ phoenixnap.server_type }} is not currently available in {{ item.value.location }}."
-      loop: "{{ sites | dict2items }}"
+        fail_msg: >-
+          {{ item.item.value.server_type | default(phoenixnap.server_type) }} is not currently available in
+          {{ item.item.value.location }} for {{ item.item.key }}. Run `make availability` to list currently
+          available server SKUs, then set sites.{{ item.item.key }}.server_type to an approved alternative.
+      loop: "{{ pnap_site_availability.results }}"
+      loop_control:
+        label: "{{ item.item.key }}={{ item.item.value.server_type | default(phoenixnap.server_type) }}@{{ item.item.value.location }}"
 
-    - name: Display SNO sizing warning
+    - name: Display requested OpenShift Virtualization server shapes
       ansible.builtin.debug:
         msg: >-
-          Requested {{ phoenixnap.server_type }} is intentionally permitted for this
-          OpenShift 4.22 lab. It is below the 8-vCPU recommended SNO topology;
-          {{ phoenixnap.recommended_server_type }} provides more virtualization headroom.
-      when: phoenixnap.server_type == 's2.c1.small'
+          Requested server types are available: SW1={{ sites.sw1.server_type | default(phoenixnap.server_type) }} in {{ sites.sw1.location }},
+          C1={{ sites.c1.server_type | default(phoenixnap.server_type) }} in {{ sites.c1.location }}. Servers are
+          provisioned HOURLY with explicit public management plus a site-local phoenixNAP private Layer2 VLAN.
 
     - name: Verify RHACM hub access
       kubernetes.core.k8s_info:

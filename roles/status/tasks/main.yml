@@ -53,3 +53,26 @@
     msg: >-
       EVPN apply={{ evpn.apply }}, fabric_confirmed={{ evpn.fabric_confirmed }},
       shared VM subnet={{ evpn.vm_subnet }}, VNI={{ evpn.vni }}.
+
+- name: List phoenixNAP private networks
+  ansible.builtin.uri:
+    url: "{{ phoenixnap.api_base }}/networks/v1/private-networks"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ pnap_token }}"
+    return_content: true
+    status_code: 200
+  register: status_private_networks
+  no_log: true
+
+- name: Show site-local private Layer2 network state
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.key }}: requested server={{ phoenixnap.server_type }},
+      private-L2={{ item.value.private_l2.name }},
+      CIDR={{ item.value.private_l2.cidr }},
+      VLAN={{ ((status_private_networks.json
+        | selectattr('name', 'equalto', item.value.private_l2.name)
+        | selectattr('location', 'equalto', item.value.location)
+        | list | first).vlanId) | default('not-created') }}
+  loop: "{{ sites | dict2items }}"

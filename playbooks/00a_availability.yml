@@ -1,0 +1,34 @@
+---
+- name: Show phoenixNAP server availability for requested regions
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - role: pnap_auth
+  tasks:
+    - name: Query all currently available server SKUs per site
+      ansible.builtin.uri:
+        url: >-
+          {{ phoenixnap.api_base }}/billing/v1/product-availability?productCategory=SERVER&location={{ item.value.location }}&minQuantity=1&showOnlyMinQuantityAvailable=true
+        method: GET
+        headers:
+          Authorization: "Bearer {{ pnap_token }}"
+        return_content: true
+        status_code: 200
+      loop: "{{ sites | dict2items }}"
+      register: availability_by_site
+      no_log: true
+
+    - name: Display available server SKUs
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.item.key | upper }} / {{ item.item.value.location }} available SKUs:
+          {{ item.json | map(attribute='productCode') | unique | sort | join(', ') }}
+      loop: "{{ availability_by_site.results }}"
+      loop_control:
+        label: "{{ item.item.key }} / {{ item.item.value.location }}"
+
+    - name: Display configured choices
+      ansible.builtin.debug:
+        msg: >-
+          Configured: SW1={{ sites.sw1.server_type | default(phoenixnap.server_type) }} in {{ sites.sw1.location }};
+          C1={{ sites.c1.server_type | default(phoenixnap.server_type) }} in {{ sites.c1.location }}.

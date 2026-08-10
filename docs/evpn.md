@@ -17,7 +17,7 @@ evpn:
 The playbook then:
 
 1. Enables the FRR routing capability and OVN route advertisements.
-2. Installs Kubernetes NMState.
+2. Reuses Kubernetes NMState installed by the base VM-L2 workflow.
 3. Adds a dummy VTEP IP to the SNO node.
 4. Creates an FRRConfiguration to the external EVPN peer.
 5. Creates the unmanaged VTEP object.
@@ -31,3 +31,11 @@ The two OpenShift clusters do not share an IPAM database. A common subnet theref
 ## Transport warning
 
 The VTEP range `10.255.50.0/24` is an overlay underlay-routing design choice for this lab. Your external fabric must route these VTEP addresses between sites and permit UDP/4789 as required by the EVPN/VXLAN data plane.
+
+
+## Relationship to phoenixNAP private networks
+
+The `ocp-sw1-vm-l2` and `ocp-c1-vm-l2` private VLANs are site-local physical segments for
+OpenShift Virtualization Localnet attachment. They do not stretch Layer2 between PHX and CHI.
+The EVPN/VXLAN design is still the mechanism intended to carry the portable `10.50.50.0/24`
+VM network between sites. phoenixNAP BGP peering itself remains public-IP based.

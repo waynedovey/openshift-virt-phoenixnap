@@ -1,0 +1,7 @@
+---
+- name: Install Kubernetes NMState on both SNO clusters
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - role: openshift_nmstate
+      when: nmstate.enabled | bool

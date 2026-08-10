@@ -1,4 +1,8 @@
 ---
+- name: Set desired server type for {{ site_item.key }}
+  ansible.builtin.set_fact:
+    site_server_type: "{{ site_item.value.server_type | default(phoenixnap.server_type) }}"
+
 - name: Read {{ site_item.key }} InfraEnv iPXE URL
   kubernetes.core.k8s_info:
     kubeconfig: "{{ rhacm.kubeconfig }}"
@@ -23,7 +27,56 @@
           | selectattr('hostname', 'equalto', site_item.value.node_hostname)
           | list | first) | default({}) }}
 
-- name: Provision hourly {{ phoenixnap.server_type }} using RHACM iPXE
+- name: Read full existing server network configuration
+  ansible.builtin.uri:
+    url: "{{ phoenixnap.api_base }}/bmc/v1/servers/{{ existing_site_server.id }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ pnap_token }}"
+    return_content: true
+    status_code: 200
+  register: existing_site_server_detail
+  when: existing_site_server | length > 0
+  no_log: true
+
+- name: Find site private Layer2 network
+  ansible.builtin.set_fact:
+    site_private_network: >-
+      {{ (pnap_private_networks_for_servers.json
+          | selectattr('name', 'equalto', site_item.value.private_l2.name)
+          | selectattr('location', 'equalto', site_item.value.location)
+          | list | first) | default({}) }}
+
+- name: Require site private Layer2 network before provisioning
+  ansible.builtin.assert:
+    that:
+      - site_private_network | length > 0
+      - site_private_network.id | length > 0
+      - site_private_network.vlanId is defined
+    fail_msg: >-
+      Private L2 network {{ site_item.value.private_l2.name }} is missing in
+      {{ site_item.value.location }}. Run `make private-networks` first.
+
+- name: Refuse to silently reuse an incompatible existing server
+  ansible.builtin.assert:
+    that:
+      - existing_site_server.type == site_server_type
+      - existing_site_server_detail.json.networkType | default('') == phoenixnap.network_type
+      - >-
+        (existing_site_server_detail.json.networkConfiguration.privateNetworkConfiguration.privateNetworks | default([])
+        | selectattr('id', 'equalto', site_private_network.id)
+        | list | length) == 1
+    fail_msg: >-
+      Existing {{ site_item.value.node_hostname }} is not compatible with the new lab definition.
+      Current type={{ existing_site_server.type | default('unknown') }}, desired={{ site_server_type }};
+      current networkType={{ existing_site_server_detail.json.networkType | default('unknown') }},
+      desired={{ phoenixnap.network_type }}; private network={{ site_private_network.name }}.
+      phoenixNAP cannot resize a server in place. Run `make replace-servers`, then rerun deployment.
+  when:
+    - existing_site_server | length > 0
+    - phoenixnap.fail_on_existing_server_mismatch | bool
+
+- name: Provision hourly {{ site_server_type }} with public management and private L2 VLAN
   ansible.builtin.uri:
     url: "{{ phoenixnap.api_base }}/bmc/v1/servers"
     method: POST
@@ -36,10 +89,20 @@
       description: "OpenShift {{ ocp_minor }} SNO {{ site_item.key }} - {{ project_name }}"
       location: "{{ site_item.value.location }}"
       os: ipxe
-      type: "{{ phoenixnap.server_type }}"
+      type: "{{ site_server_type }}"
       pricingModel: "{{ phoenixnap.pricing_model }}"
       networkType: "{{ phoenixnap.network_type }}"
       installDefaultSshKeys: "{{ phoenixnap.install_default_ssh_keys | bool }}"
+      networkConfiguration:
+        ipBlocksConfiguration:
+          configurationType: PURCHASE_NEW
+        privateNetworkConfiguration:
+          configurationType: USER_DEFINED
+          privateNetworks:
+            - id: "{{ site_private_network.id }}"
+              ips:
+                - "{{ site_item.value.private_l2.server_ip }}"
+              dhcp: false
       osConfiguration:
         iPXE:
           url: "{{ site_infraenv.resources[0].status.bootArtifacts.ipxeScript }}"
@@ -71,6 +134,17 @@
   retries: "{{ (wait.server_seconds / 15) | int }}"
   delay: 15
   no_log: true
+
+- name: Verify server has the requested private network attached
+  ansible.builtin.assert:
+    that:
+      - >-
+        (site_server_info.json.networkConfiguration.privateNetworkConfiguration.privateNetworks | default([])
+        | selectattr('id', 'equalto', site_private_network.id)
+        | list | length) == 1
+    fail_msg: >-
+      {{ site_item.key }} server is running but private L2 network
+      {{ site_private_network.name }} is not attached.
 
 - name: Wait for RHACM Agent discovered by iPXE
   kubernetes.core.k8s_info:
@@ -112,11 +186,17 @@
       server_id: {{ site_server_info.json.id }}
       hostname: {{ site_server_info.json.hostname }}
       location: {{ site_server_info.json.location }}
+      type: {{ site_server_info.json.type }}
       public_ip: {{ site_server_info.json.publicIpAddresses[0] }}
+      private_l2_network_id: {{ site_private_network.id }}
+      private_l2_vlan_id: {{ site_private_network.vlanId }}
+      private_l2_server_ip: {{ site_item.value.private_l2.server_ip }}
       status: {{ site_server_info.json.status }}
 
 - name: Report server endpoint
   ansible.builtin.debug:
     msg: >-
       {{ site_item.key }}: {{ site_server_info.json.hostname }} ->
-      {{ site_server_info.json.publicIpAddresses[0] }} ({{ site_server_info.json.status }})
+      public={{ site_server_info.json.publicIpAddresses[0] }},
+      private-L2={{ site_item.value.private_l2.server_ip }}/VLAN{{ site_private_network.vlanId }}
+      ({{ site_server_info.json.status }})

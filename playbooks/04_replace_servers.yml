@@ -1,0 +1,7 @@
+---
+- name: Explicitly replace project servers whose immutable shape/network no longer matches
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - role: pnap_auth
+    - role: pnap_replace_servers

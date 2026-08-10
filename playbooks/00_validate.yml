@@ -10,12 +10,16 @@
           - ocp_minor == '4.22'
           - rhacm.existing_hub | bool
           - rhacm.api | length > 0
-          - phoenixnap.server_type | length > 0
+          - (sites.sw1.server_type | default(phoenixnap.server_type)) | length > 0
+          - (sites.c1.server_type | default(phoenixnap.server_type)) | length > 0
+          - phoenixnap.network_type == 'PUBLIC_AND_PRIVATE'
           - sites.sw1.location == 'PHX'
           - sites.c1.location == 'CHI'
           - sites.sw1.cluster_network != sites.c1.cluster_network
           - sites.sw1.service_network != sites.c1.service_network
           - evpn.vm_subnet | length > 0
+          - sites.sw1.private_l2.cidr != sites.c1.private_l2.cidr
+          - vm_l2.network_name | length > 0
         fail_msg: "Review inventories/lab/group_vars/all.yml."
 
     - name: Explain EVPN safety gate

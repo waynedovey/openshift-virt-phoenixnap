@@ -1,0 +1,8 @@
+---
+- name: Expose phoenixNAP private Layer2 VLANs to OpenShift Virtualization VMs
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - role: pnap_auth
+    - role: openshift_localnet
+      when: vm_l2.enabled | bool

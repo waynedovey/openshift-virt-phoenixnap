@@ -6,7 +6,7 @@ ANSIBLE_PLAYBOOK := $(VENV)/bin/ansible-playbook
 ANSIBLE_GALAXY := $(VENV)/bin/ansible-galaxy
 ANSIBLE_LINT := $(VENV)/bin/ansible-lint
 
-.PHONY: bootstrap validate preflight prepare-hub bgp provision dns install virt evpn status deploy destroy lint clean-venv
+.PHONY: bootstrap validate availability preflight prepare-hub private-networks bgp replace-servers provision dns install virt nmstate vm-l2 evpn status deploy destroy lint clean-venv
 
 $(ANSIBLE_PLAYBOOK): requirements.txt requirements.yml
 	$(PYTHON) -m venv $(VENV)
@@ -22,14 +22,23 @@ bootstrap: $(ANSIBLE_PLAYBOOK)
 validate: $(ANSIBLE_PLAYBOOK)
 	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) playbooks/00_validate.yml
 
+availability: $(ANSIBLE_PLAYBOOK)
+	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) playbooks/00a_availability.yml
+
 preflight: $(ANSIBLE_PLAYBOOK)
 	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) playbooks/01_preflight.yml
 
 prepare-hub: $(ANSIBLE_PLAYBOOK)
 	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) playbooks/02_prepare_rhacm.yml
 
+private-networks: $(ANSIBLE_PLAYBOOK)
+	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) playbooks/03a_private_networks.yml
+
 bgp: $(ANSIBLE_PLAYBOOK)
 	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) playbooks/03_phoenixnap_bgp.yml
+
+replace-servers: $(ANSIBLE_PLAYBOOK)
+	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) playbooks/04_replace_servers.yml -e confirm_replace=true
 
 provision: $(ANSIBLE_PLAYBOOK)
 	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) playbooks/04_provision_servers.yml
@@ -42,6 +51,12 @@ install: $(ANSIBLE_PLAYBOOK)
 
 virt: $(ANSIBLE_PLAYBOOK)
 	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) playbooks/07_virtualization.yml
+
+nmstate: $(ANSIBLE_PLAYBOOK)
+	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) playbooks/07b_nmstate.yml
+
+vm-l2: $(ANSIBLE_PLAYBOOK)
+	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) playbooks/07c_vm_localnet.yml
 
 evpn: $(ANSIBLE_PLAYBOOK)
 	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) playbooks/08_evpn.yml

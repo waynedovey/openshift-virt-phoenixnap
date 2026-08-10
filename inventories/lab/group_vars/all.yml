@@ -15,14 +15,18 @@ rhacm:
 phoenixnap:
   api_base: "https://api.phoenixnap.com"
   auth_url: "https://auth.phoenixnap.com/auth/realms/BMC/protocol/openid-connect/token"
-  server_type: s2.c1.small
+  # Default server type. Each site can override this independently.
+  server_type: s1.c1.medium
   pricing_model: HOURLY
-  network_type: PUBLIC_ONLY
+  # Public management/iPXE plus an explicit site-local private L2 VLAN.
+  # The private network list itself is USER_DEFINED in networkConfiguration.
+  network_type: PUBLIC_AND_PRIVATE
   install_default_ssh_keys: false
   delete_ip_blocks_on_destroy: true
-  # OCP 4.22 supports a 4-vCPU SNO minimum, while 8 vCPU is the recommended
-  # topology. This 6-core SKU is intentionally allowed but preflight warns.
-  recommended_server_type: s2.c2.small
+  delete_private_networks_on_destroy: false
+  # Server type cannot be resized in place. Existing mismatched servers are
+  # never silently destroyed; use `make replace-servers` explicitly.
+  fail_on_existing_server_mismatch: true
   bgp:
     enabled: true
     asn: 65401
@@ -37,6 +41,8 @@ openshift_pull_secret_file: >-
 sites:
   sw1:
     cluster_name: sw1
+    # Override per site when a SKU is temporarily unavailable in a location.
+    server_type: s1.c1.medium
     location: PHX
     node_hostname: sno-sw1.digitaldovey.net
     cluster_network: 10.128.0.0/14
@@ -44,8 +50,16 @@ sites:
     service_network: 172.30.0.0/16
     bgp_asn: 65011
     vtep_ip: 10.255.50.11
+    private_l2:
+      name: ocp-sw1-vm-l2
+      cidr: 10.60.10.0/24
+      server_ip: 10.60.10.10
+      # auto = choose an UP Ethernet NIC that is not carrying the default route.
+      # Set explicitly if your SNO interface naming differs.
+      uplink_interface: auto
   c1:
     cluster_name: c1
+    server_type: s1.c1.medium
     location: CHI
     node_hostname: sno-c1.digitaldovey.net
     cluster_network: 10.132.0.0/14
@@ -53,6 +67,11 @@ sites:
     service_network: 172.31.0.0/16
     bgp_asn: 65021
     vtep_ip: 10.255.50.21
+    private_l2:
+      name: ocp-c1-vm-l2
+      cidr: 10.60.20.0/24
+      server_ip: 10.60.20.10
+      uplink_interface: auto
 
 cloudflare:
   enabled: true
@@ -81,6 +100,20 @@ nmstate:
   source: redhat-operators
   source_namespace: openshift-marketplace
 
+# Site-local physical/L2 VM access. phoenixNAP assigns a private VLAN in each
+# region. The SNO exposes that VLAN through an OVN-Kubernetes Localnet CUDN.
+# These two VLANs are NOT a cross-region L2 stretch.
+vm_l2:
+  enabled: true
+  apply: true
+  namespace: vm-workloads
+  network_name: pnap-vm-localnet
+  physical_network_name: pnap-vm-l2
+  bridge_name: br-pnap-vm
+  namespace_label_key: digitaldovey.net/vm-l2
+  namespace_label_value: "true"
+  require_non_management_interface: true
+
 # IMPORTANT: phoenixNAP BGP peer groups are ordinary IP BGP. They are not
 # treated here as an EVPN fabric. EVPN application is gated until the actual
 # external EVPN peer addresses are known and reachable from both SNO nodes.
@@ -101,5 +134,6 @@ evpn:
 
 wait:
   server_seconds: 1800
+  network_seconds: 900
   install_seconds: 7200
   operator_seconds: 1800

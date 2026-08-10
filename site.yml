@@ -2,10 +2,13 @@
 - import_playbook: playbooks/00_validate.yml
 - import_playbook: playbooks/01_preflight.yml
 - import_playbook: playbooks/02_prepare_rhacm.yml
+- import_playbook: playbooks/03a_private_networks.yml
 - import_playbook: playbooks/03_phoenixnap_bgp.yml
 - import_playbook: playbooks/04_provision_servers.yml
 - import_playbook: playbooks/05_cloudflare_dns.yml
 - import_playbook: playbooks/06_wait_and_export.yml
 - import_playbook: playbooks/07_virtualization.yml
+- import_playbook: playbooks/07b_nmstate.yml
+- import_playbook: playbooks/07c_vm_localnet.yml
 - import_playbook: playbooks/08_evpn.yml
 - import_playbook: playbooks/09_status.yml

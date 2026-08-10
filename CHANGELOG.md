@@ -1,4 +1,22 @@
+## 1.1.1
+
+- Add per-site phoenixNAP server type overrides.
+- Add `make availability` to list currently available server SKUs in PHX and CHI.
+- Preflight now validates each site's configured SKU independently and points to the availability command.
+- Provision/replace roles use the site-specific SKU without silently choosing a fallback.
+
 # Changelog
+
+## v1.1.0
+
+- Move the hourly server default to `s1.c1.medium`.
+- Add a private phoenixNAP Layer2 network per region and attach it during server provisioning.
+- Use deterministic site-local private CIDRs: SW1 `10.60.10.0/24`, C1 `10.60.20.0/24`.
+- Add explicit `make replace-servers` workflow because phoenixNAP server type is immutable.
+- Install Kubernetes NMState independently of EVPN activation.
+- Auto-detect a non-default-route Ethernet interface for the lab VM private VLAN, with a hard safety gate and documented phoenixNAP LACP caveat.
+- Create an OVS bridge and secondary OVN-Kubernetes Localnet CUDN for OpenShift Virtualization VMs.
+- Keep the site-local private L2 networks separate from the staged cross-site EVPN `10.50.50.0/24` network.
 
 ## v1.0.4
 

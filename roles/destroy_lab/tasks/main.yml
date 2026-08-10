@@ -40,3 +40,29 @@
   loop_control:
     loop_var: bgp_file
   when: bgp_file.stat.exists | bool
+
+- name: List private networks for optional teardown
+  ansible.builtin.uri:
+    url: "{{ phoenixnap.api_base }}/networks/v1/private-networks"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ pnap_token }}"
+    return_content: true
+    status_code: 200
+  register: destroy_private_networks
+  when: phoenixnap.delete_private_networks_on_destroy | bool
+  no_log: true
+
+- name: Delete project-named private networks when explicitly enabled
+  ansible.builtin.uri:
+    url: "{{ phoenixnap.api_base }}/networks/v1/private-networks/{{ item.id }}"
+    method: DELETE
+    headers:
+      Authorization: "Bearer {{ pnap_token }}"
+    status_code: [200, 202, 204, 404]
+  loop: >-
+    {{ destroy_private_networks.json | default([])
+       | selectattr('name', 'in', [sites.sw1.private_l2.name, sites.c1.private_l2.name])
+       | list }}
+  when: phoenixnap.delete_private_networks_on_destroy | bool
+  no_log: true
