@@ -22,7 +22,11 @@ The playbook then:
 4. Creates an FRRConfiguration to the external EVPN peer.
 5. Creates the unmanaged VTEP object.
 6. Creates RouteAdvertisements.
-7. Creates a primary Layer2 EVPN ClusterUserDefinedNetwork using `10.50.50.0/24`, VNI `5050`, RT `65000:5050`.
+7. Creates a primary Layer2 EVPN ClusterUserDefinedNetwork with no OVN-managed subnet, VNI `5050`, RT `65000:5050`. The proof guests use deterministic static addresses from `10.50.50.0/24`.
+
+## Manual addressing on the Layer2 CUDN
+
+OpenShift 4.22 allows a primary Layer2 `ClusterUserDefinedNetwork` to omit the `subnets` field. In that mode, workload IP addresses must be configured manually and IP spoofing protection is not enforced; MAC spoofing protection remains. This lab uses that supported Layer2 mode so two independent clusters do not run separate OVN IP allocators against the same `10.50.50.0/24` address space. The RHEL guests receive their fixed addresses through cloud-init while the EVPN MAC-VRF carries the Layer2 reachability.
 
 ## IPAM warning
 
@@ -39,3 +43,8 @@ The `ocp-sw1-vm-l2` and `ocp-c1-ash-vm-l2` private VLANs are site-local physical
 OpenShift Virtualization Localnet attachment. They do not stretch Layer2 between PHX and ASH.
 The EVPN/VXLAN design is still the mechanism intended to carry the portable `10.50.50.0/24`
 VM network between sites. phoenixNAP BGP peering itself remains public-IP based.
+
+
+## Proof VMs
+
+When EVPN is accepted by both clusters, `make test-vms` creates `rhel9-sw1` (`10.50.50.11/24`) and `rhel9-c1` (`10.50.50.21/24`). Each VM uses one primary UDN `l2bridge` interface and writes a continuous peer-ping result to its serial console. The proof VM stage is skipped unless both `evpn.apply` and `evpn.fabric_confirmed` are true.

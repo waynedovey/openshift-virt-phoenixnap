@@ -1,0 +1,241 @@
+---
+- name: Set EVPN proof VM site facts
+  ansible.builtin.set_fact:
+    managed_kubeconfig: "artifacts/kubeconfigs/{{ site_item.value.cluster_name }}.kubeconfig"
+    evpn_test_vm_name: "rhel9-{{ site_item.key }}"
+    evpn_test_vm_rootdisk: "rhel9-{{ site_item.key }}-rootdisk"
+    evpn_test_vm_secret: "rhel9-{{ site_item.key }}-authorized-keys"
+    evpn_test_vm_ip_cidr: "{{ evpn_test_vms.ips[site_item.key] }}"
+    evpn_test_vm_ip: "{{ evpn_test_vms.ips[site_item.key].split('/')[0] }}"
+    evpn_test_vm_mac: "{{ evpn_test_vms.macs[site_item.key] }}"
+    evpn_test_vm_peer_ip: >-
+      {{ evpn_test_vms.ips['c1' if site_item.key == 'sw1' else 'sw1'].split('/')[0] }}
+
+- name: Require shared EVPN network and LVM storage before creating test VM
+  ansible.builtin.assert:
+    that:
+      - evpn_test_vm_ip_cidr | length > 0
+      - evpn_test_vm_mac | length > 0
+      - evpn_test_vms.storage_class == ('lvms-' ~ lvm_storage.device_class)
+    fail_msg: "Review evpn_test_vms configuration in inventories/lab/group_vars/all.yml."
+
+- name: Verify EVPN workload namespace has immutable primary-UDN label
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: v1
+    kind: Namespace
+    name: "{{ evpn.namespace }}"
+  register: evpn_vm_namespace
+
+- name: Require primary UDN namespace to be ready
+  ansible.builtin.assert:
+    that:
+      - evpn_vm_namespace.resources | length == 1
+      - (evpn_vm_namespace.resources[0].metadata.labels | default({})).get('k8s.ovn.org/primary-user-defined-network', '__missing__') == ''
+    fail_msg: >-
+      {{ evpn.namespace }} must exist with k8s.ovn.org/primary-user-defined-network=""
+      from namespace creation time before a single-interface primary-UDN VM can start.
+
+- name: Wait for EVPN ClusterUserDefinedNetwork acceptance
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: k8s.ovn.org/v1
+    kind: ClusterUserDefinedNetwork
+    name: "{{ evpn.network_name }}"
+  register: evpn_test_cudn
+  until: >-
+    evpn_test_cudn.resources | length == 1 and
+    (evpn_test_cudn.resources[0].status.conditions | default([])
+      | selectattr('reason', 'equalto', 'EVPNTransportAccepted')
+      | selectattr('status', 'equalto', 'True') | list | length) > 0
+  retries: 60
+  delay: 10
+
+- name: Wait for LVMS StorageClass
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: storage.k8s.io/v1
+    kind: StorageClass
+    name: "{{ evpn_test_vms.storage_class }}"
+  register: evpn_vm_sc
+  until: evpn_vm_sc.resources | length == 1
+  retries: 60
+  delay: 5
+
+- name: Wait for Red Hat RHEL 9 boot DataSource
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: cdi.kubevirt.io/v1beta1
+    kind: DataSource
+    name: "{{ evpn_test_vms.image_datasource }}"
+    namespace: "{{ evpn_test_vms.image_namespace }}"
+  register: rhel9_datasource
+  until: >-
+    rhel9_datasource.resources | length == 1 and
+    (rhel9_datasource.resources[0].spec.source.pvc is defined or
+     rhel9_datasource.resources[0].spec.source.snapshot is defined)
+  retries: "{{ (wait.operator_seconds / 15) | int }}"
+  delay: 15
+
+- name: Create SSH key secret for RHEL 9 proof VM
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: "{{ evpn_test_vm_secret }}"
+        namespace: "{{ evpn.namespace }}"
+      type: Opaque
+      stringData:
+        key: "{{ evpn_test_vm_ssh_key }}"
+
+- name: Create single-interface RHEL 9 EVPN proof VM
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: kubevirt.io/v1
+      kind: VirtualMachine
+      metadata:
+        name: "{{ evpn_test_vm_name }}"
+        namespace: "{{ evpn.namespace }}"
+        labels:
+          digitaldovey.net/evpn-proof: "true"
+          digitaldovey.net/site: "{{ site_item.key }}"
+      spec:
+        runStrategy: Always
+        preference:
+          name: rhel.9
+        dataVolumeTemplates:
+          - metadata:
+              name: "{{ evpn_test_vm_rootdisk }}"
+            spec:
+              sourceRef:
+                kind: DataSource
+                name: "{{ evpn_test_vms.image_datasource }}"
+                namespace: "{{ evpn_test_vms.image_namespace }}"
+              storage:
+                storageClassName: "{{ evpn_test_vms.storage_class }}"
+                accessModes:
+                  - ReadWriteOnce
+                volumeMode: Block
+                resources:
+                  requests:
+                    storage: "{{ evpn_test_vms.disk_size }}"
+        template:
+          metadata:
+            labels:
+              digitaldovey.net/evpn-proof: "true"
+              digitaldovey.net/site: "{{ site_item.key }}"
+          spec:
+            domain:
+              cpu:
+                cores: "{{ evpn_test_vms.cpu_cores | int }}"
+              memory:
+                guest: "{{ evpn_test_vms.memory }}"
+              devices:
+                interfaces:
+                  - name: default
+                    macAddress: "{{ evpn_test_vm_mac }}"
+                    binding:
+                      name: l2bridge
+            networks:
+              - name: default
+                pod: {}
+            accessCredentials:
+              - sshPublicKey:
+                  propagationMethod:
+                    noCloud: {}
+                  source:
+                    secret:
+                      secretName: "{{ evpn_test_vm_secret }}"
+            volumes:
+              - name: rootdisk
+                dataVolume:
+                  name: "{{ evpn_test_vm_rootdisk }}"
+              - name: cloudinitdisk
+                cloudInitNoCloud:
+                  userData: |
+                    #cloud-config
+                    user: cloud-user
+                    write_files:
+                      - path: /usr/local/sbin/evpn-peer-check
+                        owner: root:root
+                        permissions: '0755'
+                        content: |
+                          #!/bin/bash
+                          while true; do
+                            echo "[EVPN-PROOF] $(date -Is) {{ evpn_test_vm_name }} ({{ evpn_test_vm_ip }}) -> {{ evpn_test_vm_peer_ip }}" > /dev/ttyS0
+                            ping -c 1 -W 2 {{ evpn_test_vm_peer_ip }} >> /dev/ttyS0 2>&1 || true
+                            sleep {{ evpn_test_vms.peer_check_seconds }}
+                          done
+                      - path: /etc/systemd/system/evpn-peer-check.service
+                        owner: root:root
+                        permissions: '0644'
+                        content: |
+                          [Unit]
+                          Description=Cross-site EVPN proof ping
+                          After=network-online.target
+                          Wants=network-online.target
+
+                          [Service]
+                          Type=simple
+                          ExecStart=/usr/local/sbin/evpn-peer-check
+                          Restart=always
+                          RestartSec=5
+
+                          [Install]
+                          WantedBy=multi-user.target
+                    runcmd:
+                      - [ systemctl, daemon-reload ]
+                      - [ systemctl, enable, --now, evpn-peer-check.service ]
+                  networkData: |
+                    version: 2
+                    ethernets:
+                      evpn0:
+                        match:
+                          macaddress: "{{ evpn_test_vm_mac }}"
+                        set-name: eth0
+                        dhcp4: false
+                        dhcp6: false
+                        addresses:
+                          - "{{ evpn_test_vm_ip_cidr }}"
+
+- name: Wait for RHEL 9 root DataVolume import/clone
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: cdi.kubevirt.io/v1beta1
+    kind: DataVolume
+    name: "{{ evpn_test_vm_rootdisk }}"
+    namespace: "{{ evpn.namespace }}"
+  register: evpn_vm_dv
+  until:
+    - evpn_vm_dv.resources | length == 1
+    - evpn_vm_dv.resources[0].status.phase | default('') == 'Succeeded'
+  retries: "{{ (wait.operator_seconds / 15) | int }}"
+  delay: 15
+
+- name: Wait for RHEL 9 EVPN proof VMI to run
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: kubevirt.io/v1
+    kind: VirtualMachineInstance
+    name: "{{ evpn_test_vm_name }}"
+    namespace: "{{ evpn.namespace }}"
+  register: evpn_test_vmi
+  until:
+    - evpn_test_vmi.resources | length == 1
+    - evpn_test_vmi.resources[0].status.phase | default('') == 'Running'
+  retries: "{{ (wait.operator_seconds / 10) | int }}"
+  delay: 10
+
+- name: Report RHEL 9 EVPN proof VM
+  ansible.builtin.debug:
+    msg: >-
+      {{ site_item.key }}: {{ evpn_test_vm_name }} is Running with exactly one
+      primary l2bridge interface; static guest IP={{ evpn_test_vm_ip_cidr }},
+      MAC={{ evpn_test_vm_mac }}, root={{ evpn_test_vms.disk_size }} on
+      {{ evpn_test_vms.storage_class }}. Its serial console continuously pings
+      peer {{ evpn_test_vm_peer_ip }} for the cross-site EVPN proof.

@@ -6,7 +6,7 @@ ANSIBLE_PLAYBOOK := $(VENV)/bin/ansible-playbook
 ANSIBLE_GALAXY := $(VENV)/bin/ansible-galaxy
 ANSIBLE_LINT := $(VENV)/bin/ansible-lint
 
-.PHONY: bootstrap validate availability preflight prepare-hub private-networks bgp replace-servers provision dns install virt nmstate vm-l2 evpn status deploy destroy lint clean-venv
+.PHONY: bootstrap validate availability preflight prepare-hub private-networks bgp replace-servers provision dns install storage virt nmstate vm-l2 evpn test-vms status deploy destroy lint clean-venv
 
 $(ANSIBLE_PLAYBOOK): requirements.txt requirements.yml
 	$(PYTHON) -m venv $(VENV)
@@ -49,6 +49,9 @@ dns: $(ANSIBLE_PLAYBOOK)
 install: $(ANSIBLE_PLAYBOOK)
 	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) playbooks/06_wait_and_export.yml
 
+storage: $(ANSIBLE_PLAYBOOK)
+	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) playbooks/06a_lvm_storage.yml
+
 virt: $(ANSIBLE_PLAYBOOK)
 	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) playbooks/07_virtualization.yml
 
@@ -60,6 +63,9 @@ vm-l2: $(ANSIBLE_PLAYBOOK)
 
 evpn: $(ANSIBLE_PLAYBOOK)
 	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) playbooks/08_evpn.yml
+
+test-vms: $(ANSIBLE_PLAYBOOK)
+	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) playbooks/08a_test_vms.yml
 
 status: $(ANSIBLE_PLAYBOOK)
 	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) playbooks/09_status.yml

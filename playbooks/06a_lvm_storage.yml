@@ -1,0 +1,7 @@
+---
+- name: Configure LVM Storage on both SNO clusters
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - role: openshift_lvm_storage
+      when: lvm_storage.enabled | bool

@@ -1,0 +1,7 @@
+---
+- name: Create RHEL 9 EVPN proof VMs
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - role: evpn_test_vms
+      when: evpn_test_vms.enabled | bool

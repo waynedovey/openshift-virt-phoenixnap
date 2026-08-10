@@ -7,8 +7,10 @@
 - import_playbook: playbooks/04_provision_servers.yml
 - import_playbook: playbooks/05_cloudflare_dns.yml
 - import_playbook: playbooks/06_wait_and_export.yml
+- import_playbook: playbooks/06a_lvm_storage.yml
 - import_playbook: playbooks/07_virtualization.yml
 - import_playbook: playbooks/07b_nmstate.yml
 - import_playbook: playbooks/07c_vm_localnet.yml
 - import_playbook: playbooks/08_evpn.yml
+- import_playbook: playbooks/08a_test_vms.yml
 - import_playbook: playbooks/09_status.yml

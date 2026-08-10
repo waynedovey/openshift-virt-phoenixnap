@@ -26,7 +26,12 @@ make bgp
 make provision
 make dns
 make install
+make storage
 make virt
+make nmstate
+make vm-l2
+make evpn
+make test-vms
 make status
 ```
 
@@ -36,7 +41,7 @@ Or run all safe stages:
 make deploy
 ```
 
-`make deploy` will stage but skip EVPN until `evpn.apply=true` and the external fabric is confirmed.
+`make deploy` configures LVM Storage before OpenShift Virtualization. It stages but skips EVPN and the RHEL 9 cross-site proof VMs until `evpn.apply=true` and the external fabric is confirmed.
 
 ## Destruction
 

@@ -1,0 +1,6 @@
+---
+- name: Configure LVM Storage on each managed SNO
+  ansible.builtin.include_tasks: site.yml
+  loop: "{{ sites | dict2items }}"
+  loop_control:
+    loop_var: site_item

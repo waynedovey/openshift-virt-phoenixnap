@@ -23,6 +23,15 @@
           - evpn.vm_subnet | length > 0
           - sites.sw1.private_l2.cidr != sites.c1.private_l2.cidr
           - vm_l2.network_name | length > 0
+          - lvm_storage.size_percent | int >= 10
+          - lvm_storage.size_percent | int <= 90
+          - lvm_storage.min_thin_pool_gib | int >= 100
+          - lvm_storage.overprovision_ratio | int >= 1
+          - lvm_storage.device_class | length > 0
+          - evpn_test_vms.storage_class == ('lvms-' ~ lvm_storage.device_class)
+          - evpn_test_vms.namespace == evpn.namespace
+          - evpn_test_vms.ips.sw1 != evpn_test_vms.ips.c1
+          - evpn_test_vms.macs.sw1 != evpn_test_vms.macs.c1
         fail_msg: "Review inventories/lab/group_vars/all.yml."
 
     - name: Explain EVPN safety gate

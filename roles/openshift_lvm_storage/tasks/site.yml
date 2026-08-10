@@ -1,0 +1,367 @@
+---
+- name: Set LVM Storage site facts
+  ansible.builtin.set_fact:
+    managed_kubeconfig: "artifacts/kubeconfigs/{{ site_item.value.cluster_name }}.kubeconfig"
+    lvm_storage_class_name: "lvms-{{ lvm_storage.device_class }}"
+    lvm_selected_device: ""
+    lvm_selected_device_bytes: 0
+    lvm_selected_device_kernel: ""
+    lvm_device_selection_mode: ""
+    lvm_device_candidates: []
+
+- name: Get the SNO node for LVM Storage
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: v1
+    kind: Node
+  register: lvm_nodes
+
+- name: Require exactly one node for LVM Storage
+  ansible.builtin.assert:
+    that:
+      - lvm_nodes.resources | length == 1
+    fail_msg: >-
+      {{ site_item.key }} must be a Single Node OpenShift cluster before LVM Storage
+      is configured; found {{ lvm_nodes.resources | length }} nodes.
+
+- name: Remember SNO node name
+  ansible.builtin.set_fact:
+    lvm_node_name: "{{ lvm_nodes.resources[0].metadata.name }}"
+
+- name: Create LVM Storage namespace
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ lvm_storage.namespace }}"
+        labels:
+          openshift.io/cluster-monitoring: "true"
+          pod-security.kubernetes.io/enforce: privileged
+          pod-security.kubernetes.io/audit: privileged
+          pod-security.kubernetes.io/warn: privileged
+
+- name: Create LVM Storage OperatorGroup
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: operators.coreos.com/v1
+      kind: OperatorGroup
+      metadata:
+        name: openshift-storage-operatorgroup
+        namespace: "{{ lvm_storage.namespace }}"
+      spec:
+        targetNamespaces:
+          - "{{ lvm_storage.namespace }}"
+
+- name: Subscribe to LVM Storage
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: operators.coreos.com/v1alpha1
+      kind: Subscription
+      metadata:
+        name: "{{ lvm_storage.subscription }}"
+        namespace: "{{ lvm_storage.namespace }}"
+      spec:
+        channel: "{{ lvm_storage.channel }}"
+        installPlanApproval: Automatic
+        name: "{{ lvm_storage.package }}"
+        source: "{{ lvm_storage.source }}"
+        sourceNamespace: "{{ lvm_storage.source_namespace }}"
+
+- name: Wait for LVM Storage installedCSV
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: operators.coreos.com/v1alpha1
+    kind: Subscription
+    name: "{{ lvm_storage.subscription }}"
+    namespace: "{{ lvm_storage.namespace }}"
+  register: lvms_subscription
+  until:
+    - lvms_subscription.resources | length == 1
+    - lvms_subscription.resources[0].status.installedCSV is defined
+  retries: "{{ (wait.operator_seconds / 15) | int }}"
+  delay: 15
+
+- name: Wait for LVM Storage CSV to succeed
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: operators.coreos.com/v1alpha1
+    kind: ClusterServiceVersion
+    name: "{{ lvms_subscription.resources[0].status.installedCSV }}"
+    namespace: "{{ lvm_storage.namespace }}"
+  register: lvms_csv
+  until:
+    - lvms_csv.resources | length == 1
+    - lvms_csv.resources[0].status.phase | default('') == 'Succeeded'
+  retries: "{{ (wait.operator_seconds / 15) | int }}"
+  delay: 15
+
+- name: Read existing LVMCluster
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: lvm.topolvm.io/v1alpha1
+    kind: LVMCluster
+    name: "{{ lvm_storage.lvmcluster_name }}"
+    namespace: "{{ lvm_storage.namespace }}"
+  register: existing_lvmcluster
+
+- name: Reuse device path already owned by LVM Storage
+  ansible.builtin.set_fact:
+    lvm_selected_device: >-
+      {{ existing_lvmcluster.resources[0].spec.storage.deviceClasses[0].deviceSelector.paths[0] }}
+    lvm_device_selection_mode: existing-lvmcluster
+  when:
+    - existing_lvmcluster.resources | length == 1
+    - existing_lvmcluster.resources[0].spec.storage.deviceClasses | default([]) | length > 0
+    - existing_lvmcluster.resources[0].spec.storage.deviceClasses[0].deviceSelector.paths | default([]) | length == 1
+
+- name: Require an explicit device path on an existing LVMCluster
+  ansible.builtin.assert:
+    that:
+      - existing_lvmcluster.resources[0].spec.storage.deviceClasses[0].deviceSelector.paths | default([]) | length == 1
+    fail_msg: >-
+      {{ site_item.key }} already has {{ lvm_storage.lvmcluster_name }}, but it is not
+      pinned to exactly one explicit deviceSelector.paths entry. Refusing to guess or
+      change an existing LVM volume group.
+  when: existing_lvmcluster.resources | length == 1
+
+- name: Probe SNO host for one completely unused whole disk
+  ansible.builtin.command:
+    argv:
+      - oc
+      - --kubeconfig
+      - "{{ managed_kubeconfig }}"
+      - debug
+      - "node/{{ lvm_node_name }}"
+      - --quiet
+      - --
+      - chroot
+      - /host
+      - bash
+      - -ceu
+      - |
+        for sysdev in /sys/block/*; do
+          name="$(basename "${sysdev}")"
+          case "${name}" in
+            nvme*n1|sd[a-z]|vd[a-z]) ;;
+            *) continue ;;
+          esac
+
+          dev="/dev/${name}"
+          [ -b "${dev}" ] || continue
+          [ "$(lsblk -dn -o RO "${dev}" | tr -d ' ')" = "0" ] || continue
+
+          # An installation disk has partitions. LVMS may only receive a whole,
+          # unused disk with no children, mounts, filesystem, partition table,
+          # RAID/LVM metadata or other wipefs signatures.
+          [ "$(lsblk -nr -o TYPE "${dev}" | wc -l)" -eq 1 ] || continue
+          [ -z "$(lsblk -dn -o FSTYPE "${dev}" | xargs)" ] || continue
+          [ -z "$(lsblk -dn -o PTTYPE "${dev}" | xargs)" ] || continue
+          [ -z "$(lsblk -dn -o MOUNTPOINTS "${dev}" | xargs)" ] || continue
+          [ -z "$(wipefs -n --noheadings -o TYPE "${dev}" 2>/dev/null | xargs)" ] || continue
+
+          stable=""
+          for link in /dev/disk/by-path/*; do
+            [ -L "${link}" ] || continue
+            case "${link}" in *-part*) continue ;; esac
+            if [ "$(readlink -f "${link}")" = "${dev}" ]; then
+              stable="${link}"
+              break
+            fi
+          done
+          [ -n "${stable}" ] || continue
+
+          bytes="$(blockdev --getsize64 "${dev}")"
+          min_bytes={{ ((lvm_storage.min_thin_pool_gib | float) * 1073741824 * 100 / (lvm_storage.size_percent | float)) | int }}
+          [ "${bytes}" -ge "${min_bytes}" ] || continue
+          printf 'LVMS_CANDIDATE|%s|%s|%s\n' "${stable}" "${bytes}" "${dev}"
+        done
+  register: lvm_device_probe
+  changed_when: false
+  when: existing_lvmcluster.resources | length == 0
+
+- name: Parse safe unused LVM device candidates
+  ansible.builtin.set_fact:
+    lvm_device_candidates: >-
+      {{ lvm_device_probe.stdout_lines | default([])
+         | select('match', '^LVMS_CANDIDATE\\|') | list }}
+  when: existing_lvmcluster.resources | length == 0
+
+- name: Require exactly one safe unused whole disk
+  ansible.builtin.assert:
+    that:
+      - lvm_device_candidates | length == 1
+    fail_msg: >-
+      {{ site_item.key }} requires exactly one empty whole disk able to provide at least
+      {{ lvm_storage.min_thin_pool_gib }} GiB of physical thin-pool capacity, but
+      discovered {{ lvm_device_candidates | length }} safe qualifying candidates. No disk will be
+      wiped automatically. Inspect the node with `oc debug node/{{ lvm_node_name }} --
+      chroot /host lsblk -f` and resolve the disk layout before retrying.
+  when: existing_lvmcluster.resources | length == 0
+
+- name: Select stable by-path device for new LVM Storage
+  ansible.builtin.set_fact:
+    lvm_selected_device: "{{ (lvm_device_candidates[0].split('|'))[1] }}"
+    lvm_selected_device_bytes: "{{ (lvm_device_candidates[0].split('|'))[2] | int }}"
+    lvm_selected_device_kernel: "{{ (lvm_device_candidates[0].split('|'))[3] }}"
+    lvm_device_selection_mode: newly-discovered-empty-disk
+  when: existing_lvmcluster.resources | length == 0
+
+- name: Report selected LVM Storage device before apply
+  ansible.builtin.debug:
+    msg: >-
+      {{ site_item.key }}: LVM Storage device={{ lvm_selected_device }}
+      mode={{ lvm_device_selection_mode }}{% if lvm_selected_device_bytes | int > 0 %},
+      raw-capacity={{ ((lvm_selected_device_bytes | float) / 1073741824) | round(1) }} GiB,
+      {{ lvm_storage.size_percent }}%-thin-pool≈{{ (((lvm_selected_device_bytes | float) / 1073741824) * (lvm_storage.size_percent | float / 100)) | round(1) }} GiB{% endif %}.
+      force-wipe={{ lvm_storage.force_wipe }}.
+
+- name: Create LVMCluster using only the selected unused disk
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: lvm.topolvm.io/v1alpha1
+      kind: LVMCluster
+      metadata:
+        name: "{{ lvm_storage.lvmcluster_name }}"
+        namespace: "{{ lvm_storage.namespace }}"
+      spec:
+        storage:
+          deviceClasses:
+            - name: "{{ lvm_storage.device_class }}"
+              default: "{{ lvm_storage.make_default | bool }}"
+              fstype: xfs
+              deviceDiscoveryPolicy: Static
+              nodeSelector:
+                nodeSelectorTerms:
+                  - matchExpressions:
+                      - key: kubernetes.io/hostname
+                        operator: In
+                        values:
+                          - "{{ lvm_node_name }}"
+              deviceSelector:
+                paths:
+                  - "{{ lvm_selected_device }}"
+                forceWipeDevicesAndDestroyAllData: "{{ lvm_storage.force_wipe | bool }}"
+              thinPoolConfig:
+                name: "{{ lvm_storage.thin_pool_name }}"
+                sizePercent: "{{ lvm_storage.size_percent | int }}"
+                overprovisionRatio: "{{ lvm_storage.overprovision_ratio | int }}"
+              storageClassOptions:
+                reclaimPolicy: Delete
+                volumeBindingMode: WaitForFirstConsumer
+                additionalLabels:
+                  digitaldovey.net/storage-purpose: virtualization
+
+- name: Wait for LVMCluster Ready state
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: lvm.topolvm.io/v1alpha1
+    kind: LVMCluster
+    name: "{{ lvm_storage.lvmcluster_name }}"
+    namespace: "{{ lvm_storage.namespace }}"
+  register: lvmcluster_status
+  until:
+    - lvmcluster_status.resources | length == 1
+    - lvmcluster_status.resources[0].status.state | default('') == 'Ready'
+  retries: "{{ (wait.operator_seconds / 15) | int }}"
+  delay: 15
+
+- name: Wait for LVMS StorageClass
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: storage.k8s.io/v1
+    kind: StorageClass
+    name: "{{ lvm_storage_class_name }}"
+  register: lvms_storageclass
+  until: lvms_storageclass.resources | length == 1
+  retries: 60
+  delay: 5
+
+- name: Read all StorageClasses before choosing defaults
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: storage.k8s.io/v1
+    kind: StorageClass
+  register: all_storageclasses
+
+- name: Clear other cluster-default StorageClasses after LVMS is available
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    state: present
+    merge_type: merge
+    definition:
+      apiVersion: storage.k8s.io/v1
+      kind: StorageClass
+      metadata:
+        name: "{{ item.metadata.name }}"
+        annotations:
+          storageclass.kubernetes.io/is-default-class: "false"
+  loop: "{{ all_storageclasses.resources }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when:
+    - lvm_storage.make_default | bool
+    - item.metadata.name != lvm_storage_class_name
+    - (item.metadata.annotations | default({})).get('storageclass.kubernetes.io/is-default-class', 'false') == 'true'
+
+- name: Clear other virtualization-default StorageClasses
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    state: present
+    merge_type: merge
+    definition:
+      apiVersion: storage.k8s.io/v1
+      kind: StorageClass
+      metadata:
+        name: "{{ item.metadata.name }}"
+        annotations:
+          storageclass.kubevirt.io/is-default-virt-class: "false"
+  loop: "{{ all_storageclasses.resources }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when:
+    - lvm_storage.make_default_virt | bool
+    - item.metadata.name != lvm_storage_class_name
+    - (item.metadata.annotations | default({})).get('storageclass.kubevirt.io/is-default-virt-class', 'false') == 'true'
+
+- name: Mark LVMS as virtualization-default StorageClass
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    state: present
+    merge_type: merge
+    definition:
+      apiVersion: storage.k8s.io/v1
+      kind: StorageClass
+      metadata:
+        name: "{{ lvm_storage_class_name }}"
+        annotations:
+          storageclass.kubevirt.io/is-default-virt-class: "{{ 'true' if lvm_storage.make_default_virt | bool else 'false' }}"
+
+- name: Wait for LVMS to own the cluster-default StorageClass annotation
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: storage.k8s.io/v1
+    kind: StorageClass
+    name: "{{ lvm_storage_class_name }}"
+  register: lvms_default_storageclass
+  until: >-
+    lvms_default_storageclass.resources | length == 1 and
+    (not (lvm_storage.make_default | bool) or
+     (lvms_default_storageclass.resources[0].metadata.annotations | default({})).get('storageclass.kubernetes.io/is-default-class', 'false') == 'true')
+  retries: 30
+  delay: 5
+
+- name: Report ready LVM StorageClass
+  ansible.builtin.debug:
+    msg: >-
+      {{ site_item.key }}: {{ lvm_storage_class_name }} is ready on {{ lvm_selected_device }};
+      thin-pool={{ lvm_storage.size_percent }}%, overprovision={{ lvm_storage.overprovision_ratio }}x,
+      cluster-default={{ lvm_storage.make_default }}, virt-default={{ lvm_storage.make_default_virt }}.

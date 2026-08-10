@@ -1,3 +1,15 @@
+## 1.3.0
+
+- Add Red Hat LVM Storage to both SNO clusters using one dynamically discovered, completely unused whole local disk per node.
+- Pin the selected LVMS device by stable `/dev/disk/by-path`; abort unless exactly one safe empty candidate exists and keep force-wipe disabled.
+- Create `lvms-vg1` with a 90% thin pool, require at least 600 GiB physical thin-pool capacity, and use overprovision ratio 1; wait for LVMS to create its class before clearing any previous Kubernetes default, and mark `lvms-vg1` as the OpenShift Virtualization default storage class.
+- Add `make storage` and include the storage stage in `make deploy` before OpenShift Virtualization.
+- Stage one RHEL 9 proof VM per site: `rhel9-sw1` at `10.50.50.11/24` and `rhel9-c1` at `10.50.50.21/24`, each with exactly one primary EVPN `l2bridge` interface.
+- Use the Red Hat RHEL 9 boot DataSource, a 40 GiB LVMS root disk, deterministic MAC/IP addressing and a serial-console peer-ping service.
+- Gate the proof VMs on a confirmed, active external EVPN fabric so the site-local phoenixNAP VLANs are never misrepresented as a cross-site L2 network.
+- Configure the EVPN Layer2 CUDN with `subnets` omitted so workload addressing is manual; this avoids independent OVN allocators selecting overlapping addresses while the proof guests use controlled static IPs.
+- Sanitize BGP status output so phoenixNAP peer-group passwords are never printed by the status role.
+
 ## 1.2.9
 
 - Fix dynamic Kubernetes label-map rendering in the OpenShift Localnet role.

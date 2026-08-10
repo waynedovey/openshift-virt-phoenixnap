@@ -130,6 +130,28 @@ dns_record_prefixes:
   - api-int
   - "*.apps"
 
+# LVM Storage uses one dedicated, completely unused local disk on each SNO.
+# The automation discovers exactly one safe empty whole disk on first apply,
+# pins it by stable /dev/disk/by-path, and never force-wipes a device.
+lvm_storage:
+  enabled: true
+  namespace: openshift-lvm-storage
+  subscription: lvms
+  package: lvms-operator
+  channel: stable-4.22
+  source: redhat-operators
+  source_namespace: openshift-marketplace
+  lvmcluster_name: lvmcluster
+  device_class: vg1
+  thin_pool_name: thin-pool-1
+  size_percent: 90
+  # Require at least this much physical thin-pool capacity after sizePercent.
+  min_thin_pool_gib: 600
+  overprovision_ratio: 1
+  force_wipe: false
+  make_default: true
+  make_default_virt: true
+
 virtualization:
   enabled: true
   namespace: openshift-cnv
@@ -179,6 +201,29 @@ evpn:
   peers:
     sw1: ""
     c1: ""
+
+# One RHEL 9 proof VM per site. These are intentionally gated by evpn.apply
+# and evpn.fabric_confirmed: the site-local phoenixNAP VLANs are not a shared
+# PHX-to-ASH segment. The EVPN Layer2 CUDN deliberately omits `subnets`, so
+# workload addressing is manual and the guests use unique static addresses from
+# this shared L2 subnet.
+evpn_test_vms:
+  enabled: true
+  apply: true
+  namespace: evpn-vms
+  storage_class: lvms-vg1
+  disk_size: 40Gi
+  memory: 4Gi
+  cpu_cores: 2
+  image_datasource: rhel9
+  image_namespace: openshift-virtualization-os-images
+  peer_check_seconds: 15
+  ips:
+    sw1: 10.50.50.11/24
+    c1: 10.50.50.21/24
+  macs:
+    sw1: "02:50:50:00:00:11"
+    c1: "02:50:50:00:00:21"
 
 wait:
   server_seconds: 1800

@@ -54,12 +54,14 @@ phoenixNAP custom iPXE provisioning is currently limited to PHX, ASH and NLD. CH
 - phoenixNAP iPXE boot directly from the RHACM InfraEnv boot artifact
 - OpenShift Container Platform **4.22** Single Node OpenShift at each site
 - Cloudflare DNS for API, API-int and wildcard ingress
+- Red Hat LVM Storage on one dedicated unused NVMe per SNO, providing `lvms-vg1`
 - OpenShift Virtualization on each SNO
 - phoenixNAP dual-NIC LACP bond for the SNO native/public network
 - phoenixNAP private Layer-2 VLAN in each region for OpenShift Virtualization VMs
 - secondary OVN-Kubernetes Localnet CUDN backed by that private VLAN
 - phoenixNAP BGP Peer Group creation in both regions
 - staged OpenShift 4.22 BGP EVPN configuration for a shared VM network
+- gated RHEL 9 proof VMs `rhel9-sw1` and `rhel9-c1` on the shared `10.50.50.0/24` EVPN segment
 - explicit, guarded teardown of hourly resources
 
 ## Deliberate safety decisions
@@ -105,6 +107,14 @@ See `docs/evpn.md`.
 
 The first iPXE discovery can expose the same native/public DHCP address on both physical 10 Gb NICs. The automation uses that first Agent inventory to create an RHACM `NMStateConfig`, builds `bond0` in `802.3ad` mode, clones the active physical NIC MAC for DHCP, adds explicit NTP sources, regenerates the InfraEnv image and reboots iPXE. The OpenShift machine/default route then lives on `bond0`; private VLANs are consumed as tagged VLANs on the same bond.
 
+### 5. LVMS never repartitions the OpenShift installation disk
+
+The storage stage looks for exactly one completely unused whole local disk on each SNO that can provide at least 600 GiB of physical thin-pool capacity, pins it by stable `/dev/disk/by-path`, and creates an LVM thin pool with `forceWipeDevicesAndDestroyAllData: false`. Existing LVMCluster device ownership is reused on subsequent deploys. See `docs/lvm-storage.md`.
+
+### 6. Cross-site RHEL 9 proof VMs are EVPN-gated
+
+The proof VMs use `10.50.50.11/24` on SW1 and `10.50.50.21/24` on C1 with exactly one primary `l2bridge` interface. They are not created while `evpn.apply=false`, because the site-local phoenixNAP private VLANs do not constitute a cross-site Layer-2 fabric. See `docs/evpn-test-vms.md`.
+
 ## Prerequisites
 
 Local workstation:
@@ -147,9 +157,12 @@ make bgp
 make provision
 make dns
 make install
+make storage
 make virt
 make nmstate
 make vm-l2
+make evpn        # staged/skipped until fabric is confirmed
+make test-vms   # staged/skipped until EVPN is active
 make status
 ```
 
@@ -174,6 +187,12 @@ sno-c1.digitaldovey.net
 ```
 
 All are unproxied Cloudflare A records pointing at the SNO public IP for this lab.
+
+## LVM Storage
+
+The current two-disk SNO layout does **not** require rebuilding the clusters just to obtain VM storage. The installed RHCOS disk stays untouched; the other empty NVMe is consumed as the LVMS device. With a ~931 GiB raw disk and the default 90% thin pool, the lab gets roughly 838 GiB of physical thin-pool capacity per site with overprovisioning disabled (`overprovisionRatio: 1`).
+
+The generated storage class is `lvms-vg1`, marked as both cluster-default and virtualization-default. Run `make storage` independently if you want to validate the disk selection before the rest of the day-2 deployment. See `docs/lvm-storage.md`.
 
 ## Site-local VM Layer2
 
@@ -210,6 +229,17 @@ PHX / SW1                               ASH / C1
                     VNI: 5050
                     RT: 65000:5050
 ```
+
+## Shared EVPN proof VMs
+
+When a real external BGP EVPN fabric is configured and `evpn.apply=true`, the deploy creates:
+
+```text
+rhel9-sw1  10.50.50.11/24
+rhel9-c1   10.50.50.21/24
+```
+
+Each VM has exactly one primary UDN interface and a 40 GiB RHEL 9 disk on `lvms-vg1`. A serial-console service continuously pings the peer VM so the cross-site proof is easy to demonstrate. With the default `evpn.apply=false`, these VMs are staged but intentionally skipped. See `docs/evpn-test-vms.md`.
 
 ## Publish to GitHub
 

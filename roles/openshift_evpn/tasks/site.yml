@@ -67,7 +67,26 @@
   retries: 90
   delay: 10
 
-- name: Create workload namespace
+- name: Read EVPN workload namespace before primary UDN creation
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: v1
+    kind: Namespace
+    name: "{{ evpn.namespace }}"
+  register: evpn_workload_namespace
+
+- name: Refuse an existing EVPN namespace without the immutable primary-UDN label
+  ansible.builtin.assert:
+    that:
+      - (evpn_workload_namespace.resources[0].metadata.labels | default({})).get('k8s.ovn.org/primary-user-defined-network', '__missing__') == ''
+    fail_msg: >-
+      Namespace {{ evpn.namespace }} already exists without
+      k8s.ovn.org/primary-user-defined-network="". OpenShift requires that label
+      at namespace creation time for a primary UDN. Remove only that unused
+      namespace and rerun EVPN configuration.
+  when: evpn_workload_namespace.resources | length == 1
+
+- name: Create primary-UDN EVPN workload namespace
   kubernetes.core.k8s:
     kubeconfig: "{{ managed_kubeconfig }}"
     state: present
@@ -76,6 +95,10 @@
       kind: Namespace
       metadata:
         name: "{{ evpn.namespace }}"
+        labels:
+          k8s.ovn.org/primary-user-defined-network: ""
+          digitaldovey.net/evpn: enabled
+  when: evpn_workload_namespace.resources | length == 0
 
 - name: Configure external EVPN BGP peer
   kubernetes.core.k8s:
@@ -128,7 +151,30 @@
   retries: 90
   delay: 10
 
-- name: Create shared Layer2 EVPN ClusterUserDefinedNetwork
+- name: Read existing shared Layer2 EVPN ClusterUserDefinedNetwork
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: k8s.ovn.org/v1
+    kind: ClusterUserDefinedNetwork
+    name: "{{ evpn.network_name }}"
+  register: existing_evpn_cudn
+
+- name: Require an existing EVPN CUDN to use manual guest IP addressing
+  ansible.builtin.assert:
+    that:
+      - existing_evpn_cudn.resources[0].spec.network.topology == 'Layer2'
+      - existing_evpn_cudn.resources[0].spec.network.transport == 'EVPN'
+      - existing_evpn_cudn.resources[0].spec.network.layer2.role == 'Primary'
+      - existing_evpn_cudn.resources[0].spec.network.layer2.subnets is not defined
+      - existing_evpn_cudn.resources[0].spec.network.evpn.macVRF.vni | int == evpn.vni | int
+    fail_msg: >-
+      {{ evpn.network_name }} already exists with an incompatible immutable CUDN
+      specification. This lab requires Layer2/Primary/EVPN with no OVN-managed subnet,
+      because the two clusters use deterministic guest addresses from
+      {{ evpn.vm_subnet }} and must not allocate the same address independently.
+  when: existing_evpn_cudn.resources | length == 1
+
+- name: Create shared Layer2 EVPN ClusterUserDefinedNetwork with manual guest addressing
   kubernetes.core.k8s:
     kubeconfig: "{{ managed_kubeconfig }}"
     state: present
@@ -147,14 +193,28 @@
           topology: Layer2
           layer2:
             role: Primary
-            subnets:
-              - "{{ evpn.vm_subnet }}"
           transport: EVPN
           evpn:
             vtep: evpn-vtep
             macVRF:
               vni: "{{ evpn.vni }}"
               routeTarget: "{{ evpn.route_target }}"
+  when: existing_evpn_cudn.resources | length == 0
+
+- name: Wait for EVPN CUDN acceptance
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: k8s.ovn.org/v1
+    kind: ClusterUserDefinedNetwork
+    name: "{{ evpn.network_name }}"
+  register: evpn_cudn_status
+  until: >-
+    evpn_cudn_status.resources | length == 1 and
+    (evpn_cudn_status.resources[0].status.conditions | default([])
+      | selectattr('reason', 'equalto', 'EVPNTransportAccepted')
+      | selectattr('status', 'equalto', 'True') | list | length) > 0
+  retries: 90
+  delay: 10
 
 - name: Create RouteAdvertisements selecting FRR and EVPN CUDN labels
   kubernetes.core.k8s:
