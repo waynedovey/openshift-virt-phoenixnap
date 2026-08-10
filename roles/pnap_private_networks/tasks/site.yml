@@ -2,10 +2,22 @@
 - name: Find existing {{ site_item.key }} private L2 network
   ansible.builtin.set_fact:
     existing_private_network: >-
-      {{ (pnap_private_networks_existing.json
+      {{ (pnap_private_networks_state
           | selectattr('name', 'equalto', site_item.value.private_l2.name)
           | selectattr('location', 'equalto', site_item.value.location)
           | list | first) | default({}) }}
+
+- name: Determine whether this location already has a private network
+  ansible.builtin.set_fact:
+    location_private_networks: >-
+      {{ pnap_private_networks_state
+         | selectattr('location', 'equalto', site_item.value.location)
+         | list }}
+    site_location_default_required: >-
+      {{ (pnap_private_networks_state
+          | selectattr('location', 'equalto', site_item.value.location)
+          | list
+          | length) == 0 }}
 
 - name: Require an existing lab network to be a pure Layer2 NO-CIDR network
   ansible.builtin.assert:
@@ -30,12 +42,21 @@
       name: "{{ site_item.value.private_l2.name }}"
       description: "{{ project_name }} OpenShift Virtualization site-local L2 - {{ site_item.key }}"
       location: "{{ site_item.value.location }}"
-      locationDefault: false
+      # phoenixNAP requires the first owned private network in each location
+      # to be marked as that location's default network. Later networks stay non-default.
+      locationDefault: "{{ site_location_default_required | bool }}"
     return_content: true
     status_code: [200, 201, 202, 400, 409]
   register: private_network_create
   when: existing_private_network | length == 0
   no_log: true
+
+- name: Add newly created network to in-play private-network state
+  ansible.builtin.set_fact:
+    pnap_private_networks_state: "{{ pnap_private_networks_state + [private_network_create.json] }}"
+  when:
+    - existing_private_network | length == 0
+    - (private_network_create.status | int) in [200, 201, 202]
 
 - name: Publish sanitized private-network API error
   ansible.builtin.set_fact:
@@ -104,10 +125,12 @@
       provider_cidr: none
       guest_cidr: {{ site_item.value.private_l2.cidr }}
       vlan_id: {{ private_network_info.json.vlanId }}
+      location_default: {{ private_network_info.json.locationDefault | default(site_location_default_required | bool) }}
 
 - name: Report private Layer2 network
   ansible.builtin.debug:
     msg: >-
       {{ site_item.key }} private L2: {{ private_network_info.json.name }}
       provider-CIDR=none, guest-CIDR={{ site_item.value.private_l2.cidr }},
-      VLAN={{ private_network_info.json.vlanId }}.
+      VLAN={{ private_network_info.json.vlanId }},
+      location-default={{ private_network_info.json.locationDefault | default(site_location_default_required | bool) }}.

@@ -53,6 +53,7 @@ SKU can still be used by setting `phoenixnap.auto_select.enabled: false` and con
 - OpenShift Container Platform **4.22** Single Node OpenShift at each site
 - Cloudflare DNS for API, API-int and wildcard ingress
 - OpenShift Virtualization on each SNO
+- phoenixNAP dual-NIC LACP bond for the SNO native/public network
 - phoenixNAP private Layer-2 VLAN in each region for OpenShift Virtualization VMs
 - secondary OVN-Kubernetes Localnet CUDN backed by that private VLAN
 - phoenixNAP BGP Peer Group creation in both regions
@@ -98,9 +99,9 @@ evpn:
 
 See `docs/evpn.md`.
 
-### 4. Machine network is learned from phoenixNAP DHCP
+### 4. phoenixNAP dual NICs are bonded before installation
 
-The repository does not invent a private `machineNetwork` for the SNOs. phoenixNAP assigns the iPXE/native public address and the Assisted Installer discovers the host network. Pod and service ranges remain site-specific.
+The first iPXE discovery can expose the same native/public DHCP address on both physical 10 Gb NICs. The automation uses that first Agent inventory to create an RHACM `NMStateConfig`, builds `bond0` in `802.3ad` mode, clones the active physical NIC MAC for DHCP, adds explicit NTP sources, regenerates the InfraEnv image and reboots iPXE. The OpenShift machine/default route then lives on `bond0`; private VLANs are consumed as tagged VLANs on the same bond.
 
 ## Prerequisites
 
@@ -185,12 +186,11 @@ OCP SNO + private VLAN                OCP SNO + private VLAN
             VMs                                    VMs
 ```
 
-The private VLAN ID is assigned by phoenixNAP and consumed by an NMState NNCP. For this lab,
-the automation deliberately selects an UP Ethernet interface other than the SNO's IPv4
-default-route interface as the private-L2 uplink; it fails safely if no such interface is
-visible. phoenixNAP itself attaches VLANs at the server/fabric level rather than exposing a
-per-network "NIC2" selector in the API, and recommends LACP for production. See
-`docs/private-l2.md`.
+The private VLAN ID is assigned by phoenixNAP and consumed as `bond0.<VLAN>` by an NMState NNCP.
+The public/native VLAN and tagged private VM VLAN therefore share the phoenixNAP dual-NIC LACP
+bond, while remaining separate Layer-2 segments through 802.1Q tagging. This matches phoenixNAP's
+iPXE redundancy guidance; the API does not expose a supported "private VLAN only on NIC2" model.
+See `docs/private-l2.md`.
 
 ## EVPN target
 
@@ -273,6 +273,25 @@ For these PhoenixNAP SNO clusters the `AgentClusterInstall` intentionally uses `
 
 
 
+### phoenixNAP iPXE dual-NIC overlap
+
+If the first discovery reports the same native/public subnet on both physical NICs, do not override the Assisted Installer validation. The `pnap_servers` role creates a discovery-time `NMStateConfig` for `bond0`, reboots the host through iPXE, and waits for both `non-overlapping-subnets` and `ntp-synced` to pass before approval.
+
 ### Private VM Layer 2
 
-Each site gets a phoenixNAP private **NO-CIDR** VLAN. The OpenShift host does not consume an IP on this VLAN; NMState/OVS exposes it as an OVN Localnet secondary network for VMs. Inventory `private_l2.cidr` values are guest-addressing conventions only.
+Each site gets a phoenixNAP private **NO-CIDR** VLAN. The OpenShift host does not consume an IP on this VLAN; NMState/OVS exposes `bond0.<VLAN>` as an OVN Localnet secondary network for VMs. Inventory `private_l2.cidr` values are guest-addressing conventions only.
+
+## Direct RHCOS rootfs bypass
+
+The PhoenixNAP iPXE flow keeps the RHACM-generated discovery kernel/initrd, but
+appends the `AgentServiceConfig` OpenShift 4.22 x86_64 `rootFSUrl` as an
+`InfraEnv` kernel argument. This avoids streaming the ~1.2 GiB rootfs through
+the hub ingress route when that path truncates large responses. Set
+`rhacm.direct_rootfs.enabled: false` to disable the workaround.
+
+### phoenixNAP LACP discovery bootstrap
+
+For phoenixNAP iPXE hosts, the first DHCP discovery is used only to learn the two physical NIC names and MAC addresses. The automation then creates the per-host `NMStateConfig`, recreates the `InfraEnv` with that selector present from creation, updates the phoenixNAP iPXE URL, and reboots. This avoids relying on an in-place InfraEnv image refresh when advanced networking is added after the first discovery.
+
+The resulting public network is DHCP on `bond0` in `802.3ad` mode. Site-local private VLANs are consumed later on the bond for OpenShift Virtualization localnet networking.
+

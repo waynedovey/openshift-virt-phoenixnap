@@ -1,11 +1,51 @@
+# Changelog
+
+## 1.2.6
+
+- Rebuilds the RHACM `InfraEnv` after phoenixNAP NIC discovery so the per-host `NMStateConfig` selector is present from InfraEnv creation rather than relying on an in-place discovery-image refresh.
+- Preserves the existing InfraEnv spec, including the direct RHCOS rootfs bypass, NTP sources, pull secret, SSH key, agent labels and iPXE mode.
+- Verifies the recreated InfraEnv has a new Kubernetes UID and a new usable iPXE boot artifact before rebooting the phoenixNAP server.
+- Uses the preferred DHCP NIC MAC explicitly on `bond0`, matching the configuration validated interactively on phoenixNAP.
+- Removes the false-positive `createdTime` regeneration check that could pass when both old and new values were empty.
+
+## v1.2.5
+
+- Fix post-reboot Agent polling so an empty/transient Assisted Installer inventory annotation cannot crash the play with `from_json`.
+- Poll structured `Agent.status.inventory.interfaces` and `status.validationsInfo.network` instead.
+- Add sanitized diagnostics for bond presence, overlapping-subnet validation, and NTP validation when rediscovery does not become ready.
+
+
+## 1.2.4
+
+- Treat phoenixNAP iPXE dual NICs as a redundancy pair instead of dedicating NIC2 to the VM VLAN.
+- After first RHACM Agent discovery, dynamically create an `NMStateConfig` for `bond0` using the discovered physical NIC MAC addresses.
+- Use `802.3ad` LACP, clone the preferred physical NIC MAC for DHCP, regenerate the InfraEnv and reboot iPXE before Agent approval.
+- Add explicit discovery NTP sources and wait for `non-overlapping-subnets` and `ntp-synced` validations to pass.
+- Consume the site-local private VLAN as `bond0.<VLAN>` for the OpenShift Virtualization Localnet bridge.
+- Surface sanitized phoenixNAP server-provisioning 400/409/422 validation errors instead of hiding the useful API message.
+- Keep an already-provisioned auto-selected server type pinned on reruns to avoid unnecessary replacement when live stock changes.
+
+## 1.2.3
+
+- Work around RHACM/OpenTLC ingress truncation of the large RHCOS PXE rootfs.
+- Read the matching OpenShift 4.22 x86_64 `rootFSUrl` from `AgentServiceConfig`.
+- Append that direct URL to each `InfraEnv.spec.kernelArguments`; dracut honors the later value, while RHACM continues to provide the discovery initrd/kernel and agent configuration.
+- Fail early if the hub does not expose a valid direct `rootFSUrl`.
+
+## 1.2.2
+
+- Fix phoenixNAP private-network creation when the account has no existing network in a location.
+- Automatically set `locationDefault: true` for the first private network in a location and `false` for subsequent networks.
+- Track newly-created networks during the play so multiple sites in one location remain safe.
+- Preserve pure Layer-2 NO-CIDR (`force=true`) behavior for the VM transport VLAN.
+- Provision servers with `force=true` and an explicit empty private-network IP list so the SNO host remains unnumbered on the VM VLAN.
+
 ## 1.2.1
 
 - Create phoenixNAP VM transport networks as pure Layer-2 NO-CIDR private VLANs using `force=true`.
 - Do not assign a private IP to the SNO host; the secondary NIC/VLAN remains unnumbered and is bridged to OVN Localnet for VMs.
 - Preserve `private_l2.cidr` only as a guest VM addressing convention.
 - Surface phoenixNAP private-network validation errors without exposing OAuth headers/tokens.
-
-# Changelog
 
 ## 1.2.0
 
@@ -23,8 +63,6 @@
 - Add `make availability` to list currently available server SKUs in PHX and CHI.
 - Preflight now validates each site's configured SKU independently and points to the availability command.
 - Provision/replace roles use the site-specific SKU without silently choosing a fallback.
-
-# Changelog
 
 ## v1.1.0
 

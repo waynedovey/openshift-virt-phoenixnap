@@ -1,10 +1,19 @@
 ---
+- name: Find existing server by hostname
+  ansible.builtin.set_fact:
+    existing_site_server: >-
+      {{ (pnap_servers_existing.json
+          | selectattr('hostname', 'equalto', site_item.value.node_hostname)
+          | list | first) | default({}) }}
+
 - name: Set desired server type for {{ site_item.key }}
   ansible.builtin.set_fact:
     site_server_type: >-
-      {{ pnap_selected_skus[site_item.key].productCode
-         if phoenixnap.auto_select.enabled | bool
-         else site_item.value.server_type | default(phoenixnap.server_type) }}
+      {{ existing_site_server.type
+         if (phoenixnap.auto_select.enabled | bool and existing_site_server | length > 0)
+         else (pnap_selected_skus[site_item.key].productCode
+               if phoenixnap.auto_select.enabled | bool
+               else site_item.value.server_type | default(phoenixnap.server_type)) }}
 
 - name: Read {{ site_item.key }} InfraEnv iPXE URL
   kubernetes.core.k8s_info:
@@ -22,13 +31,6 @@
       - site_infraenv.resources[0].status.bootArtifacts.ipxeScript | default('') | length > 0
       - site_infraenv.resources[0].status.bootArtifacts.ipxeScript | length <= 1000
     fail_msg: "InfraEnv iPXE URL is missing or exceeds the phoenixNAP 1000-character iPXE URL limit for {{ site_item.key }}."
-
-- name: Find existing server by hostname
-  ansible.builtin.set_fact:
-    existing_site_server: >-
-      {{ (pnap_servers_existing.json
-          | selectattr('hostname', 'equalto', site_item.value.node_hostname)
-          | list | first) | default({}) }}
 
 - name: Read full existing server network configuration
   ansible.builtin.uri:
@@ -70,7 +72,7 @@
         | selectattr('id', 'equalto', site_private_network.id)
         | list | length) == 1
     fail_msg: >-
-      Existing {{ site_item.value.node_hostname }} is not compatible with the new lab definition.
+      Existing {{ site_item.value.node_hostname }} is not compatible with the lab definition.
       Current type={{ existing_site_server.type | default('unknown') }}, desired={{ site_server_type }};
       current networkType={{ existing_site_server_detail.json.networkType | default('unknown') }},
       desired={{ phoenixnap.network_type }}; private network={{ site_private_network.name }}.
@@ -81,7 +83,7 @@
 
 - name: Provision hourly {{ site_server_type }} with public management and private L2 VLAN
   ansible.builtin.uri:
-    url: "{{ phoenixnap.api_base }}/bmc/v1/servers"
+    url: "{{ phoenixnap.api_base }}/bmc/v1/servers?force=true"
     method: POST
     headers:
       Authorization: "Bearer {{ pnap_token }}"
@@ -102,17 +104,38 @@
         privateNetworkConfiguration:
           configurationType: USER_DEFINED
           privateNetworks:
-            # Pure L2 NO-CIDR network: do not assign an IP to the OpenShift host.
-            # The spare NIC/VLAN is bridged later and guest VMs own their addressing.
+            # Pure L2 NO-CIDR network. The tagged VLAN is consumed on bond0
+            # after the phoenixNAP dual-NIC LACP bond is established.
             - id: "{{ site_private_network.id }}"
+              ips: []
+              dhcp: false
       osConfiguration:
         iPXE:
           url: "{{ site_infraenv.resources[0].status.bootArtifacts.ipxeScript }}"
     return_content: true
-    status_code: [200, 201, 202]
+    status_code: [200, 201, 202, 400, 409, 422]
   register: site_server_create
   when: existing_site_server | length == 0
   no_log: true
+
+- name: Publish sanitized server-provisioning API error
+  ansible.builtin.set_fact:
+    site_server_create_error: >-
+      {{ (site_server_create.json | default({})).message | default('phoenixNAP rejected the server provisioning request') }}
+      {{ (site_server_create.json | default({})).validationErrors | default([]) | to_json }}
+  when:
+    - existing_site_server | length == 0
+    - (site_server_create.status | int) not in [200, 201, 202]
+
+- name: Require phoenixNAP server provisioning to succeed
+  ansible.builtin.assert:
+    that:
+      - existing_site_server | length > 0 or (site_server_create.status | int) in [200, 201, 202]
+    fail_msg: >-
+      phoenixNAP could not provision {{ site_item.key }} {{ site_server_type }} in
+      {{ site_item.value.location }}: {{ site_server_create_error | default('unknown API error') }}.
+      Run `make availability` and retry if the selected one-unit SKU was consumed between
+      selection and provisioning. OAuth headers remain hidden.
 
 - name: Determine server ID
   ansible.builtin.set_fact:
@@ -160,6 +183,337 @@
   retries: 120
   delay: 10
 
+- name: Select discovered SNO Agent
+  ansible.builtin.set_fact:
+    discovered_agent: "{{ discovered_agents.resources | first }}"
+
+- name: Parse phoenixNAP discovery inventory
+  ansible.builtin.set_fact:
+    pnap_agent_inventory: >-
+      {{ discovered_agent.metadata.annotations['agent.agent-install.openshift.io/inventory'] | from_json }}
+  when: phoenixnap.ipxe_network.configure_lacp_bond | bool
+
+- name: Find physical data NICs and current default routes
+  ansible.builtin.set_fact:
+    pnap_data_nics: >-
+      {{ pnap_agent_inventory.interfaces
+         | selectattr('type', 'equalto', 'physical')
+         | selectattr('biosdevname', 'defined')
+         | list }}
+    pnap_default_routes: >-
+      {{ pnap_agent_inventory.routes | default([])
+         | selectattr('destination', 'equalto', '0.0.0.0')
+         | sort(attribute='metric')
+         | list }}
+    pnap_bond_already_present: >-
+      {{ (pnap_agent_inventory.interfaces
+          | selectattr('name', 'equalto', phoenixnap.ipxe_network.bond_name)
+          | list | length) > 0 }}
+  when: phoenixnap.ipxe_network.configure_lacp_bond | bool
+
+- name: Require dual NIC inventory before LACP bootstrap
+  ansible.builtin.assert:
+    that:
+      - pnap_data_nics | length == 2
+      - pnap_default_routes | length >= 1
+    fail_msg: >-
+      {{ site_item.key }} did not expose exactly two phoenixNAP data NICs plus a default route.
+      NICs={{ pnap_data_nics | map(attribute='name') | list }}, routes={{ pnap_default_routes }}.
+      Refusing to change discovery networking automatically.
+  when:
+    - phoenixnap.ipxe_network.configure_lacp_bond | bool
+    - not (pnap_bond_already_present | bool)
+
+- name: Select primary and secondary phoenixNAP NICs
+  ansible.builtin.set_fact:
+    pnap_primary_nic_name: "{{ pnap_default_routes[0].interface }}"
+  when:
+    - phoenixnap.ipxe_network.configure_lacp_bond | bool
+    - not (pnap_bond_already_present | bool)
+
+- name: Resolve primary and secondary NIC objects
+  ansible.builtin.set_fact:
+    pnap_primary_nic: >-
+      {{ pnap_data_nics | selectattr('name', 'equalto', pnap_primary_nic_name) | list | first }}
+    pnap_secondary_nic: >-
+      {{ pnap_data_nics | rejectattr('name', 'equalto', pnap_primary_nic_name) | list | first }}
+  when:
+    - phoenixnap.ipxe_network.configure_lacp_bond | bool
+    - not (pnap_bond_already_present | bool)
+
+- name: Require a deterministic primary/secondary NIC pair
+  ansible.builtin.assert:
+    that:
+      - pnap_primary_nic | length > 0
+      - pnap_secondary_nic | length > 0
+      - pnap_primary_nic.mac_address | default('') | length > 0
+      - pnap_secondary_nic.mac_address | default('') | length > 0
+    fail_msg: >-
+      Could not map the preferred default-route interface {{ pnap_primary_nic_name }}
+      to the two phoenixNAP physical NICs for {{ site_item.key }}. Refusing to create a bond.
+  when:
+    - phoenixnap.ipxe_network.configure_lacp_bond | bool
+    - not (pnap_bond_already_present | bool)
+
+- name: Remember current InfraEnv identity and spec before deterministic LACP rebuild
+  ansible.builtin.set_fact:
+    pnap_old_infraenv_uid: "{{ site_infraenv.resources[0].metadata.uid }}"
+    pnap_infraenv_spec_for_recreate: "{{ site_infraenv.resources[0].spec }}"
+  when:
+    - phoenixnap.ipxe_network.configure_lacp_bond | bool
+    - not (pnap_bond_already_present | bool)
+
+- name: Create discovery NMStateConfig for phoenixNAP dual-NIC LACP
+  kubernetes.core.k8s:
+    kubeconfig: "{{ rhacm.kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: agent-install.openshift.io/v1beta1
+      kind: NMStateConfig
+      metadata:
+        name: "{{ site_item.value.cluster_name }}-pnap-bond"
+        namespace: "{{ site_item.value.cluster_name }}"
+        labels:
+          digitaldovey.net/pnap-bond: "{{ site_item.key }}"
+      spec:
+        config:
+          interfaces:
+            - name: "{{ pnap_primary_nic.name }}"
+              type: ethernet
+              state: up
+              ipv4:
+                enabled: false
+              ipv6:
+                enabled: false
+            - name: "{{ pnap_secondary_nic.name }}"
+              type: ethernet
+              state: up
+              ipv4:
+                enabled: false
+              ipv6:
+                enabled: false
+            - name: "{{ phoenixnap.ipxe_network.bond_name }}"
+              type: bond
+              state: up
+              # Use the preferred DHCP NIC's real MAC explicitly. This is the
+              # exact shape validated manually on phoenixNAP and keeps the
+              # public DHCP lease stable when the two physical ports join LACP.
+              mac-address: "{{ pnap_primary_nic.mac_address | upper }}"
+              mtu: "{{ phoenixnap.ipxe_network.mtu | int }}"
+              ipv4:
+                enabled: true
+                dhcp: true
+              ipv6:
+                enabled: false
+              link-aggregation:
+                mode: "{{ phoenixnap.ipxe_network.bond_mode }}"
+                options:
+                  miimon: "{{ phoenixnap.ipxe_network.miimon | string }}"
+                  lacp_rate: "{{ phoenixnap.ipxe_network.lacp_rate }}"
+                  xmit_hash_policy: "{{ phoenixnap.ipxe_network.xmit_hash_policy }}"
+                  updelay: "{{ phoenixnap.ipxe_network.updelay | string }}"
+                  downdelay: "{{ phoenixnap.ipxe_network.downdelay | string }}"
+                port:
+                  - "{{ pnap_primary_nic.name }}"
+                  - "{{ pnap_secondary_nic.name }}"
+        interfaces:
+          - name: "{{ pnap_primary_nic.name }}"
+            macAddress: "{{ pnap_primary_nic.mac_address }}"
+          - name: "{{ pnap_secondary_nic.name }}"
+            macAddress: "{{ pnap_secondary_nic.mac_address }}"
+  when:
+    - phoenixnap.ipxe_network.configure_lacp_bond | bool
+    - not (pnap_bond_already_present | bool)
+
+- name: Delete bootstrap InfraEnv so NMState is present from image creation
+  kubernetes.core.k8s:
+    kubeconfig: "{{ rhacm.kubeconfig }}"
+    state: absent
+    api_version: agent-install.openshift.io/v1beta1
+    kind: InfraEnv
+    name: "{{ site_item.value.cluster_name }}"
+    namespace: "{{ site_item.value.cluster_name }}"
+    wait: true
+    wait_timeout: 180
+  when:
+    - phoenixnap.ipxe_network.configure_lacp_bond | bool
+    - not (pnap_bond_already_present | bool)
+
+- name: Recreate InfraEnv with LACP NMState selector present from creation
+  kubernetes.core.k8s:
+    kubeconfig: "{{ rhacm.kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: agent-install.openshift.io/v1beta1
+      kind: InfraEnv
+      metadata:
+        name: "{{ site_item.value.cluster_name }}"
+        namespace: "{{ site_item.value.cluster_name }}"
+        annotations:
+          digitaldovey.net/pnap-network-bootstrap: "lacp-v1"
+      spec: >-
+        {{ pnap_infraenv_spec_for_recreate
+           | combine({
+               'nmStateConfigLabelSelector': {
+                 'matchLabels': {
+                   'digitaldovey.net/pnap-bond': site_item.key
+                 }
+               },
+               'additionalNTPSources': rhacm.additional_ntp_sources
+             }, recursive=True) }}
+  when:
+    - phoenixnap.ipxe_network.configure_lacp_bond | bool
+    - not (pnap_bond_already_present | bool)
+
+- name: Wait for a new InfraEnv image with LACP network state
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ rhacm.kubeconfig }}"
+    api_version: agent-install.openshift.io/v1beta1
+    kind: InfraEnv
+    name: "{{ site_item.value.cluster_name }}"
+    namespace: "{{ site_item.value.cluster_name }}"
+  register: bonded_infraenv
+  until: >-
+    (bonded_infraenv.resources | length == 1) and
+    (bonded_infraenv.resources[0].metadata.uid | default('') != pnap_old_infraenv_uid) and
+    (bonded_infraenv.resources[0].status.bootArtifacts.ipxeScript | default('') | length > 0) and
+    ((bonded_infraenv.resources[0].status.conditions | default([])
+      | selectattr('type', 'equalto', 'ImageCreated')
+      | selectattr('status', 'equalto', 'True')
+      | list | length) >= 1)
+  retries: 60
+  delay: 10
+  when:
+    - phoenixnap.ipxe_network.configure_lacp_bond | bool
+    - not (pnap_bond_already_present | bool)
+
+- name: Report deterministic LACP discovery image replacement
+  ansible.builtin.debug:
+    msg: >-
+      {{ site_item.key }} InfraEnv recreated for LACP discovery:
+      oldUID={{ pnap_old_infraenv_uid }},
+      newUID={{ bonded_infraenv.resources[0].metadata.uid }},
+      createdTime={{ bonded_infraenv.resources[0].status.createdTime | default('not-published') }}.
+      The new iPXE URL will be pushed to phoenixNAP before reboot.
+  when:
+    - phoenixnap.ipxe_network.configure_lacp_bond | bool
+    - not (pnap_bond_already_present | bool)
+
+- name: Reboot phoenixNAP server into deterministic LACP discovery image
+  ansible.builtin.uri:
+    url: "{{ phoenixnap.api_base }}/bmc/v1/servers/{{ site_server_id }}/actions/reboot"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ pnap_token }}"
+      Content-Type: application/json
+    body_format: json
+    body:
+      bootType: IPXE
+      ipxeUrl: "{{ bonded_infraenv.resources[0].status.bootArtifacts.ipxeScript }}"
+    return_content: true
+    status_code: 200
+  register: pnap_bond_reboot
+  no_log: true
+  when:
+    - phoenixnap.ipxe_network.configure_lacp_bond | bool
+    - not (pnap_bond_already_present | bool)
+
+- name: Wait for Agent to return with bond and passing network validations
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ rhacm.kubeconfig }}"
+    api_version: agent-install.openshift.io/v1beta1
+    kind: Agent
+    namespace: "{{ site_item.value.cluster_name }}"
+  register: post_bond_agents
+  until: >-
+    ((post_bond_agents.resources
+      | map(attribute='status.inventory.interfaces', default=[])
+      | flatten
+      | selectattr('name', 'equalto', phoenixnap.ipxe_network.bond_name)
+      | list | length) >= 1) and
+    ((post_bond_agents.resources
+      | map(attribute='status.validationsInfo.network', default=[])
+      | flatten
+      | selectattr('id', 'equalto', 'non-overlapping-subnets')
+      | selectattr('status', 'equalto', 'success')
+      | list | length) >= 1) and
+    ((post_bond_agents.resources
+      | map(attribute='status.validationsInfo.network', default=[])
+      | flatten
+      | selectattr('id', 'equalto', 'ntp-synced')
+      | selectattr('status', 'equalto', 'success')
+      | list | length) >= 1)
+  retries: 120
+  delay: 10
+  ignore_errors: true
+  when:
+    - phoenixnap.ipxe_network.configure_lacp_bond | bool
+    - not (pnap_bond_already_present | bool)
+
+- name: Build sanitized post-bond discovery diagnostics
+  ansible.builtin.set_fact:
+    pnap_post_bond_interfaces: >-
+      {{ post_bond_agents.resources
+         | default([])
+         | map(attribute='status.inventory.interfaces', default=[])
+         | flatten
+         | map(attribute='name')
+         | list }}
+    pnap_post_bond_network_validations: >-
+      {{ post_bond_agents.resources
+         | default([])
+         | map(attribute='status.validationsInfo.network', default=[])
+         | flatten
+         | selectattr('id', 'in', ['non-overlapping-subnets', 'ntp-synced'])
+         | list }}
+  when:
+    - phoenixnap.ipxe_network.configure_lacp_bond | bool
+    - not (pnap_bond_already_present | bool)
+
+- name: Require Agent to return with LACP bond and healthy discovery networking
+  ansible.builtin.assert:
+    that:
+      - >-
+        (post_bond_agents.resources | default([])
+         | map(attribute='status.inventory.interfaces', default=[])
+         | flatten
+         | selectattr('name', 'equalto', phoenixnap.ipxe_network.bond_name)
+         | list | length) >= 1
+      - >-
+        (post_bond_agents.resources | default([])
+         | map(attribute='status.validationsInfo.network', default=[])
+         | flatten
+         | selectattr('id', 'equalto', 'non-overlapping-subnets')
+         | selectattr('status', 'equalto', 'success')
+         | list | length) >= 1
+      - >-
+        (post_bond_agents.resources | default([])
+         | map(attribute='status.validationsInfo.network', default=[])
+         | flatten
+         | selectattr('id', 'equalto', 'ntp-synced')
+         | selectattr('status', 'equalto', 'success')
+         | list | length) >= 1
+    fail_msg: >-
+      {{ site_item.key }} rediscovered but did not reach the expected LACP/NTP state.
+      interfaces={{ pnap_post_bond_interfaces | default([]) }};
+      validations={{ pnap_post_bond_network_validations | default([]) }}.
+      Inspect `oc get nmstateconfig -n {{ site_item.value.cluster_name }} -o yaml`
+      and the phoenixNAP console before rebooting again.
+  when:
+    - phoenixnap.ipxe_network.configure_lacp_bond | bool
+    - not (pnap_bond_already_present | bool)
+
+- name: Default to initially discovered Agent state for approval
+  ansible.builtin.set_fact:
+    agents_ready_for_approval: "{{ discovered_agents.resources }}"
+
+- name: Use post-bond Agent state for approval
+  ansible.builtin.set_fact:
+    agents_ready_for_approval: "{{ post_bond_agents.resources }}"
+  when:
+    - phoenixnap.ipxe_network.configure_lacp_bond | bool
+    - not (pnap_bond_already_present | bool)
+
 - name: Approve discovered Agent and assign SNO master role
   kubernetes.core.k8s:
     kubeconfig: "{{ rhacm.kubeconfig }}"
@@ -172,7 +526,7 @@
       spec:
         approved: true
         role: master
-  loop: "{{ discovered_agents.resources }}"
+  loop: "{{ agents_ready_for_approval }}"
 
 - name: Create local artifact directory
   ansible.builtin.file:
@@ -190,6 +544,7 @@
       location: {{ site_server_info.json.location }}
       type: {{ site_server_info.json.type }}
       public_ip: {{ site_server_info.json.publicIpAddresses[0] }}
+      primary_network_bond: {{ phoenixnap.ipxe_network.bond_name }}
       private_l2_network_id: {{ site_private_network.id }}
       private_l2_vlan_id: {{ site_private_network.vlanId }}
       private_l2_host_ip: none
@@ -201,6 +556,7 @@
     msg: >-
       {{ site_item.key }}: {{ site_server_info.json.hostname }} ->
       public={{ site_server_info.json.publicIpAddresses[0] }},
+      primary={{ phoenixnap.ipxe_network.bond_name }} (dual-NIC LACP),
       private-L2=NO-CIDR/VLAN{{ site_private_network.vlanId }},
       guest-CIDR={{ site_item.value.private_l2.cidr }}
       ({{ site_server_info.json.status }})

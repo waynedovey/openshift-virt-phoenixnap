@@ -50,6 +50,53 @@
         iPXEHTTPRoute: enabled
   when: rhacm.enable_http_ipxe_route | bool
 
+- name: Read AgentServiceConfig for the direct RHCOS rootfs source
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ rhacm.kubeconfig }}"
+    api_version: agent-install.openshift.io/v1beta1
+    kind: AgentServiceConfig
+    name: agent
+  register: agent_service_config
+  when: rhacm.direct_rootfs.enabled | bool
+
+- name: Require AgentServiceConfig before selecting the direct rootfs
+  ansible.builtin.assert:
+    that:
+      - agent_service_config.resources | length == 1
+    fail_msg: "AgentServiceConfig agent was not found on the RHACM hub."
+  when: rhacm.direct_rootfs.enabled | bool
+
+- name: Select the matching RHCOS rootfs URL
+  ansible.builtin.set_fact:
+    rhacm_rootfs_url: >-
+      {{ (agent_service_config.resources[0].spec.osImages
+          | selectattr('openshiftVersion', 'equalto', ocp_minor)
+          | selectattr('cpuArchitecture', 'equalto', 'x86_64')
+          | selectattr('rootFSUrl', 'defined')
+          | rejectattr('rootFSUrl', 'equalto', '')
+          | map(attribute='rootFSUrl')
+          | list
+          | first) | default('') }}
+  when: rhacm.direct_rootfs.enabled | bool
+
+- name: Require a direct RHCOS rootfs URL
+  ansible.builtin.assert:
+    that:
+      - rhacm_rootfs_url | length > 0
+      - rhacm_rootfs_url is match('^https?://')
+    fail_msg: >-
+      AgentServiceConfig agent does not contain a non-empty x86_64 OpenShift
+      {{ ocp_minor }} rootFSUrl. The PhoenixNAP iPXE flow cannot bypass the
+      hub ingress rootfs stream until spec.osImages[].rootFSUrl is populated.
+  when: rhacm.direct_rootfs.enabled | bool
+
+- name: Report direct rootfs bypass
+  ansible.builtin.debug:
+    msg: >-
+      Discovery iPXE will append coreos.live.rootfs_url={{ rhacm_rootfs_url }}
+      so the large RHCOS rootfs bypasses the RHACM ingress route.
+  when: rhacm.direct_rootfs.enabled | bool
+
 - name: Create Host Inventory resources for each site
   ansible.builtin.include_tasks: site.yml
   loop: "{{ sites | dict2items }}"

@@ -1,85 +1,77 @@
 # Site-local private Layer2 network for OpenShift Virtualization
 
-Each phoenixNAP SNO is provisioned with two network roles:
+Each phoenixNAP SNO uses the provider's dual-NIC network model:
 
-1. Public/IP-block connectivity for iPXE, OpenShift API/Ingress and management.
-2. A phoenixNAP **Private Network** VLAN used as a physical Layer2 segment for VMs.
+1. The two physical data NICs form `bond0` using LACP (`802.3ad`).
+2. The iPXE/native public VLAN provides DHCP, the OpenShift API/Ingress path and management on `bond0`.
+3. A phoenixNAP **Private Network** is trunked as an additional tagged VLAN on the same bond and is exposed to VMs through OVN Localnet.
 
 The automation creates:
 
-| Site | phoenixNAP location | Private network | CIDR | Purpose |
+| Site | phoenixNAP location | Private network | Guest CIDR | Purpose |
 |---|---|---|---|---|
-| SW1 | PHX | `ocp-sw1-vm-l2` | `10.60.10.0/24 (guest addressing; provider VLAN is NO-CIDR)` | site-local VM L2 |
-| C1 | CHI | `ocp-c1-vm-l2` | `10.60.20.0/24 (guest addressing; provider VLAN is NO-CIDR)` | site-local VM L2 |
+| SW1 | PHX | `ocp-sw1-vm-l2` | `10.60.10.0/24` | site-local VM L2 |
+| C1 | CHI | `ocp-c1-vm-l2` | `10.60.20.0/24` | site-local VM L2 |
 
-phoenixNAP dynamically assigns the VLAN IDs. The server is attached at provisioning with
-`networkType: PUBLIC_AND_PRIVATE`, a purchased public IP block, and the site private network.
-Private-network DHCP is disabled because the server also has public connectivity.
+The provider VLANs themselves are created with **NO-CIDR**. The CIDRs above are guest VM addressing conventions only.
 
-## Physical NIC behaviour on phoenixNAP
+## Why the LACP bootstrap is required
 
-phoenixNAP attaches VLANs to the server networking fabric; its API does **not** provide a
-per-private-network switch-port selector such as "put this VLAN only on NIC2". BMC servers
-have dual NICs, and phoenixNAP recommends an LACP bond for production, with VLANs consumed
-on the bond.
+phoenixNAP iPXE initially exposes the dual NICs without OS-level redundancy. During discovery, both physical NICs can obtain the same DHCP address on the native public VLAN. Assisted Installer correctly rejects that as overlapping networking.
 
-For this **lab**, the OpenShift role implements the requested second-uplink pattern after SNO
-is installed: it discovers the IPv4 default-route NIC and uses another UP Ethernet NIC as the
-VM-L2 VLAN uplink. It only adds a tagged VLAN subinterface; it does not move the OpenShift
-machine/default route. If it cannot identify a safe non-management interface, it stops instead
-of changing networking.
+The provisioning role therefore performs a two-stage discovery:
 
-This gives VMs a second vNIC backed by the site-local private L2. For a long-lived production
-design, switch `uplink_interface` to an explicitly validated bond/VLAN design rather than
-leaving the host single-homed.
+1. Boot the RHACM InfraEnv normally and wait for the Agent inventory.
+2. Discover the two physical NIC MAC addresses and the interface carrying the preferred/default route.
+3. Create an RHACM `NMStateConfig` that builds `bond0` in `802.3ad` mode.
+4. Clone the preferred physical NIC MAC onto the bond so phoenixNAP DHCP can continue using its reservation.
+5. Attach the NMStateConfig to the InfraEnv, add explicit NTP sources and wait for the discovery image to regenerate.
+6. Reboot the server using iPXE and wait until the Agent reports the bond plus passing `non-overlapping-subnets` and `ntp-synced` validations.
+7. Approve the Agent for SNO installation.
+
+This avoids overriding a real Assisted Installer validation failure.
+
+## Private VLAN placement
+
+phoenixNAP attaches VLANs to the server network fabric rather than exposing a supported per-VLAN physical-port selector such as "put this private VLAN only on NIC2". Once LACP is established, VLANs should be consumed on the bond.
+
+The OpenShift post-install networking therefore creates:
+
+```text
+physical NIC 0 ----\
+                    +-- bond0 -- native/public DHCP
+physical NIC 1 ----/       \
+                            +-- bond0.<private VLAN> -- br-pnap-vm -- OVN Localnet -- VMs
+```
+
+The private VLAN subinterface has no host IPv4 or IPv6 address. It is only a Layer-2 transport into the OVS/OVN Localnet bridge.
 
 ## OpenShift mapping
 
-After installation the automation installs Kubernetes NMState and discovers the SNO's IPv4
-default-route interface. With `uplink_interface: auto`, it selects an UP Ethernet interface
-that is **not** the management/default-route interface. It then creates:
+After installation the automation installs Kubernetes NMState and verifies `bond0` exists. It then creates:
 
-- a tagged VLAN subinterface using the phoenixNAP-assigned VLAN ID;
+- tagged VLAN subinterface `bond0.<phoenixNAP VLAN ID>`;
 - OVS bridge `br-pnap-vm`;
 - OVN bridge mapping `pnap-vm-l2 -> br-pnap-vm`;
 - secondary Localnet `ClusterUserDefinedNetwork` named `pnap-vm-localnet`;
 - namespace `vm-workloads` selected by that CUDN.
 
-The Localnet CUDN has IPAM disabled for VMs. Guest addresses are therefore controlled by the
-VM/your external IPAM rather than independently allocated by each OpenShift cluster.
+The Localnet CUDN has IPAM disabled. Guest addresses are controlled by the VM or external DHCP/IPAM.
 
-## Safety
-
-The role will not deliberately repurpose the interface carrying the default route. If no spare
-UP Ethernet NIC can be identified, it fails before applying the NNCP. Set
-`sites.<site>.private_l2.uplink_interface` explicitly only after verifying the correct NIC.
-
-## VM attachment and guest addressing
-
-The CUDN is secondary and has IPAM disabled, as required for this OpenShift Virtualization
-Localnet pattern. Attach `pnap-vm-localnet` as a second VM network and set the guest address
-from the site subnet (or provide external DHCP/IPAM). Example static guest ranges can be kept
-away from the reserved node address:
+Suggested lab ranges:
 
 - SW1 VMs: `10.60.10.20-10.60.10.250/24`
 - C1 VMs: `10.60.20.20-10.60.20.250/24`
 
-Do not use those addresses as a cross-site portable range; the two private networks are
-independent L2 broadcast domains.
-
-A VM interface/network snippet is included at `examples/vm-localnet-network-snippet.yaml`.
+Do not use those ranges as a cross-site portable subnet. The PHX and CHI private networks are independent L2 broadcast domains.
 
 ## Cross-site boundary
-
-A phoenixNAP private network is location-scoped. The PHX VLAN and CHI VLAN are separate Layer2
-broadcast domains. They give each site a physical VM network, but they do **not** create the
-shared cross-site subnet.
 
 The separate EVPN design remains responsible for the portable `10.50.50.0/24` VM network:
 
 ```text
 PHX local private VLAN                      CHI local private VLAN
-10.60.10.0/24 (guest addressing; provider VLAN is NO-CIDR)                               10.60.20.0/24 (guest addressing; provider VLAN is NO-CIDR)
+10.60.10.0/24                               10.60.20.0/24
        |                                           |
        +--- OCP SNO --- external EVPN/VXLAN --- OCP SNO ---+
                                |
@@ -87,10 +79,12 @@ PHX local private VLAN                      CHI local private VLAN
                      VNI 5050 / RT 65000:5050
 ```
 
-phoenixNAP standard BGP peering remains on public addresses; BMC does not support BGP peering
-over private IP addresses.
+phoenixNAP standard BGP peer groups remain ordinary IP BGP and are not treated as an EVPN fabric by this project.
 
+## Pure Layer-2 provider network
 
-## Pure Layer 2 provider network
+The phoenixNAP private networks are created with no provider CIDR (`force=true`). The SNO host receives no IP address on the private VLAN. OpenShift NMState creates the tagged VLAN and OVS bridge with IPv4/IPv6 disabled.
 
-The phoenixNAP private networks are created with no provider CIDR (`force=true`). This is intentional. The SNO host receives no IP address on the private VLAN. OpenShift NMState creates the VLAN subinterface and OVS bridge with IPv4/IPv6 disabled, and OVN Localnet passes Layer-2 traffic to VM interfaces. The `private_l2.cidr` values in inventory are guest addressing conventions only.
+### First private network in a location
+
+phoenixNAP requires the first private network owned by an account in a location to be marked as that location's default private network. The automation detects this and sets `locationDefault: true` only for the first network. Servers still attach the VLAN explicitly through `USER_DEFINED` networking.

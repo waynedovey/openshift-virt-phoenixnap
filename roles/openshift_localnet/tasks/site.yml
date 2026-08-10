@@ -59,48 +59,31 @@
   retries: 60
   delay: 10
 
-- name: Determine management interface from the IPv4 default route
+- name: Find phoenixNAP primary LACP bond
   ansible.builtin.set_fact:
-    localnet_management_interface: >-
-      {{ (localnet_nns.resources[0].status.currentState.routes.running | default([])
-          | selectattr('destination', 'equalto', '0.0.0.0/0')
-          | map(attribute='next-hop-interface')
-          | list | first) | default('') }}
+    localnet_uplink_interface: "{{ site_item.value.private_l2.uplink_interface | default(phoenixnap.ipxe_network.bond_name) }}"
+    localnet_bond_state: >-
+      {{ (localnet_nns.resources[0].status.currentState.interfaces | default([])
+          | selectattr('name', 'equalto', site_item.value.private_l2.uplink_interface | default(phoenixnap.ipxe_network.bond_name))
+          | list | first) | default({}) }}
 
-- name: Build safe spare-Ethernet interface candidates
-  ansible.builtin.set_fact:
-    localnet_spare_interfaces: >-
-      {{ localnet_nns.resources[0].status.currentState.interfaces | default([])
-         | selectattr('type', 'equalto', 'ethernet')
-         | selectattr('state', 'equalto', 'up')
-         | rejectattr('name', 'equalto', localnet_management_interface)
-         | rejectattr('controller', 'defined')
-         | map(attribute='name') | list | sort }}
-
-- name: Choose private-L2 uplink
-  ansible.builtin.set_fact:
-    localnet_uplink_interface: >-
-      {{ (localnet_spare_interfaces | first)
-         if site_item.value.private_l2.uplink_interface == 'auto'
-         else site_item.value.private_l2.uplink_interface }}
-
-- name: Require a non-management uplink before changing node networking
+- name: Require the discovery-time LACP bond before exposing VM VLAN
   ansible.builtin.assert:
     that:
-      - localnet_uplink_interface | default('') | length > 0
-      - not (vm_l2.require_non_management_interface | bool) or localnet_uplink_interface != localnet_management_interface
-      - site_item.value.private_l2.uplink_interface != 'auto' or localnet_spare_interfaces | length > 0
+      - localnet_bond_state | length > 0
+      - localnet_bond_state.type == 'bond'
+      - localnet_bond_state.state == 'up'
     fail_msg: >-
-      No safe spare NIC was found on {{ localnet_node_name }}. management={{ localnet_management_interface }},
-      candidates={{ localnet_spare_interfaces }}. Set sites.{{ site_item.key }}.private_l2.uplink_interface
-      explicitly only after confirming the phoenixNAP private VLAN is trunked to that port.
+      {{ site_item.key }} does not have the expected phoenixNAP LACP bond
+      {{ localnet_uplink_interface }}. Current interface names={{ localnet_nns.resources[0].status.currentState.interfaces
+      | default([]) | map(attribute='name') | list }}. The private VLAN must be
+      consumed on the bond, not on one physical NIC.
 
 - name: Report selected physical wiring before apply
   ansible.builtin.debug:
     msg: >-
-      {{ site_item.key }}: management={{ localnet_management_interface }},
-      VM-L2 uplink={{ localnet_uplink_interface }},
-      private VLAN={{ localnet_private_network.vlanId }},
+      {{ site_item.key }}: native/public management={{ localnet_uplink_interface }},
+      tagged VM private VLAN={{ localnet_private_network.vlanId }} on {{ localnet_uplink_interface }},
       bridge={{ vm_l2.bridge_name }}.
 
 - name: Create VM workload namespace
@@ -115,7 +98,7 @@
         labels:
           "{{ vm_l2.namespace_label_key }}": "{{ vm_l2.namespace_label_value }}"
 
-- name: Map phoenixNAP private VLAN to an OVS Localnet bridge
+- name: Map phoenixNAP private VLAN on bond to an OVS Localnet bridge
   kubernetes.core.k8s:
     kubeconfig: "{{ managed_kubeconfig }}"
     state: present
@@ -132,6 +115,7 @@
             - name: "{{ localnet_uplink_interface }}.{{ localnet_private_network.vlanId }}"
               type: vlan
               state: up
+              mtu: "{{ phoenixnap.ipxe_network.mtu | int }}"
               ipv4:
                 enabled: false
               ipv6:
@@ -196,8 +180,7 @@
     mode: '0600'
     content: |
       node: {{ localnet_node_name }}
-      management_interface: {{ localnet_management_interface }}
-      uplink_interface: {{ localnet_uplink_interface }}
+      primary_bond: {{ localnet_uplink_interface }}
       vlan_id: {{ localnet_private_network.vlanId }}
       bridge: {{ vm_l2.bridge_name }}
       physical_network_name: {{ vm_l2.physical_network_name }}

@@ -167,8 +167,25 @@
         sshAuthorizedKey: "{{ lab_ssh_public_key }}"
         cpuArchitecture: x86_64
         ipxeScriptType: "{{ rhacm.infraenv_ipxe_script_type }}"
+        additionalNTPSources: "{{ rhacm.additional_ntp_sources }}"
         agentLabels:
           cluster-name: "{{ site.cluster_name }}"
+
+- name: Append direct RHCOS rootfs URL to discovery kernel arguments
+  kubernetes.core.k8s:
+    kubeconfig: "{{ rhacm.kubeconfig }}"
+    state: patched
+    definition:
+      apiVersion: agent-install.openshift.io/v1beta1
+      kind: InfraEnv
+      metadata:
+        name: "{{ site.cluster_name }}"
+        namespace: "{{ site.cluster_name }}"
+      spec:
+        kernelArguments:
+          - operation: append
+            value: "coreos.live.rootfs_url={{ rhacm_rootfs_url }}"
+  when: rhacm.direct_rootfs.enabled | bool
 
 - name: Wait for RHACM iPXE boot artifact
   kubernetes.core.k8s_info:

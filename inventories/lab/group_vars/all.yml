@@ -11,6 +11,16 @@ rhacm:
   # hub-wide AgentServiceConfig to expose iPXE artifacts over HTTP.
   enable_http_ipxe_route: true
   infraenv_ipxe_script_type: BootOrderControl
+  # The OpenTLC ingress path truncates the ~1.2 GiB Assisted Image Service
+  # rootfs stream. Append the authoritative AgentServiceConfig rootFSUrl as
+  # a later kernel argument so dracut fetches the large image directly.
+  direct_rootfs:
+    enabled: true
+  # Explicit NTP sources for discovery. DHCP/NTP is unreliable on the raw
+  # dual-NIC iPXE network until the phoenixNAP bond is established.
+  additional_ntp_sources:
+    - time.google.com
+    - time.cloudflare.com
 
 phoenixnap:
   api_base: "https://api.phoenixnap.com"
@@ -39,6 +49,20 @@ phoenixnap:
   # The private network list itself is USER_DEFINED in networkConfiguration.
   network_type: PUBLIC_AND_PRIVATE
   install_default_ssh_keys: false
+  # phoenixNAP iPXE presents two physical data NICs. During the first discovery
+  # both can obtain the same native-VLAN DHCP address, which Assisted Installer
+  # rejects as overlapping. Build the provider-recommended LACP bond from the
+  # discovered MAC addresses, clone the active NIC MAC for DHCP, then reboot iPXE.
+  ipxe_network:
+    configure_lacp_bond: true
+    bond_name: bond0
+    bond_mode: 802.3ad
+    mtu: 1500
+    miimon: 100
+    lacp_rate: fast
+    xmit_hash_policy: layer3+4
+    updelay: 200
+    downdelay: 200
   delete_ip_blocks_on_destroy: true
   delete_private_networks_on_destroy: false
   # Server type cannot be resized in place. Existing mismatched servers are
@@ -71,9 +95,8 @@ sites:
       name: ocp-sw1-vm-l2
       # Guest VM addressing only. phoenixNAP VLAN itself is created NO-CIDR.
       cidr: 10.60.10.0/24
-      # auto = choose an UP Ethernet NIC that is not carrying the default route.
-      # Set explicitly if your SNO interface naming differs.
-      uplink_interface: auto
+      # Private VLAN is trunked over the phoenixNAP dual-NIC LACP bond.
+      uplink_interface: bond0
   c1:
     cluster_name: c1
     server_type: auto
@@ -88,7 +111,7 @@ sites:
       name: ocp-c1-vm-l2
       # Guest VM addressing only. phoenixNAP VLAN itself is created NO-CIDR.
       cidr: 10.60.20.0/24
-      uplink_interface: auto
+      uplink_interface: bond0
 
 cloudflare:
   enabled: true
@@ -129,7 +152,9 @@ vm_l2:
   bridge_name: br-pnap-vm
   namespace_label_key: digitaldovey.net/vm-l2
   namespace_label_value: "true"
-  require_non_management_interface: true
+  # The tagged private VLAN intentionally rides the same LACP bond as the
+  # native/public management VLAN; it is isolated by 802.1Q tagging.
+  require_non_management_interface: false
 
 # IMPORTANT: phoenixNAP BGP peer groups are ordinary IP BGP. They are not
 # treated here as an EVPN fabric. EVPN application is gated until the actual
