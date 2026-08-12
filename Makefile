@@ -5,8 +5,9 @@ PYTHON ?= python3
 ANSIBLE_PLAYBOOK := $(VENV)/bin/ansible-playbook
 ANSIBLE_GALAXY := $(VENV)/bin/ansible-galaxy
 ANSIBLE_LINT := $(VENV)/bin/ansible-lint
+PROJECT_VERSION := $(shell cat VERSION 2>/dev/null || echo unknown)
 
-.PHONY: bootstrap validate availability preflight prepare-hub private-networks bgp replace-servers provision dns install virt nmstate vm-l2 evpn status deploy destroy lint clean-venv
+.PHONY: version bootstrap validate availability preflight prepare-hub private-networks bgp replace-servers provision dns install virt nmstate vm-l2 evpn status deploy destroy lint clean-venv
 
 $(ANSIBLE_PLAYBOOK): requirements.txt requirements.yml
 	$(PYTHON) -m venv $(VENV)
@@ -14,7 +15,11 @@ $(ANSIBLE_PLAYBOOK): requirements.txt requirements.yml
 	$(VENV)/bin/python -m pip install -r requirements.txt
 	$(ANSIBLE_GALAXY) collection install -r requirements.yml
 
+version:
+	@echo "openshift-virt-phoenixnap $(PROJECT_VERSION)"
+
 bootstrap: $(ANSIBLE_PLAYBOOK)
+	@echo "Repository version: $(PROJECT_VERSION)"
 	@echo "Ansible environment ready: $$($(ANSIBLE_PLAYBOOK) --version | head -1)"
 	@echo "Python: $$($(VENV)/bin/python -c 'import sys; print(sys.executable)')"
 	@$(VENV)/bin/python -c 'import kubernetes; print("Kubernetes Python client:", kubernetes.__version__)'
@@ -65,6 +70,7 @@ status: $(ANSIBLE_PLAYBOOK)
 	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) playbooks/09_status.yml
 
 deploy: $(ANSIBLE_PLAYBOOK)
+	@echo "Repository version: $(PROJECT_VERSION)"
 	@echo "Deploying full lab, including OpenShift EVPN platform prerequisites..."
 	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) site.yml
 

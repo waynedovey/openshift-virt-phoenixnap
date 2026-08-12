@@ -1,3 +1,17 @@
+## 1.4.11 - 2026-08-12
+
+- Carry forward the v1.4.10 idempotent AgentClusterInstall fix unchanged.
+- Add an explicit repository version banner to `make deploy` and `make bootstrap`, plus `make version`, so stale working-tree copies are immediately obvious.
+- Add a first-task version report in `playbooks/00_validate.yml`. The reported failure logs for the previous run contained v1.4.9 task names, proving the v1.4.10 files had not actually replaced the active checkout.
+- Document safe extraction/update using `rsync -a` so hidden files and revised role files are copied consistently without deleting local `.env` or `artifacts/`.
+
+## 1.4.10 - 2026-08-12
+
+- Fix idempotent RHACM reruns when existing `AgentClusterInstall` objects are present but their live API representation does not expose `spec.imageSetRef`. Existing ACI presence is now authoritative; catalog discovery is no longer triggered just because `imageSetRef` is absent.
+- Skip `ClusterImageSet` catalog access entirely when every configured site already has an AgentClusterInstall. This allows reruns to continue even when the hub does not currently serve `/apis/hive.openshift.io/v1/clusterimagesets`.
+- Preserve existing AgentClusterInstall resources exactly instead of reapplying install-spec fields on every `make deploy`; only a genuinely missing ACI is created and therefore requires an effective ClusterImageSet.
+- Keep partial-rebuild safety: if one site has an ACI and another does not, only the missing site requires `OPENSHIFT_CLUSTER_IMAGE_SET` or a healthy ClusterImageSet catalog.
+
 ## 1.4.9 - 2026-08-12
 
 - Make RHACM release-image handling truly idempotent: existing `AgentClusterInstall.spec.imageSetRef.name` values are now treated as authoritative live install state and preserved per site.

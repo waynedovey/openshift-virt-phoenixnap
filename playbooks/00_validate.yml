@@ -3,6 +3,13 @@
   hosts: localhost
   gather_facts: false
   tasks:
+    - name: Report repository revision
+      ansible.builtin.debug:
+        msg: >-
+          openshift-virt-phoenixnap {{ lookup('file', playbook_dir ~ '/../VERSION') | trim }}.
+          If this does not match the ZIP you just installed, stop before troubleshooting
+          later tasks because the working tree was not updated.
+
     - name: Require native-iPXE-capable phoenixNAP locations
       ansible.builtin.assert:
         that:

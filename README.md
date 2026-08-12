@@ -1,5 +1,8 @@
 # phoenixNAP OpenShift 4.22 Two-Site EVPN Lab
 
+
+> **Updating an existing checkout:** unpack the new ZIP beside the checkout, then run `rsync -a openshift-virt-phoenixnap-main/ ./` and verify with `make version`. Do not use a stale extracted directory from an earlier revision.
+
 GitHub-ready Ansible automation for a two-region OpenShift Virtualization lab on phoenixNAP Bare Metal Cloud.
 
 ### Dynamic server selection under $0.30/hour

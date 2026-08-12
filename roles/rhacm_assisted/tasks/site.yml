@@ -3,7 +3,8 @@
   ansible.builtin.set_fact:
     site_key: "{{ site_item.key }}"
     site: "{{ site_item.value }}"
-    site_ocp_imageset_name: "{{ rhacm_imageset_by_site[site_item.key] }}"
+    site_ocp_imageset_name: "{{ rhacm_imageset_by_site[site_item.key] | default('') }}"
+    site_existing_aci: "{{ rhacm_existing_aci_exists_by_site[site_item.key] | default(false) | bool }}"
 
 - name: Create cluster namespace
   kubernetes.core.k8s:
@@ -120,7 +121,14 @@
         pullSecretRef:
           name: assisted-pull-secret
 
-- name: Create AgentClusterInstall
+- name: Preserve an existing AgentClusterInstall exactly on idempotent reruns
+  ansible.builtin.debug:
+    msg: >-
+      {{ site.cluster_name }} AgentClusterInstall already exists. Its install spec is
+      treated as live state and will not be reapplied or backfilled on this rerun.
+  when: site_existing_aci | bool
+
+- name: Create AgentClusterInstall only for a genuinely fresh site
   kubernetes.core.k8s:
     kubeconfig: "{{ rhacm.kubeconfig }}"
     state: present
@@ -150,6 +158,7 @@
           controlPlaneAgents: 1
           workerAgents: 0
         sshPublicKey: "{{ lab_ssh_public_key }}"
+  when: not (site_existing_aci | bool)
 
 - name: Verify AgentClusterInstall exists after creation
   kubernetes.core.k8s_info:
