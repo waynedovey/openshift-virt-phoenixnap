@@ -1,5 +1,5 @@
 ---
-- name: Configure OpenShift 4.22 BGP EVPN when external fabric is confirmed
+- name: Enable OpenShift 4.22 EVPN platform and cross-site fabric
   hosts: localhost
   gather_facts: false
   roles:

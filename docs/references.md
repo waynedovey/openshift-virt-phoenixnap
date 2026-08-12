@@ -21,5 +21,3 @@ These are the primary references used when assembling the automation.
 ## Cloudflare
 
 - DNS record API: https://developers.cloudflare.com/api/resources/dns/subresources/records/methods/create/
-
-- phoenixNAP, *How to Use iPXE on Bare Metal Cloud* — current custom iPXE provisioning locations and LACP guidance.

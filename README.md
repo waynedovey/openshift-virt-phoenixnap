@@ -48,20 +48,27 @@ SKU can still be used by setting `phoenixnap.auto_select.enabled: false` and con
 - **PHX / US SW1**: `sw1.digitaldovey.net`
 - **ASH / US C1**: `c1.digitaldovey.net`
 
-phoenixNAP custom iPXE provisioning is currently limited to PHX, ASH and NLD. CHI remains a general BMC location but cannot be used with `os: ipxe`, so this lab uses ASH for the second site.
+> **phoenixNAP native-iPXE location note (v1.4.6):** The live BMC provisioning API
+> rejected `os: ipxe` in CHI and reported native iPXE support in PHX, ASH, and NLD.
+> The default second site is therefore ASH. The logical cluster remains `c1` with the same
+> DNS name, ASN, VTEP, and OpenShift networks. Exact CHI placement requires a different
+> bootstrap path (for example a RAM-resident Ubuntu/kexec workflow) and is intentionally
+> not guessed by this production-style path.
 - dynamically selected phoenixNAP server below **$0.30/hour per site**, billed **HOURLY**
 - RHACM Host Inventory / Assisted Installer `InfraEnv` per site
 - phoenixNAP iPXE boot directly from the RHACM InfraEnv boot artifact
 - OpenShift Container Platform **4.22** Single Node OpenShift at each site
 - Cloudflare DNS for API, API-int and wildcard ingress
-- Red Hat LVM Storage on one dedicated unused NVMe per SNO, providing `lvms-vg1`
 - OpenShift Virtualization on each SNO
 - phoenixNAP dual-NIC LACP bond for the SNO native/public network
 - phoenixNAP private Layer-2 VLAN in each region for OpenShift Virtualization VMs
 - secondary OVN-Kubernetes Localnet CUDN backed by that private VLAN
 - phoenixNAP BGP Peer Group creation in both regions
-- staged OpenShift 4.22 BGP EVPN configuration for a shared VM network
-- gated RHEL 9 proof VMs `rhel9-sw1` and `rhel9-c1` on the shared `10.50.50.0/24` EVPN segment
+- complete two-site OpenShift 4.22 EVPN lab fabric built automatically by `make deploy`
+
+> **RHACM release-image self-heal:** if the hub does not currently contain an OpenShift 4.22 `ClusterImageSet`, `make deploy` creates `openshift-4.22.0-auto` automatically. Set `OPENSHIFT_RELEASE_IMAGE` only if you need a mirrored registry or a different 4.22.z payload.
+
+- self-managed PHX↔ASH routed VXLAN transit for MP-BGP EVPN, with optional external-provider mode
 - explicit, guarded teardown of hourly resources
 
 ## Deliberate safety decisions
@@ -78,6 +85,10 @@ make replace-servers
 make deploy
 ```
 
+`make deploy` is safe to rerun against already-installed SW1/C1 clusters. The RHACM/Hive stage preserves an existing `ClusterDeployment.spec.installed: true` value rather than attempting to reset the cluster to an uninstalled state.
+
+For an existing compatible phoenixNAP server, `make deploy` also reconciles a missing site-local private Layer-2 network membership in place through the BMC API instead of incorrectly asking for a server replacement. It never removes an existing private-network membership automatically.
+
 ### 2. Private Layer2 is site-local, not a PHX-to-ASH VLAN stretch
 
 Each SNO gets public management/iPXE connectivity plus a phoenixNAP private VLAN for VMs.
@@ -85,35 +96,25 @@ The OpenShift side maps that VLAN into a secondary OVN Localnet CUDN. PHX and AS
 networks are separate L2 broadcast domains; the EVPN layer remains responsible for the shared
 `10.50.50.0/24` cross-site VM subnet. See `docs/private-l2.md`.
 
-### 3. phoenixNAP BGP is not assumed to be an EVPN fabric
+### 3. `make deploy` now builds the PHX↔ASH EVPN lab fabric end to end
 
-The playbooks create phoenixNAP BGP Peer Groups, but **do not equate normal BGP peering with EVPN L2VPN transport**. `evpn.apply` defaults to `false`.
+The phoenixNAP BGP Peer Groups remain standard IP-BGP resources and are **not** treated as an L2VPN EVPN provider fabric. Instead, the default `self-managed-vxlan` mode builds a deterministic routed transit directly between the two existing SNO nodes.
 
-After you provide actual external EVPN peers reachable from the SNO nodes, set:
+`make deploy` derives each SNO public address from the generated server artifacts, creates `evpn-transit0` with VXLAN VNI 4090 / UDP 4790, assigns `192.168.254.1/30` and `192.168.254.2/30`, and then establishes direct eBGP between FRR-K8s ASN 65011 and ASN 65021. OpenShift uses that underlay to exchange the VTEP routes and the MP-BGP L2VPN EVPN address family for VNI 5050.
 
-```yaml
-evpn:
-  apply: true
-  fabric_confirmed: true
-  peer_asn: 65000
-  peers:
-    sw1: <PHX-EVPN-PEER-IP>
-    c1: <ASH-EVPN-PEER-IP>
+The lab keeps the real OpenShift EVPN data plane distinct from the carrier tunnel:
+
+```text
+physical bond MTU 1500
+  └─ transit VXLAN VNI 4090 / UDP 4790, MTU 1450
+       └─ OpenShift EVPN VXLAN VNI 5050 / UDP 4789, CUDN MTU 1400
 ```
 
-See `docs/evpn.md`.
+Only UDP/4790 needs to pass between the two public SNO addresses in the default lab mode. The carrier is intentionally a lab shim, not a production provider-fabric design. For a real EVPN-capable DC/provider fabric, set `EVPN_FABRIC_MODE=external` and provide the external peer addresses/ASN. See `docs/evpn.md`.
 
 ### 4. phoenixNAP dual NICs are bonded before installation
 
 The first iPXE discovery can expose the same native/public DHCP address on both physical 10 Gb NICs. The automation uses that first Agent inventory to create an RHACM `NMStateConfig`, builds `bond0` in `802.3ad` mode, clones the active physical NIC MAC for DHCP, adds explicit NTP sources, regenerates the InfraEnv image and reboots iPXE. The OpenShift machine/default route then lives on `bond0`; private VLANs are consumed as tagged VLANs on the same bond.
-
-### 5. LVMS never repartitions the OpenShift installation disk
-
-The storage stage looks for exactly one completely unused whole local disk on each SNO that can provide at least 600 GiB of physical thin-pool capacity, pins it by stable `/dev/disk/by-path`, and creates an LVM thin pool with `forceWipeDevicesAndDestroyAllData: false`. Existing LVMCluster device ownership is reused on subsequent deploys. See `docs/lvm-storage.md`.
-
-### 6. Cross-site RHEL 9 proof VMs are EVPN-gated
-
-The proof VMs use `10.50.50.11/24` on SW1 and `10.50.50.21/24` on C1 with exactly one primary `l2bridge` interface. They are not created while `evpn.apply=false`, because the site-local phoenixNAP private VLANs do not constitute a cross-site Layer-2 fabric. See `docs/evpn-test-vms.md`.
 
 ## Prerequisites
 
@@ -157,12 +158,10 @@ make bgp
 make provision
 make dns
 make install
-make storage
 make virt
 make nmstate
 make vm-l2
-make evpn        # staged/skipped until fabric is confirmed
-make test-vms   # staged/skipped until EVPN is active
+make evpn
 make status
 ```
 
@@ -188,12 +187,6 @@ sno-c1.digitaldovey.net
 
 All are unproxied Cloudflare A records pointing at the SNO public IP for this lab.
 
-## LVM Storage
-
-The current two-disk SNO layout does **not** require rebuilding the clusters just to obtain VM storage. The installed RHCOS disk stays untouched; the other empty NVMe is consumed as the LVMS device. With a ~931 GiB raw disk and the default 90% thin pool, the lab gets roughly 838 GiB of physical thin-pool capacity per site with overprovisioning disabled (`overprovisionRatio: 1`).
-
-The generated storage class is `lvms-vg1`, marked as both cluster-default and virtualization-default. Run `make storage` independently if you want to validate the disk selection before the rest of the day-2 deployment. See `docs/lvm-storage.md`.
-
 ## Site-local VM Layer2
 
 ```text
@@ -216,30 +209,21 @@ See `docs/private-l2.md`.
 ## EVPN target
 
 ```text
-PHX / SW1                               ASH / C1
-+------------------+                   +------------------+
-| OCP 4.22 SNO     |                   | OCP 4.22 SNO     |
-| OpenShift Virt   |                   | OpenShift Virt   |
-| ASN 65011        |                   | ASN 65021        |
-| VTEP 10.255.50.11|                   | VTEP 10.255.50.21|
-+---------+--------+                   +--------+---------+
-          |                                     |
-          +------ external BGP EVPN/VXLAN ------+
-                    VM: 10.50.50.0/24
-                    VNI: 5050
-                    RT: 65000:5050
+PHX / SW1                                             ASH / C1
+public IP                                               public IP
+   |                                                       |
+   +==== lab carrier VXLAN VNI 4090 / UDP 4790 ============+
+   |        192.168.254.1/30 <-> 192.168.254.2/30           |
+   |                                                       |
+FRR-K8s ASN 65011 <========== MP-BGP EVPN =========> FRR-K8s ASN 65021
+   |                                                       |
+VTEP 10.255.50.11/32                              VTEP 10.255.50.21/32
+   |                                                       |
+   +========= OpenShift EVPN VNI 5050 / UDP 4789 ==========+
+                         10.50.50.0/24
 ```
 
-## Shared EVPN proof VMs
-
-When a real external BGP EVPN fabric is configured and `evpn.apply=true`, the deploy creates:
-
-```text
-rhel9-sw1  10.50.50.11/24
-rhel9-c1   10.50.50.21/24
-```
-
-Each VM has exactly one primary UDN interface and a 40 GiB RHEL 9 disk on `lvms-vg1`. A serial-console service continuously pings the peer VM so the cross-site proof is easy to demonstrate. With the default `evpn.apply=false`, these VMs are staged but intentionally skipped. See `docs/evpn-test-vms.md`.
+Automatic IP allocation is split by site so the two independent cluster IPAM databases cannot hand out the same VM address: SW1 uses the lower half of the `/24` and C1 uses the upper half, while both still participate in the same MAC-VRF.
 
 ## Publish to GitHub
 
@@ -259,7 +243,7 @@ Hourly infrastructure costs money. Tear the lab down when finished:
 make destroy
 ```
 
-The destroy playbook deprovisions only servers matching the configured node hostnames. It deletes a BGP peer group only when this repository recorded that it created that group; pre-existing regional peer groups are left intact. Review `playbooks/99_destroy.yml` before first use in a shared phoenixNAP account.
+The destroy playbook deprovisions only servers matching the configured node hostnames. It deletes a BGP peer group only when this repository recorded that it created that group; pre-existing regional peer groups are left intact. Review `playbooks/99_destroy.yml` before first use in a shared phoenixNAP account. Destroy is safe to rerun: phoenixNAP `deleting` state and temporary HTTP 409 lifecycle conflicts are retried/waited through, and teardown waits for the BMC server object to disappear before continuing.
 
 ## Repository layout
 
@@ -271,9 +255,9 @@ artifacts/                            # generated runtime state, gitignored
 docs/                                 # design and operations notes
 ```
 
-## First thing to review
+## EVPN deployment behavior
 
-Open `inventories/lab/group_vars/all.yml`. The remaining unresolved design input is the **actual external EVPN peer address at each site**. Everything before EVPN can be automated now.
+`make deploy` now completes the two-site lab EVPN fabric automatically in the default `self-managed-vxlan` mode. It builds the PHX↔ASH carrier, establishes base eBGP, creates the EVPN CUDN and RouteAdvertisements, and does not return success until MP-BGP L2VPN EVPN is established and each cluster has learned the remote VTEP `/32`. External EVPN peer inputs are required only when `EVPN_FABRIC_MODE=external`.
 
 ## macOS / Python interpreter note
 
@@ -328,18 +312,13 @@ For phoenixNAP iPXE hosts, the first DHCP discovery is used only to learn the tw
 The resulting public network is DHCP on `bond0` in `802.3ad` mode. Site-local private VLANs are consumed later on the bond for OpenShift Virtualization localnet networking.
 
 
-## Idempotent day-2 reruns
+## Two-site EVPN lab fabric
 
-After a cluster finishes installing, Hive sets `ClusterDeployment.spec.installed=true`.
-The project treats that as a lifecycle boundary: `make deploy` continues to reconcile
-day-2 resources, but it does not push the ClusterDeployment back to an uninstalled
-state, recreate Assisted Installer resources, reboot the phoenixNAP server into iPXE,
-or require spare live SKU inventory for a server that already exists.
+Version 1.4 defaults to `EVPN_FABRIC_MODE=self-managed-vxlan`. `make deploy`
+automatically creates a routed PHX<->ASH VXLAN transit and runs MP-BGP EVPN
+between the two OpenShift 4.22 SNO clusters. See `docs/evpn.md` for the topology,
+MTU design, validation steps, and the external-provider mode.
 
-This means rerunning `make deploy` against healthy SW1/C1 clusters is safe.
-Installation-only resources are reconciled only while the corresponding
-`ClusterDeployment` is not yet installed.
+### phoenixNAP OAuth token refresh
 
-### VM Localnet namespace labels
-
-The Localnet role renders the configured `vm_l2.namespace_label_key` and value into a dictionary before submitting Namespace and ClusterUserDefinedNetwork objects. This avoids sending literal Jinja syntax as a Kubernetes label key on repeatable day-2 deploys.
+phoenixNAP access tokens are short-lived. Long `make deploy` runs automatically refresh the bearer token before each site and again before the LACP reboot phase, so SW1 discovery time cannot cause C1 provisioning to fail with HTTP 401. No manual token handling is required.

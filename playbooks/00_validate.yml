@@ -3,6 +3,20 @@
   hosts: localhost
   gather_facts: false
   tasks:
+    - name: Require native-iPXE-capable phoenixNAP locations
+      ansible.builtin.assert:
+        that:
+          - sites.sw1.location in phoenixnap.ipxe_network.supported_locations
+          - sites.c1.location in phoenixnap.ipxe_network.supported_locations
+          - sites.sw1.location != sites.c1.location
+        fail_msg: >-
+          This lab provisions servers with phoenixNAP native `os: ipxe`.
+          Configured locations are SW1={{ sites.sw1.location }}, C1={{ sites.c1.location }}.
+          The currently confirmed native-iPXE locations for this workflow are
+          {{ phoenixnap.ipxe_network.supported_locations | join(', ') }}.
+          The live BMC API rejected CHI for `os: ipxe`; use ASH (default) or NLD for C1,
+          or implement a separate RAM-OS/kexec bootstrap before using CHI.
+
     - name: Validate static project settings
       ansible.builtin.assert:
         that:
@@ -15,28 +29,29 @@
           - phoenixnap.auto_select.min_ram_gb | int >= 32
           - phoenixnap.auto_select.min_cores | int >= 4
           - phoenixnap.network_type == 'PUBLIC_AND_PRIVATE'
-          - sites.sw1.location in phoenixnap.ipxe_supported_locations
-          - sites.c1.location in phoenixnap.ipxe_supported_locations
-          - sites.sw1.location != sites.c1.location
           - sites.sw1.cluster_network != sites.c1.cluster_network
           - sites.sw1.service_network != sites.c1.service_network
           - evpn.vm_subnet | length > 0
           - sites.sw1.private_l2.cidr != sites.c1.private_l2.cidr
           - vm_l2.network_name | length > 0
-          - lvm_storage.size_percent | int >= 10
-          - lvm_storage.size_percent | int <= 90
-          - lvm_storage.min_thin_pool_gib | int >= 100
-          - lvm_storage.overprovision_ratio | int >= 1
-          - lvm_storage.device_class | length > 0
-          - evpn_test_vms.storage_class == ('lvms-' ~ lvm_storage.device_class)
-          - evpn_test_vms.namespace == evpn.namespace
-          - evpn_test_vms.ips.sw1 != evpn_test_vms.ips.c1
-          - evpn_test_vms.macs.sw1 != evpn_test_vms.macs.c1
+          - evpn.fabric_mode in ['self-managed-vxlan', 'external']
+          - evpn.transport.vni | int != evpn.vni | int
+          - evpn.transport.udp_port | int != 4789
+          - evpn.vm_mtu | int <= (evpn.transport.mtu | int - 50)
+          - evpn.transport.addresses.sw1 != evpn.transport.addresses.c1
+          - evpn.addressing.sw1.default_gateway != evpn.addressing.c1.default_gateway
+          - evpn.addressing.sw1.infrastructure_subnet != evpn.addressing.c1.infrastructure_subnet
+          - evpn.addressing.sw1.reserved_subnets != evpn.addressing.c1.reserved_subnets
+          - sites.sw1.bgp_asn | int != sites.c1.bgp_asn | int
         fail_msg: "Review inventories/lab/group_vars/all.yml."
 
-    - name: Explain EVPN safety gate
+    - name: Explain EVPN deployment behavior
       ansible.builtin.debug:
         msg: >-
-          EVPN apply={{ evpn.apply }}. PhoenixNAP BGP peer groups are provisioned
-          independently. OpenShift EVPN is only applied when evpn.apply=true,
-          evpn.fabric_confirmed=true and both evpn.peers values are populated.
+          EVPN platform_apply={{ evpn.platform_apply | default(true) }},
+          fabric_mode={{ evpn.fabric_mode }},
+          fabric_required={{ evpn.fabric_required | default(false) }}.
+          In self-managed-vxlan mode, make deploy builds a {{ sites.sw1.location }}<->{{ sites.c1.location }} routed transit
+          over UDP/{{ evpn.transport.udp_port }} and automatically peers SW1 ASN
+          {{ sites.sw1.bgp_asn }} with C1 ASN {{ sites.c1.bgp_asn }}. In external
+          mode, provider peer inputs are used instead.

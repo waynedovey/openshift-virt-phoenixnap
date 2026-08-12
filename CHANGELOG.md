@@ -1,42 +1,117 @@
+## 1.4.9 - 2026-08-12
+
+- Make RHACM release-image handling truly idempotent: existing `AgentClusterInstall.spec.imageSetRef.name` values are now treated as authoritative live install state and preserved per site.
+- Skip `ClusterImageSet` catalog discovery entirely when existing AgentClusterInstall resources already provide the image-set references, so reruns no longer fail just because `oc` discovery temporarily cannot resolve `clusterimagesets`.
+- For genuinely fresh installs, query the Hive collection through the raw Kubernetes REST endpoint (`/apis/hive.openshift.io/v1/clusterimagesets`) instead of relying on the client RESTMapper; raw create is used for deterministic self-heal when needed.
+- Add `OPENSHIFT_CLUSTER_IMAGE_SET` as an explicit escape hatch for fresh hubs where the desired ClusterImageSet is known but catalog discovery/controller health is temporarily degraded.
+- Preserve each site's existing imageSetRef independently, avoiding accidental OpenShift payload changes on reruns after the hub refreshes its ClusterImageSet catalog.
+
+## 1.4.8
+
+- Fix RHACM `ClusterImageSet` reconciliation on idempotent reruns. The Kubernetes Python dynamic client could query the resource and then fail to resolve the same cluster-scoped kind for `kubernetes.core.k8s`, causing `make deploy` to stop even though both phoenixNAP servers already existed.
+- Use `oc get clusterimagesets.hive.openshift.io -o json` for deterministic discovery and `oc apply -f -` only when a 4.22 image set is genuinely absent.
+- Keep the v1.4.7 server-capacity idempotency behavior: existing SW1/C1 servers bypass live-stock gating and are reused in place.
+
+## 1.4.7 - 2026-08-12
+
+- Make phoenixNAP capacity preflight genuinely idempotent: `make deploy` now inventories existing servers by configured hostname before consulting live SKU stock.
+- Exclude already-deployed SW1/C1 servers from live availability gating, so consuming the last qualifying unit no longer makes the next `make deploy` fail.
+- Support partial reruns: if one site exists and the other is missing, only the missing site must have live stock and only that site is dynamically selected.
+- Apply the same behavior to static-SKU preflight and `make availability`, with clear `REUSE` versus `SELECT` reporting.
+- Keep `make replace-servers` safe by forcing a fresh capacity check before any destructive replacement instead of reusing the idempotent deploy shortcut.
+- Guard against silently adopting a same-hostname server from the wrong phoenixNAP location.
+
+## 1.4.6 - 2026-08-12
+
+- Fix C1 provisioning after phoenixNAP rejected native `os: ipxe` in CHI; default the second physical site to ASH while retaining the logical `c1` cluster identity and addressing.
+- Add a native-iPXE location guard (`PHX`, `ASH`, `NLD`) to validate, availability, and preflight so a valid SERVER SKU can no longer produce a false-green result in an OS-incompatible location.
+- Improve server-provisioning diagnostics to distinguish provider OS/location incompatibility from ordinary SKU stock races.
+- Make self-managed EVPN transit labels location-neutral so the same PHX↔ASH lab fabric code can later be pointed at any confirmed iPXE-capable pair.
+
+## 1.4.5 - 2026-08-11
+
+- Refresh phoenixNAP OAuth credentials at the start of every SNO site because phoenixNAP bearer tokens are short-lived and SW1 Assisted Installer/LACP bootstrap can outlive the token before C1 provisioning begins.
+- Refresh the phoenixNAP token again immediately before the post-InfraEnv LACP reboot, preventing long discovery/image-generation waits from causing a 401 on the next BMC action.
+- Refactor token acquisition into `roles/pnap_auth/tasks/refresh.yml` so long-running API roles can safely renew credentials without duplicating OAuth logic.
+
+## 1.4.4 - 2026-08-11
+
+- Hardened Assisted Installer discovery polling against transient `kubernetes.core.k8s_info` results that do not contain a `resources` key.
+- `Wait for RHACM Agent discovered by iPXE` now treats transient client/API failures as retryable instead of crashing while evaluating the `until` condition.
+- Applied the same defensive polling to the Agent inventory wait, rebuilt InfraEnv image wait, and post-LACP Agent validation wait.
+- Guarded Agent selection/approval facts with `default([])` so a transient discovery response cannot cause a secondary attribute error.
+- No server destroy/rebuild is required for this fix; `make deploy` can be rerun against the current partially provisioned lab.
+
+## 1.4.3 - 2026-08-11
+
+- Fixed fresh `make deploy` racing the Assisted Installer Agent inventory publication. The Agent CR can exist before the `agent.agent-install.openshift.io/inventory` annotation is populated, which previously caused `from_json` to fail on an empty string.
+- Select the newest discovered Agent, then re-read that exact Agent until the inventory annotation contains both `interfaces` and `routes` before parsing it.
+- Refresh `discovered_agent` from the post-inventory API response instead of reusing the stale object from the initial discovery poll.
+- Add a defensive inventory completeness assertion before deriving the LACP primary/secondary NICs.
+- Add configurable `inventory_wait_seconds` and `inventory_wait_retries` defaults under `phoenixnap.ipxe_network`.
+
+## 1.4.2
+
+- Made `make destroy` idempotent across phoenixNAP asynchronous server lifecycle states.
+- Treats an existing `deleting` server as an in-progress teardown instead of issuing a second deprovision request.
+- Handles HTTP 409 from the deprovision action as a retryable lifecycle conflict, refreshes live server state, and retries for up to four minutes by default.
+- Waits for each server to disappear from the BMC API before continuing, preventing teardown races with Cloudflare/RHACM/network cleanup.
+- Fails with a clear sanitized message if a potentially billable server still cannot be deprovisioned after retries.
+
+## 1.4.1 - 2026-08-10
+
+- Fixed `make deploy` when the RHACM hub has no OpenShift 4.22 `ClusterImageSet`. The deployment now self-heals by creating `openshift-4.22.0-auto` with the documented `quay.io/openshift-release-dev/ocp-release:4.22.0-x86_64` default, overridable with `OPENSHIFT_RELEASE_IMAGE`.
+- Fixed `make destroy` failing on `ManagedCluster` dynamic API discovery. Teardown now deletes the cluster-scoped `ManagedCluster` with `oc`, before deleting its namespace, and tolerates an absent ManagedCluster API while still surfacing real authorization/API errors.
+- Improved destroy idempotency for partially destroyed labs.
+
+## 1.4.0
+
+- Add a default `self-managed-vxlan` PHX↔CHI lab fabric so `make deploy` can complete EVPN without assuming phoenixNAP standard BGP Peer Groups provide L2VPN EVPN.
+- Build `NNCP/evpn-cross-site-transit` on both SNO nodes using the existing public `bond0` addresses, VXLAN VNI 4090, UDP/4790, MTU 1450 and a point-to-point `192.168.254.0/30` transit.
+- Directly peer SW1 FRR-K8s ASN 65011 with C1 FRR-K8s ASN 65021 over that transit, with an idempotently generated shared BGP password.
+- Bootstrap cross-site BGP in phases so both `FRRConfiguration` peers exist before either site waits for `Established`; this avoids a fresh-deploy deadlock.
+- Create the `evpn-vm-net` primary EVPN CUDN and `evpn-vm-routes` automatically after the base BGP session is up.
+- Verify MP-BGP L2VPN EVPN is established and that each cluster learns the remote OpenShift VTEP `/32` before deployment succeeds.
+- Keep nested MTUs at 1500 (physical), 1450 (lab transit) and 1400 (OpenShift EVPN CUDN) so both VXLAN headers fit without requiring jumbo frames.
+- Partition the shared `10.50.50.0/24` IPAM space by site using distinct gateways, infrastructure subnets and reserved subnets, preventing duplicate automatic VM IP allocation across the two independent clusters.
+- Preserve `EVPN_FABRIC_MODE=external` for a real provider/DC EVPN fabric.
+
+## 1.3.4
+
+- Fix dynamic namespace label rendering in the OpenShift Localnet role. The previous YAML mapping key was passed literally as `{{ vm_l2.namespace_label_key }}`, causing Kubernetes to reject `vm-workloads` with HTTP 422.
+- Build the namespace selector labels as an Ansible/Jinja dictionary before passing them to `metadata.labels` and the CUDN `namespaceSelector.matchLabels`.
+- Keep the Localnet namespace and CUDN selector using the configured `digitaldovey.net/vm-l2=true` label while remaining idempotent on reruns.
+
+## 1.3.3
+
+- Make `make deploy` resilient when phoenixNAP rejects an optional day-2 private-network attachment on an already-installed SNO.
+- Cross-check private-network membership from both the BMC Server API and the Networks API before attempting a repair, avoiding false negatives from one API view.
+- Use the documented NO-CIDR day-2 request shape (`id` plus `ips: []` with `force=true`) and surface a sanitized API validation message instead of hiding the useful error.
+- Treat private-L2 reconciliation as best-effort for existing servers by default so it cannot block the independent OpenShift Virtualization / EVPN platform stages. Newly provisioned servers still require the requested private network.
+- Add `phoenixnap.fail_on_existing_private_network_reconcile_error` for users who want strict failure behavior.
+
+## 1.3.2
+
+- Attempt in-place private-network reconciliation for compatible existing phoenixNAP servers instead of requiring destructive replacement.
+- Preserve existing server shape and `PUBLIC_AND_PRIVATE` mode during reruns.
+
+## 1.3.1
+
+- Fix idempotent `make deploy` reruns after SW1/C1 are already installed.
+- Read and preserve the live Hive `ClusterDeployment.spec.installed` value instead of trying to force it back to `false`.
+- Prevent the Hive admission error `cannot make uninstalled once installed`, allowing deployment to continue into the day-2 Virtualization, NMState and EVPN stages.
+
 ## 1.3.0
 
-- Add Red Hat LVM Storage to both SNO clusters using one dynamically discovered, completely unused whole local disk per node.
-- Pin the selected LVMS device by stable `/dev/disk/by-path`; abort unless exactly one safe empty candidate exists and keep force-wipe disabled.
-- Create `lvms-vg1` with a 90% thin pool, require at least 600 GiB physical thin-pool capacity, and use overprovision ratio 1; wait for LVMS to create its class before clearing any previous Kubernetes default, and mark `lvms-vg1` as the OpenShift Virtualization default storage class.
-- Add `make storage` and include the storage stage in `make deploy` before OpenShift Virtualization.
-- Stage one RHEL 9 proof VM per site: `rhel9-sw1` at `10.50.50.11/24` and `rhel9-c1` at `10.50.50.21/24`, each with exactly one primary EVPN `l2bridge` interface.
-- Use the Red Hat RHEL 9 boot DataSource, a 40 GiB LVMS root disk, deterministic MAC/IP addressing and a serial-console peer-ping service.
-- Gate the proof VMs on a confirmed, active external EVPN fabric so the site-local phoenixNAP VLANs are never misrepresented as a cross-site L2 network.
-- Configure the EVPN Layer2 CUDN with `subnets` omitted so workload addressing is manual; this avoids independent OVN allocators selecting overlapping addresses while the proof guests use controlled static IPs.
-- Sanitize BGP status output so phoenixNAP peer-group passwords are never printed by the status role.
-
-## 1.2.9
-
-- Fix dynamic Kubernetes label-map rendering in the OpenShift Localnet role.
-- Build the VM workload namespace labels as a rendered dictionary before passing them to `kubernetes.core.k8s`; Ansible does not template the quoted YAML mapping key in this definition path.
-- Reuse the same rendered label map for the `ClusterUserDefinedNetwork` namespace selector.
-- Add an assertion that prevents an unresolved Jinja expression from being sent as a Kubernetes label key.
-- No install-time RHACM or phoenixNAP lifecycle resources are changed by this fix.
-
-## v1.2.8
-
-- Make `make deploy` lifecycle-idempotent after successful cluster installation.
-- Stop declaring `ClusterDeployment.spec.installed: false`; Hive owns the one-way transition to `true`.
-- Detect installed `ClusterDeployment` objects and skip AgentClusterInstall/InfraEnv/iPXE reconciliation on day-2 reruns.
-- Skip phoenixNAP discovery/reboot/Agent approval for already-installed sites.
-- Preserve existing phoenixNAP servers without requiring live spare SKU inventory during preflight or `make provision`.
-- Make the install wait return immediately for clusters whose ClusterDeployment is already installed.
+- Make `make deploy` enable OpenShift 4.22 EVPN platform prerequisites on both SNO clusters automatically.
+- Enable FRR-K8s, OVN route advertisements, `routingViaHost: true` and `ipForwarding: Global` through the Cluster Network Operator.
+- Wait for `FRRConfiguration`, `VTEP` and `RouteAdvertisements` CRDs and for an FRR-K8s pod before continuing.
+- Create `evpn-vms` with the required `k8s.ovn.org/primary-user-defined-network` label at namespace creation time.
+- Create and verify the NMState dummy VTEP interface and unmanaged `VTEP` CR even before the external EVPN fabric is available.
+- Allow external EVPN peer settings to come from `.env`; rerunning the same `make deploy` completes `FRRConfiguration`, the EVPN CUDN and `RouteAdvertisements` when the fabric is confirmed.
+- Keep phoenixNAP standard BGP peer groups separate from EVPN L2VPN fabric assumptions.
 
 # Changelog
-
-## 1.2.7
-
-- Move the second phoenixNAP site from CHI to ASH because phoenixNAP custom `os: ipxe` provisioning is currently supported only in PHX, ASH and NLD.
-- Add `phoenixnap.ipxe_supported_locations` and fail early in validation, availability, SKU selection and provisioning if a site is configured in an unsupported iPXE location.
-- Keep dynamic per-site SKU selection under the strict `$0.30/hour` cap; ASH stock and pricing are selected live at runtime.
-- Rename the second-site private network to `ocp-c1-ash-vm-l2` so an existing CHI network from earlier lab runs cannot be mistaken for the ASH VLAN.
-- Update architecture and networking documentation from PHX/CHI to PHX/ASH.
-
 
 ## 1.2.6
 
@@ -137,3 +212,13 @@
 - Fixed `make availability` so it filters on live `minQuantityAvailable` / `availableQuantity`, rather than listing catalog SKUs with zero stock.
 - Added a common-live-SKU intersection for PHX and CHI.
 - Sanitized preflight availability assertions so failed checks no longer dump phoenixNAP OAuth Bearer tokens.
+
+## 1.4.0
+
+- Added a self-managed PHX<->CHI EVPN lab fabric to `make deploy`.
+- Builds an NMState point-to-point VXLAN transit over the two SNO public IPs.
+- Runs authenticated eBGP between SW1 ASN 65011 and C1 ASN 65021 over the private transit.
+- Keeps OpenShift EVPN VTEPs private on the existing dummy interfaces.
+- Makes the nested MTU explicit: 1500 outer, 1450 transit, 1400 EVPN CUDN.
+- Verifies the BGP session, `EVPNTransportAccepted`, and RouteAdvertisements acceptance.
+- Preserves `external` fabric mode for a real provider/DC EVPN fabric.

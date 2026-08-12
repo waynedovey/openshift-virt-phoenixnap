@@ -4,6 +4,10 @@
   gather_facts: false
   roles:
     - role: pnap_auth
+    # Replacement is intentionally different from an idempotent deploy: verify
+    # replacement capacity before any destructive action even when servers exist.
     - role: pnap_select_sku
-      when: (phoenixnap.auto_select.enabled | bool) and (pnap_selected_skus is not defined)
+      vars:
+        pnap_force_capacity_selection: true
+      when: phoenixnap.auto_select.enabled | bool
     - role: pnap_replace_servers

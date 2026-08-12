@@ -1,15 +1,4 @@
 ---
-- name: Refuse server provisioning in phoenixNAP locations without iPXE
-  ansible.builtin.assert:
-    that:
-      - item.value.location in phoenixnap.ipxe_supported_locations
-    fail_msg: >-
-      {{ item.key }} location {{ item.value.location }} does not support phoenixNAP os=ipxe.
-      Supported locations: {{ phoenixnap.ipxe_supported_locations | join(', ') }}.
-  loop: "{{ sites | dict2items }}"
-  loop_control:
-    label: "{{ item.key }}@{{ item.value.location }}"
-
 - name: List existing phoenixNAP servers
   ansible.builtin.uri:
     url: "{{ phoenixnap.api_base }}/bmc/v1/servers"

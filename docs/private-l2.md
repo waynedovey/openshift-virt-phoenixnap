@@ -11,7 +11,7 @@ The automation creates:
 | Site | phoenixNAP location | Private network | Guest CIDR | Purpose |
 |---|---|---|---|---|
 | SW1 | PHX | `ocp-sw1-vm-l2` | `10.60.10.0/24` | site-local VM L2 |
-| C1 | ASH | `ocp-c1-ash-vm-l2` | `10.60.20.0/24` | site-local VM L2 |
+| C1 | ASH | `ocp-c1-vm-l2` | `10.60.20.0/24` | site-local VM L2 |
 
 The provider VLANs themselves are created with **NO-CIDR**. The CIDRs above are guest VM addressing conventions only.
 
@@ -73,7 +73,7 @@ The separate EVPN design remains responsible for the portable `10.50.50.0/24` VM
 PHX local private VLAN                      ASH local private VLAN
 10.60.10.0/24                               10.60.20.0/24
        |                                           |
-       +--- OCP SNO --- external EVPN/VXLAN --- OCP SNO ---+
+       +--- OCP SNO --- OpenShift EVPN/VXLAN --- OCP SNO ---+
                                |
                      shared 10.50.50.0/24
                      VNI 5050 / RT 65000:5050

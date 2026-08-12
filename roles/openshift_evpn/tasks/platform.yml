@@ -1,0 +1,180 @@
+---
+- name: Set EVPN platform site facts
+  ansible.builtin.set_fact:
+    managed_kubeconfig: "artifacts/kubeconfigs/{{ site_item.value.cluster_name }}.kubeconfig"
+
+- name: Check whether EVPN workload namespace already exists
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: v1
+    kind: Namespace
+    name: "{{ evpn.namespace }}"
+  register: evpn_namespace_before
+
+- name: Protect primary CUDN namespace creation requirement
+  ansible.builtin.assert:
+    that:
+      - >-
+        evpn_namespace_before.resources | length == 0 or
+        ((evpn_namespace_before.resources[0].metadata.labels | default({}))
+          .get('k8s.ovn.org/primary-user-defined-network', '__missing__') == '')
+    fail_msg: >-
+      Namespace {{ evpn.namespace }} already exists without the required
+      k8s.ovn.org/primary-user-defined-network="" label. OpenShift requires this
+      label to be present when a namespace is created for a primary CUDN. Move or
+      delete workloads from the namespace, delete the namespace, then rerun make deploy.
+
+- name: Enable FRR, route advertisements and host routing in Cluster Network Operator
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: operator.openshift.io/v1
+      kind: Network
+      metadata:
+        name: cluster
+      spec:
+        additionalRoutingCapabilities:
+          providers:
+            - FRR
+        defaultNetwork:
+          type: OVNKubernetes
+          ovnKubernetesConfig:
+            routeAdvertisements: Enabled
+            gatewayConfig:
+              routingViaHost: true
+              ipForwarding: Global
+
+- name: Wait for the Network ClusterOperator to settle after EVPN prerequisite change
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: config.openshift.io/v1
+    kind: ClusterOperator
+    name: network
+  register: evpn_network_operator
+  until: >-
+    evpn_network_operator.resources | length == 1 and
+    (evpn_network_operator.resources[0].status.conditions | default([])
+      | selectattr('type', 'equalto', 'Available')
+      | selectattr('status', 'equalto', 'True')
+      | list | length) > 0 and
+    (evpn_network_operator.resources[0].status.conditions | default([])
+      | selectattr('type', 'equalto', 'Progressing')
+      | selectattr('status', 'equalto', 'False')
+      | list | length) > 0
+  retries: 180
+  delay: 10
+
+- name: Wait for EVPN and FRR custom resource definitions
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: apiextensions.k8s.io/v1
+    kind: CustomResourceDefinition
+    name: "{{ item }}"
+  register: evpn_crd
+  until: evpn_crd.resources | length == 1
+  retries: 90
+  delay: 10
+  loop:
+    - frrconfigurations.frrk8s.metallb.io
+    - routeadvertisements.k8s.ovn.org
+    - vteps.k8s.ovn.org
+
+- name: Wait for FRR-K8s pod to be running
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: v1
+    kind: Pod
+    namespace: openshift-frr-k8s
+  register: evpn_frr_pods
+  until: >-
+    evpn_frr_pods.resources | length > 0 and
+    (evpn_frr_pods.resources
+      | selectattr('status.phase', 'equalto', 'Running')
+      | list | length) > 0
+  retries: 90
+  delay: 10
+
+- name: Create EVPN workload namespace with primary CUDN label
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ evpn.namespace }}"
+        labels:
+          k8s.ovn.org/primary-user-defined-network: ""
+
+# Kubernetes NMState is installed by playbooks/07b_nmstate.yml.
+- name: Create dummy VTEP interface
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: nmstate.io/v1
+      kind: NodeNetworkConfigurationPolicy
+      metadata:
+        name: evpn-vtep
+      spec:
+        nodeSelector: {}
+        desiredState:
+          interfaces:
+            - name: evpn-vtep0
+              type: dummy
+              state: up
+              ipv4:
+                enabled: true
+                address:
+                  - ip: "{{ site_item.value.vtep_ip }}"
+                    prefix-length: 32
+                dhcp: false
+              ipv6:
+                enabled: false
+
+- name: Wait for dummy VTEP interface policy
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: nmstate.io/v1
+    kind: NodeNetworkConfigurationPolicy
+    name: evpn-vtep
+  register: nncp_status
+  until: >-
+    nncp_status.resources | length == 1 and
+    (nncp_status.resources[0].status.conditions | default([])
+      | selectattr('type', 'equalto', 'Available')
+      | selectattr('status', 'equalto', 'True')
+      | list | length) > 0
+  retries: 90
+  delay: 10
+
+- name: Create unmanaged VTEP definition
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: k8s.ovn.org/v1
+      kind: VTEP
+      metadata:
+        name: evpn-vtep
+      spec:
+        mode: Unmanaged
+        cidrs:
+          - "{{ evpn.vtep_cidr }}"
+
+- name: Wait for VTEP acceptance
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: k8s.ovn.org/v1
+    kind: VTEP
+    name: evpn-vtep
+  register: vtep_status
+  until: >-
+    vtep_status.resources | length == 1 and
+    (vtep_status.resources[0].status.conditions | default([])
+      | selectattr('type', 'equalto', 'Accepted')
+      | selectattr('status', 'equalto', 'True')
+      | list | length) > 0
+  retries: 90
+  delay: 10

@@ -8,34 +8,254 @@
     lab_pull_secret: "{{ lookup('file', openshift_pull_secret_file) | trim }}"
   no_log: true
 
-- name: Query 4.22 ClusterImageSets from hub
-  kubernetes.core.k8s_info:
-    kubeconfig: "{{ rhacm.kubeconfig }}"
-    api_version: hive.openshift.io/v1
-    kind: ClusterImageSet
-  register: image_sets
+# Idempotent reruns must not depend on the current ClusterImageSet inventory.
+# Once an AgentClusterInstall exists, its imageSetRef is part of the live cluster
+# install state and should be preserved exactly. This also avoids changing the
+# requested OpenShift payload if the cluster-image-set-controller refreshes the
+# hub's catalog between runs.
+- name: Read existing AgentClusterInstall state for every site through raw REST
+  ansible.builtin.command:
+    argv:
+      - oc
+      - --kubeconfig
+      - "{{ rhacm.kubeconfig }}"
+      - get
+      - --raw
+      - "/apis/extensions.hive.openshift.io/v1beta1/namespaces/{{ item.value.cluster_name }}/agentclusterinstalls/{{ item.value.cluster_name }}"
+  register: existing_aci_raw_queries
+  changed_when: false
+  failed_when: false
+  loop: "{{ sites | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}={{ item.value.cluster_name }}"
 
-- name: Find OpenShift 4.22 ClusterImageSet candidates
+- name: Initialize existing AgentClusterInstall object map
   ansible.builtin.set_fact:
-    ocp_imageset_candidates: >-
-      {{ image_sets.resources
-         | selectattr('metadata.name', 'search', '4[.-]22')
+    rhacm_existing_aci_by_site: {}
+
+- name: Parse existing AgentClusterInstall responses defensively
+  ansible.builtin.set_fact:
+    rhacm_existing_aci_by_site: >-
+      {{ rhacm_existing_aci_by_site
+         | combine({
+             item.item.key:
+             ((item.stdout | default('{}', true)) | from_json)
+           }) }}
+  loop: "{{ existing_aci_raw_queries.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.key | default('unknown') }}"
+
+- name: Initialize existing AgentClusterInstall image-set map
+  ansible.builtin.set_fact:
+    rhacm_existing_imageset_by_site: {}
+
+- name: Preserve imageSetRef from existing AgentClusterInstall resources
+  ansible.builtin.set_fact:
+    rhacm_existing_imageset_by_site: >-
+      {{ rhacm_existing_imageset_by_site
+         | combine({
+             item.key:
+             item.value.get('spec', {}).get('imageSetRef', {}).get('name', '')
+           }) }}
+  loop: "{{ rhacm_existing_aci_by_site | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  when: item.value.get('spec', {}).get('imageSetRef', {}).get('name', '') | length > 0
+
+- name: Build list of known image sets from existing cluster install state
+  ansible.builtin.set_fact:
+    rhacm_known_existing_imagesets: >-
+      {{ rhacm_existing_imageset_by_site.values()
+         | reject('equalto', '')
+         | unique
          | list }}
 
-- name: Require OpenShift 4.22 ClusterImageSet on hub
+- name: Read optional explicit ClusterImageSet override
+  ansible.builtin.set_fact:
+    rhacm_imageset_override: >-
+      {{ lookup('env', 'OPENSHIFT_CLUSTER_IMAGE_SET') | default('', true) | trim }}
+
+- name: Prefer explicit or already-bound image set before hub catalog discovery
+  ansible.builtin.set_fact:
+    ocp_default_imageset_name: >-
+      {{ rhacm_imageset_override
+         if (rhacm_imageset_override | length > 0)
+         else ((rhacm_known_existing_imagesets | first) | default('')) }}
+
+- name: Report existing AgentClusterInstall image-set reuse
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.key | upper }}: preserving existing AgentClusterInstall imageSetRef={{ item.value }}.
+      ClusterImageSet catalog discovery is not required for this already-created site.
+  loop: "{{ rhacm_existing_imageset_by_site | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+# Only a genuinely fresh deployment needs to discover/select a ClusterImageSet.
+# Use the raw Kubernetes REST endpoint so this path does not depend on oc/client
+# RESTMapper discovery, which can be stale or incomplete even while Hive CRDs
+# such as ClusterDeployment remain usable.
+- name: Query ClusterImageSets through the raw Hive REST endpoint for fresh installs
+  ansible.builtin.command:
+    argv:
+      - oc
+      - --kubeconfig
+      - "{{ rhacm.kubeconfig }}"
+      - get
+      - --raw
+      - /apis/hive.openshift.io/v1/clusterimagesets
+  register: image_sets_raw
+  changed_when: false
+  failed_when: false
+  when: ocp_default_imageset_name | length == 0
+
+- name: Require ClusterImageSet REST endpoint only for a fresh install
   ansible.builtin.assert:
     that:
-      - ocp_imageset_candidates | length > 0
+      - image_sets_raw.rc | int == 0
+      - image_sets_raw.stdout | default('') | trim | length > 0
     fail_msg: >-
-      No ClusterImageSet matching OpenShift 4.22 was found on the RHACM hub.
-      Add the 4.22 ClusterImageSet before provisioning.
+      No existing AgentClusterInstall provides an imageSetRef and the hub did not
+      serve /apis/hive.openshift.io/v1/clusterimagesets. A fresh Assisted Installer
+      deployment requires a ClusterImageSet. Verify MCE/Hive and its
+      cluster-image-set-controller, or set OPENSHIFT_CLUSTER_IMAGE_SET to the name
+      of a known-good OpenShift {{ ocp_minor }} ClusterImageSet.
+      rc={{ image_sets_raw.rc | default('unknown') }};
+      error={{ image_sets_raw.stderr | default('') | trim | regex_replace('Bearer [^ ]+', 'Bearer [REDACTED]') }}.
+  when: ocp_default_imageset_name | length == 0
 
-- name: Select most recently created OpenShift 4.22 ClusterImageSet
+- name: Parse ClusterImageSets returned by the raw Hive REST endpoint
   ansible.builtin.set_fact:
-    ocp_imageset_name: >-
+    image_sets_json: "{{ image_sets_raw.stdout | from_json }}"
+  when: ocp_default_imageset_name | length == 0
+
+- name: Find OpenShift 4.22 ClusterImageSet candidates for a fresh install
+  ansible.builtin.set_fact:
+    ocp_imageset_candidates: >-
+      {{ image_sets_json['items'] | default([])
+         | selectattr('metadata.name', 'search', '4[.-]22')
+         | list }}
+  when: ocp_default_imageset_name | length == 0
+
+- name: Build deterministic OpenShift 4.22 ClusterImageSet manifest for a fresh hub
+  ansible.builtin.set_fact:
+    auto_clusterimageset_manifest: |
+      apiVersion: hive.openshift.io/v1
+      kind: ClusterImageSet
+      metadata:
+        name: openshift-{{ ocp_minor }}.0-auto
+        labels:
+          visible: "true"
+          digitaldovey.net/managed-by: phoenixnap-ocp422-evpn
+      spec:
+        releaseImage: {{ rhacm.release_image }}
+  when:
+    - ocp_default_imageset_name | length == 0
+    - rhacm.auto_create_clusterimageset | default(true) | bool
+    - ocp_imageset_candidates | default([]) | length == 0
+
+- name: Create deterministic ClusterImageSet through raw Hive REST endpoint when absent
+  ansible.builtin.command:
+    argv:
+      - oc
+      - --kubeconfig
+      - "{{ rhacm.kubeconfig }}"
+      - create
+      - --raw=/apis/hive.openshift.io/v1/clusterimagesets
+      - -f
+      - -
+    stdin: "{{ auto_clusterimageset_manifest }}"
+  register: clusterimageset_create_raw
+  changed_when: clusterimageset_create_raw.rc | int == 0
+  failed_when: false
+  when:
+    - ocp_default_imageset_name | length == 0
+    - rhacm.auto_create_clusterimageset | default(true) | bool
+    - ocp_imageset_candidates | default([]) | length == 0
+
+- name: Re-query ClusterImageSets through raw REST after optional self-heal
+  ansible.builtin.command:
+    argv:
+      - oc
+      - --kubeconfig
+      - "{{ rhacm.kubeconfig }}"
+      - get
+      - --raw
+      - /apis/hive.openshift.io/v1/clusterimagesets
+  register: image_sets_after_reconcile_raw
+  changed_when: false
+  when: ocp_default_imageset_name | length == 0
+
+- name: Parse reconciled ClusterImageSets
+  ansible.builtin.set_fact:
+    image_sets_after_reconcile_json: "{{ image_sets_after_reconcile_raw.stdout | from_json }}"
+  when: ocp_default_imageset_name | length == 0
+
+- name: Rebuild OpenShift 4.22 ClusterImageSet candidates
+  ansible.builtin.set_fact:
+    ocp_imageset_candidates: >-
+      {{ image_sets_after_reconcile_json['items'] | default([])
+         | selectattr('metadata.name', 'search', '4[.-]22')
+         | list }}
+  when: ocp_default_imageset_name | length == 0
+
+- name: Require OpenShift 4.22 ClusterImageSet only for a fresh install
+  ansible.builtin.assert:
+    that:
+      - ocp_imageset_candidates | default([]) | length > 0
+    fail_msg: >-
+      No ClusterImageSet matching OpenShift {{ ocp_minor }} was found on the RHACM
+      hub and automatic creation did not produce one. Check the Hive/MCE
+      cluster-image-set-controller or set OPENSHIFT_CLUSTER_IMAGE_SET explicitly.
+  when: ocp_default_imageset_name | length == 0
+
+- name: Select most recently created OpenShift 4.22 ClusterImageSet for fresh sites
+  ansible.builtin.set_fact:
+    ocp_default_imageset_name: >-
       {{ (ocp_imageset_candidates
           | sort(attribute='metadata.creationTimestamp')
           | last).metadata.name }}
+  when: ocp_default_imageset_name | length == 0
+
+- name: Initialize effective per-site ClusterImageSet map
+  ansible.builtin.set_fact:
+    rhacm_imageset_by_site: {}
+
+- name: Build effective per-site ClusterImageSet map
+  ansible.builtin.set_fact:
+    rhacm_imageset_by_site: >-
+      {{ rhacm_imageset_by_site
+         | combine({
+             item.key:
+             (rhacm_existing_imageset_by_site[item.key]
+              if (rhacm_existing_imageset_by_site[item.key] | default('') | length > 0)
+              else ocp_default_imageset_name)
+           }) }}
+  loop: "{{ sites | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Require an effective ClusterImageSet reference for every site
+  ansible.builtin.assert:
+    that:
+      - rhacm_imageset_by_site[item.key] | default('') | length > 0
+    fail_msg: >-
+      No effective ClusterImageSet could be determined for {{ item.key }}.
+      Preserve the existing AgentClusterInstall imageSetRef or set
+      OPENSHIFT_CLUSTER_IMAGE_SET explicitly.
+  loop: "{{ sites | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Report effective OpenShift release image set per site
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.key | upper }} will use ClusterImageSet {{ rhacm_imageset_by_site[item.key] }}.
+      Existing AgentClusterInstall references are preserved on reruns; fresh sites
+      use the selected OpenShift {{ ocp_minor }} image set.
+  loop: "{{ sites | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
 
 - name: Optionally expose iPXE artifacts over HTTP on the hub
   kubernetes.core.k8s:

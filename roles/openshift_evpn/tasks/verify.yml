@@ -1,0 +1,78 @@
+---
+- name: Set final EVPN verification facts
+  ansible.builtin.set_fact:
+    managed_kubeconfig: "artifacts/kubeconfigs/{{ site_item.value.cluster_name }}.kubeconfig"
+    evpn_peer_address: >-
+      {{ evpn.transport.addresses['c1' if site_item.key == 'sw1' else 'sw1']
+         if evpn.fabric_mode == 'self-managed-vxlan'
+         else evpn.peers[site_item.key] }}
+    evpn_remote_vtep: "{{ sites['c1' if site_item.key == 'sw1' else 'sw1'].vtep_ip }}"
+
+- name: Get FRR-K8s pods for final EVPN verification
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: v1
+    kind: Pod
+    namespace: openshift-frr-k8s
+  register: evpn_verify_frr_pods
+
+- name: Build running FRR-K8s daemon pod list for final verification
+  ansible.builtin.set_fact:
+    evpn_verify_running_frr_pods: >-
+      {{ evpn_verify_frr_pods.resources
+         | rejectattr('metadata.name', 'search', 'statuscleaner')
+         | selectattr('status.phase', 'equalto', 'Running')
+         | list }}
+
+- name: Require a running FRR-K8s daemon pod for final verification
+  ansible.builtin.assert:
+    that:
+      - evpn_verify_running_frr_pods | length > 0
+    fail_msg: "No running FRR-K8s daemon pod is available on {{ site_item.key }}."
+
+- name: Select FRR-K8s daemon pod for final verification
+  ansible.builtin.set_fact:
+    evpn_frr_daemon_pod: "{{ (evpn_verify_running_frr_pods | first).metadata.name }}"
+
+- name: Wait for MP-BGP L2VPN EVPN address family to be established
+  kubernetes.core.k8s_exec:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    namespace: openshift-frr-k8s
+    pod: "{{ evpn_frr_daemon_pod }}"
+    container: frr
+    command: "vtysh -c 'show bgp l2vpn evpn summary established'"
+  register: evpn_l2vpn_established
+  until: "evpn_peer_address in (evpn_l2vpn_established.stdout | default(''))"
+  retries: 90
+  delay: 5
+  changed_when: false
+
+- name: Wait for remote OpenShift VTEP route in the EVPN underlay
+  kubernetes.core.k8s_exec:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    namespace: openshift-frr-k8s
+    pod: "{{ evpn_frr_daemon_pod }}"
+    container: frr
+    command: "vtysh -c 'show ip route {{ evpn_remote_vtep }}/32'"
+  register: evpn_remote_vtep_route
+  until: "evpn_remote_vtep in (evpn_remote_vtep_route.stdout | default(''))"
+  retries: 90
+  delay: 5
+  changed_when: false
+
+- name: Read EVPN Type-2 MAC/IP route table
+  kubernetes.core.k8s_exec:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    namespace: openshift-frr-k8s
+    pod: "{{ evpn_frr_daemon_pod }}"
+    container: frr
+    command: "vtysh -c 'show bgp l2vpn evpn route type 2'"
+  register: evpn_type2_routes
+  changed_when: false
+
+- name: Report final EVPN fabric state
+  ansible.builtin.debug:
+    msg:
+      - "{{ site_item.key }}: MP-BGP EVPN Established to {{ evpn_peer_address }}"
+      - "{{ site_item.key }}: remote VTEP {{ evpn_remote_vtep }}/32 is present in FRR routing"
+      - "Type-2 routes appear after EVPN workloads are running; current table lines={{ evpn_type2_routes.stdout_lines | default([]) | length }}"

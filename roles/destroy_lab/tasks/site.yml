@@ -6,7 +6,36 @@
           | selectattr('hostname', 'equalto', site_item.value.node_hostname)
           | list | first) | default({}) }}
 
-- name: Deprovision hourly server and optionally relinquish IP block
+- name: Refresh {{ site_item.key }} server lifecycle state before teardown
+  ansible.builtin.uri:
+    url: "{{ phoenixnap.api_base }}/bmc/v1/servers/{{ destroy_site_server.id }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ pnap_token }}"
+    return_content: true
+    status_code: [200, 404]
+  register: destroy_site_server_live
+  when: destroy_site_server | length > 0
+  no_log: true
+
+- name: Publish sanitized {{ site_item.key }} server lifecycle state
+  ansible.builtin.set_fact:
+    destroy_site_server_exists: >-
+      {{ (destroy_site_server | length > 0) and
+         (destroy_site_server_live.status | default(404) == 200) }}
+    destroy_site_server_status: >-
+      {{ (destroy_site_server_live.json | default({})).status
+         | default(destroy_site_server.status | default('absent')) }}
+
+- name: Report server teardown state
+  ansible.builtin.debug:
+    msg: >-
+      {{ site_item.key }} server {{ site_item.value.node_hostname }} lifecycle state is
+      {{ destroy_site_server_status }}. A server already in 'deleting' is treated as
+      an in-progress destroy and will not receive a second deprovision request.
+  when: destroy_site_server | length > 0
+
+- name: Request phoenixNAP hourly server deprovision
   ansible.builtin.uri:
     url: "{{ phoenixnap.api_base }}/bmc/v1/servers/{{ destroy_site_server.id }}/actions/deprovision"
     method: POST
@@ -16,9 +45,100 @@
     body_format: json
     body:
       deleteIpBlocks: "{{ phoenixnap.delete_ip_blocks_on_destroy | bool }}"
-    status_code: [200, 202, 404]
-  when: destroy_site_server | length > 0
+    return_content: true
+    # 409 means the server is temporarily in an incompatible lifecycle state.
+    # Accept it here so teardown can inspect/retry instead of aborting immediately.
+    status_code: [200, 202, 404, 409]
+  register: destroy_deprovision_initial
+  when:
+    - destroy_site_server_exists | bool
+    - destroy_site_server_status != 'deleting'
   no_log: true
+
+- name: Refresh server state after an initial deprovision conflict
+  ansible.builtin.uri:
+    url: "{{ phoenixnap.api_base }}/bmc/v1/servers/{{ destroy_site_server.id }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ pnap_token }}"
+    return_content: true
+    status_code: [200, 404]
+  register: destroy_after_conflict_state
+  when:
+    - destroy_deprovision_initial is not skipped
+    - destroy_deprovision_initial.status | default(0) == 409
+  no_log: true
+
+- name: Report phoenixNAP deprovision conflict without exposing credentials
+  ansible.builtin.debug:
+    msg: >-
+      phoenixNAP returned HTTP 409 while deprovisioning {{ site_item.key }}.
+      Current server state={{ (destroy_after_conflict_state.json | default({})).status | default('absent') }}.
+      The API documents 409 as an incompatible/transitional resource state; destroy
+      will retry instead of failing immediately.
+  when:
+    - destroy_deprovision_initial is not skipped
+    - destroy_deprovision_initial.status | default(0) == 409
+
+- name: Retry deprovision while phoenixNAP finishes a conflicting lifecycle operation
+  ansible.builtin.uri:
+    url: "{{ phoenixnap.api_base }}/bmc/v1/servers/{{ destroy_site_server.id }}/actions/deprovision"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ pnap_token }}"
+      Content-Type: application/json
+    body_format: json
+    body:
+      deleteIpBlocks: "{{ phoenixnap.delete_ip_blocks_on_destroy | bool }}"
+    return_content: true
+    status_code: [200, 202, 404, 409]
+  register: destroy_deprovision_retry
+  until: destroy_deprovision_retry.status in [200, 202, 404]
+  retries: "{{ phoenixnap.destroy_deprovision_conflict_retries | default(24) | int }}"
+  delay: "{{ phoenixnap.destroy_poll_seconds | default(10) | int }}"
+  when:
+    - destroy_deprovision_initial is not skipped
+    - destroy_deprovision_initial.status | default(0) == 409
+    - destroy_after_conflict_state.status | default(404) == 200
+    - (destroy_after_conflict_state.json | default({})).status | default('') != 'deleting'
+  no_log: true
+
+- name: Require deprovision request to have been accepted or already in progress
+  ansible.builtin.assert:
+    that:
+      - >-
+        (not (destroy_site_server_exists | bool)) or
+        (destroy_site_server_status == 'deleting') or
+        (destroy_deprovision_initial.status | default(0) in [200, 202, 404]) or
+        ((destroy_after_conflict_state.json | default({})).status | default('') == 'deleting') or
+        (destroy_deprovision_retry.status | default(0) in [200, 202, 404])
+    fail_msg: >-
+      phoenixNAP did not accept deprovision for {{ site_item.value.node_hostname }}
+      after retrying HTTP 409 lifecycle conflicts. Check the server state in the BMC
+      portal/API before rerunning make destroy. The playbook will not silently leave
+      a potentially billable server behind.
+
+- name: Wait until phoenixNAP server is fully removed
+  ansible.builtin.uri:
+    url: "{{ phoenixnap.api_base }}/bmc/v1/servers/{{ destroy_site_server.id }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ pnap_token }}"
+    return_content: false
+    status_code: [200, 404]
+  register: destroy_server_absent
+  until: destroy_server_absent.status == 404
+  retries: "{{ phoenixnap.destroy_server_delete_retries | default(60) | int }}"
+  delay: "{{ phoenixnap.destroy_poll_seconds | default(10) | int }}"
+  when: destroy_site_server_exists | bool
+  no_log: true
+
+- name: Report phoenixNAP server removal
+  ansible.builtin.debug:
+    msg: >-
+      {{ site_item.key }} server {{ site_item.value.node_hostname }} is absent from
+      phoenixNAP BMC; teardown can safely continue.
+  when: destroy_site_server | length > 0
 
 - name: Discover matching Cloudflare records
   ansible.builtin.uri:
@@ -52,20 +172,41 @@
   when: cloudflare.enabled | bool
   no_log: true
 
+- name: Delete RHACM ManagedCluster with oc for discovery-safe teardown
+  ansible.builtin.command:
+    argv:
+      - oc
+      - --kubeconfig
+      - "{{ rhacm.kubeconfig }}"
+      - delete
+      - managedclusters.cluster.open-cluster-management.io
+      - "{{ site_item.value.cluster_name }}"
+      - --ignore-not-found=true
+      - --wait=false
+  register: destroy_managedcluster_delete
+  changed_when: "'deleted' in destroy_managedcluster_delete.stdout"
+  failed_when: >-
+    destroy_managedcluster_delete.rc != 0 and
+    (
+      "the server doesn't have a resource type" not in destroy_managedcluster_delete.stderr and
+      'the server could not find the requested resource' not in destroy_managedcluster_delete.stderr and
+      'no matches for kind' not in destroy_managedcluster_delete.stderr
+    )
+
+- name: Report absent ManagedCluster API during teardown
+  ansible.builtin.debug:
+    msg: >-
+      ManagedCluster API is not currently discoverable on the RHACM hub;
+      continuing teardown because the cluster-scoped object cannot exist
+      without that API.
+  when:
+    - destroy_managedcluster_delete.rc != 0
+
 - name: Delete RHACM managed cluster namespace
   kubernetes.core.k8s:
     kubeconfig: "{{ rhacm.kubeconfig }}"
     api_version: v1
     kind: Namespace
-    name: "{{ site_item.value.cluster_name }}"
-    state: absent
-    wait: false
-
-- name: Delete RHACM ManagedCluster
-  kubernetes.core.k8s:
-    kubeconfig: "{{ rhacm.kubeconfig }}"
-    api_version: cluster.open-cluster-management.io/v1
-    kind: ManagedCluster
     name: "{{ site_item.value.cluster_name }}"
     state: absent
     wait: false

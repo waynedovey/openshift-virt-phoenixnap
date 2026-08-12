@@ -1,0 +1,65 @@
+---
+- name: Check managed-cluster kubeconfig for EVPN status
+  ansible.builtin.stat:
+    path: "artifacts/kubeconfigs/{{ site_item.value.cluster_name }}.kubeconfig"
+  register: status_managed_kubeconfig
+
+- name: Read EVPN objects from managed cluster
+  when: status_managed_kubeconfig.stat.exists
+  block:
+    - name: Read EVPN transit NNCP
+      kubernetes.core.k8s_info:
+        kubeconfig: "artifacts/kubeconfigs/{{ site_item.value.cluster_name }}.kubeconfig"
+        api_version: nmstate.io/v1
+        kind: NodeNetworkConfigurationPolicy
+        name: evpn-cross-site-transit
+      register: status_evpn_transit
+
+    - name: Read EVPN VTEP
+      kubernetes.core.k8s_info:
+        kubeconfig: "artifacts/kubeconfigs/{{ site_item.value.cluster_name }}.kubeconfig"
+        api_version: k8s.ovn.org/v1
+        kind: VTEP
+        name: evpn-vtep
+      register: status_evpn_vtep
+
+    - name: Read EVPN FRRConfiguration
+      kubernetes.core.k8s_info:
+        kubeconfig: "artifacts/kubeconfigs/{{ site_item.value.cluster_name }}.kubeconfig"
+        api_version: frrk8s.metallb.io/v1beta1
+        kind: FRRConfiguration
+        namespace: openshift-frr-k8s
+        name: evpn-fabric
+      register: status_evpn_frr
+
+    - name: Read EVPN RouteAdvertisements
+      kubernetes.core.k8s_info:
+        kubeconfig: "artifacts/kubeconfigs/{{ site_item.value.cluster_name }}.kubeconfig"
+        api_version: k8s.ovn.org/v1
+        kind: RouteAdvertisements
+        name: evpn-vm-routes
+      register: status_evpn_ra
+
+    - name: Read EVPN CUDN
+      kubernetes.core.k8s_info:
+        kubeconfig: "artifacts/kubeconfigs/{{ site_item.value.cluster_name }}.kubeconfig"
+        api_version: k8s.ovn.org/v1
+        kind: ClusterUserDefinedNetwork
+        name: "{{ evpn.network_name }}"
+      register: status_evpn_cudn
+
+    - name: Report managed-cluster EVPN state
+      ansible.builtin.debug:
+        msg: >-
+          {{ site_item.key }} EVPN:
+          transit={{ 'present' if status_evpn_transit.resources | length else 'missing' }},
+          VTEP={{ (status_evpn_vtep.resources[0].status.conditions | default([])
+            | selectattr('type', 'equalto', 'Accepted')
+            | map(attribute='status') | first | default('unknown')) if status_evpn_vtep.resources | length else 'missing' }},
+          FRR={{ 'present' if status_evpn_frr.resources | length else 'missing' }},
+          RA={{ (status_evpn_ra.resources[0].status.conditions | default([])
+            | selectattr('type', 'equalto', 'Accepted')
+            | map(attribute='status') | first | default('unknown')) if status_evpn_ra.resources | length else 'missing' }},
+          CUDN={{ (status_evpn_cudn.resources[0].status.conditions | default([])
+            | selectattr('reason', 'equalto', 'EVPNTransportAccepted')
+            | map(attribute='status') | first | default('unknown')) if status_evpn_cudn.resources | length else 'missing' }}.

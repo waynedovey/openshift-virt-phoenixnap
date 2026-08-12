@@ -7,6 +7,14 @@ rhacm:
   existing_hub: true
   api: "https://api.acm.sandbox5165.opentlc.com:6443"
   kubeconfig: "{{ lookup('env', 'RHACM_KUBECONFIG') }}"
+  # Existing AgentClusterInstall imageSetRef values are authoritative on reruns.
+  # Fresh installs discover/self-heal a 4.22 ClusterImageSet; set
+  # OPENSHIFT_CLUSTER_IMAGE_SET to force a known existing image-set name, or
+  # OPENSHIFT_RELEASE_IMAGE to change the payload used for auto-creation.
+  auto_create_clusterimageset: true
+  release_image: >-
+    {{ lookup('env', 'OPENSHIFT_RELEASE_IMAGE')
+       | default('quay.io/openshift-release-dev/ocp-release:' ~ ocp_minor ~ '.0-x86_64', true) }}
   # iPXE firmware often has limited HTTPS cipher support. This patches the
   # hub-wide AgentServiceConfig to expose iPXE artifacts over HTTP.
   enable_http_ipxe_route: true
@@ -40,17 +48,11 @@ phoenixnap:
     # Prefer a shape around this size, then choose the cheapest qualifying SKU.
     preferred_ram_gb: 128
     preferred_cores: 8
-    # Same SKU across both iPXE-capable sites is preferred for a clean
-    # two-site comparison. If none exists, select the best valid SKU per site.
+    # Same SKU in the two configured iPXE-capable locations is preferred for a clean two-site comparison.
+    # If none exists, select the best valid SKU independently at each site.
     prefer_common_sku: true
     require_common_sku: false
     show_top_candidates: 8
-  # phoenixNAP currently supports custom iPXE provisioning only in these
-  # locations. Keep this explicit so unsupported sites fail before provisioning.
-  ipxe_supported_locations:
-    - PHX
-    - ASH
-    - NLD
   # Public management/iPXE plus an explicit site-local private L2 VLAN.
   # The private network list itself is USER_DEFINED in networkConfiguration.
   network_type: PUBLIC_AND_PRIVATE
@@ -60,6 +62,14 @@ phoenixnap:
   # rejects as overlapping. Build the provider-recommended LACP bond from the
   # discovered MAC addresses, clone the active NIC MAC for DHCP, then reboot iPXE.
   ipxe_network:
+    # phoenixNAP currently permits native os=ipxe provisioning only in these locations.
+    # Keep this explicit so `make availability`, `make preflight`, and `make deploy` fail fast
+    # instead of selecting a valid SERVER SKU in a location where the iPXE OS is unavailable.
+    # Override this list only after the provider confirms additional native-iPXE locations.
+    supported_locations:
+      - PHX
+      - ASH
+      - NLD
     configure_lacp_bond: true
     bond_name: bond0
     bond_mode: 802.3ad
@@ -69,11 +79,28 @@ phoenixnap:
     xmit_hash_policy: layer3+4
     updelay: 200
     downdelay: 200
+    # The Agent CR can exist several seconds before Assisted Installer publishes
+    # the JSON discovery inventory annotation used to choose the LACP NICs.
+    inventory_wait_seconds: 5
+    inventory_wait_retries: 60
   delete_ip_blocks_on_destroy: true
   delete_private_networks_on_destroy: false
+  # Destroy is intentionally idempotent. phoenixNAP returns HTTP 409 while a
+  # server is already deleting or another asynchronous lifecycle operation is
+  # still settling. Retry conflicts and wait for the server to disappear before
+  # removing dependent lab resources.
+  destroy_poll_seconds: 10
+  destroy_deprovision_conflict_retries: 24
+  destroy_server_delete_retries: 60
   # Server type cannot be resized in place. Existing mismatched servers are
   # never silently destroyed; use `make replace-servers` explicitly.
   fail_on_existing_server_mismatch: true
+  # Existing installed SNOs are never replaced just because a day-2 private
+  # network attachment is rejected. Reconciliation is attempted, but make
+  # deploy continues into the OpenShift/EVPN stages by default. Set the fail
+  # flag to true for strict greenfield CI behavior.
+  reconcile_existing_private_networks: true
+  fail_on_existing_private_network_reconcile_error: false
   bgp:
     enabled: true
     asn: 65401
@@ -106,6 +133,8 @@ sites:
   c1:
     cluster_name: c1
     server_type: auto
+    # CHI cannot currently provision phoenixNAP native `os: ipxe`; use ASH for the
+    # second default site while keeping the logical cluster name/API/DNS as c1.
     location: ASH
     node_hostname: sno-c1.digitaldovey.net
     cluster_network: 10.132.0.0/14
@@ -114,7 +143,7 @@ sites:
     bgp_asn: 65021
     vtep_ip: 10.255.50.21
     private_l2:
-      name: ocp-c1-ash-vm-l2
+      name: ocp-c1-vm-l2
       # Guest VM addressing only. phoenixNAP VLAN itself is created NO-CIDR.
       cidr: 10.60.20.0/24
       uplink_interface: bond0
@@ -129,28 +158,6 @@ dns_record_prefixes:
   - api
   - api-int
   - "*.apps"
-
-# LVM Storage uses one dedicated, completely unused local disk on each SNO.
-# The automation discovers exactly one safe empty whole disk on first apply,
-# pins it by stable /dev/disk/by-path, and never force-wipes a device.
-lvm_storage:
-  enabled: true
-  namespace: openshift-lvm-storage
-  subscription: lvms
-  package: lvms-operator
-  channel: stable-4.22
-  source: redhat-operators
-  source_namespace: openshift-marketplace
-  lvmcluster_name: lvmcluster
-  device_class: vg1
-  thin_pool_name: thin-pool-1
-  size_percent: 90
-  # Require at least this much physical thin-pool capacity after sizePercent.
-  min_thin_pool_gib: 600
-  overprovision_ratio: 1
-  force_wipe: false
-  make_default: true
-  make_default_virt: true
 
 virtualization:
   enabled: true
@@ -184,46 +191,70 @@ vm_l2:
   # native/public management VLAN; it is isolated by 802.1Q tagging.
   require_non_management_interface: false
 
-# IMPORTANT: phoenixNAP BGP peer groups are ordinary IP BGP. They are not
-# treated here as an EVPN fabric. EVPN application is gated until the actual
-# external EVPN peer addresses are known and reachable from both SNO nodes.
+# OpenShift EVPN platform enablement is part of `make deploy`.
+#
+# Default lab mode builds a self-managed cross-site routed transit using a
+# point-to-point NMState VXLAN interface between the two SNO public addresses.
+# BGP EVPN then runs *inside* that transit and keeps the actual OpenShift VTEP
+# addresses private (10.255.50.11/32 and 10.255.50.21/32).
+#
+# This is a deterministic LAB fabric, not a replacement for a production EVPN
+# provider fabric. Set EVPN_FABRIC_MODE=external to use real provider peers.
 evpn:
   enabled: true
-  apply: false
-  fabric_confirmed: false
+  platform_apply: true
+  fabric_required: true
+  fabric_mode: "{{ lookup('env', 'EVPN_FABRIC_MODE') | default('self-managed-vxlan', true) }}"
+
   namespace: evpn-vms
   network_name: evpn-vm-net
   vm_subnet: 10.50.50.0/24
+  vm_mtu: 1400
+
+  # OpenShift EVPN data-plane VTEPs. These stay on dummy interfaces.
   vtep_cidr: 10.255.50.0/24
   vni: 5050
   route_target: "65000:5050"
-  peer_asn: 65000
-  peers:
-    sw1: ""
-    c1: ""
 
-# One RHEL 9 proof VM per site. These are intentionally gated by evpn.apply
-# and evpn.fabric_confirmed: the site-local phoenixNAP VLANs are not a shared
-# PHX-to-ASH segment. The EVPN Layer2 CUDN deliberately omits `subnets`, so
-# workload addressing is manual and the guests use unique static addresses from
-# this shared L2 subnet.
-evpn_test_vms:
-  enabled: true
-  apply: true
-  namespace: evpn-vms
-  storage_class: lvms-vg1
-  disk_size: 40Gi
-  memory: 4Gi
-  cpu_cores: 2
-  image_datasource: rhel9
-  image_namespace: openshift-virtualization-os-images
-  peer_check_seconds: 15
-  ips:
-    sw1: 10.50.50.11/24
-    c1: 10.50.50.21/24
-  macs:
-    sw1: "02:50:50:00:00:11"
-    c1: "02:50:50:00:00:21"
+  # Self-managed cross-site routed underlay. This transport VXLAN is only the
+  # lab carrier for BGP and the real EVPN/VXLAN packets. It deliberately uses
+  # a different VNI and UDP port from OpenShift EVPN (VNI 5050 / UDP 4789).
+  transport:
+    interface: evpn-transit0
+    vni: 4090
+    udp_port: 4790
+    mtu: 1450
+    prefix_length: 30
+    addresses:
+      sw1: 192.168.254.1
+      c1: 192.168.254.2
+
+  # Each cluster has its own OVN IPAM database. Keep one shared /24 and split
+  # automatic allocations/gateway infrastructure by site to prevent duplicate
+  # addresses while preserving a single stretched Layer-2 EVPN segment.
+  addressing:
+    sw1:
+      default_gateway: 10.50.50.1
+      infrastructure_subnet: 10.50.50.0/28
+      reserved_subnets:
+        - 10.50.50.128/25
+    c1:
+      default_gateway: 10.50.50.129
+      infrastructure_subnet: 10.50.50.128/28
+      reserved_subnets:
+        - 10.50.50.0/25
+
+  bgp_auth:
+    enabled: true
+    secret_name: evpn-bgp-auth
+
+  # External provider mode remains supported. These are ignored by the default
+  # self-managed-vxlan mode.
+  fabric_confirmed: "{{ lookup('env', 'EVPN_FABRIC_CONFIRMED') | default('false', true) | bool }}"
+  peer_asn: "{{ lookup('env', 'EVPN_PEER_ASN') | default('65000', true) | int }}"
+  peers:
+    sw1: "{{ lookup('env', 'EVPN_SW1_PEER') | default('', true) }}"
+    c1: "{{ lookup('env', 'EVPN_C1_PEER') | default('', true) }}"
 
 wait:
   server_seconds: 1800

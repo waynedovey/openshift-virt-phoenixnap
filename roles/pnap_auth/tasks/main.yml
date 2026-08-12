@@ -6,21 +6,5 @@
       - lookup('env', 'PNAP_CLIENT_SECRET') | length > 0
     fail_msg: "PNAP_CLIENT_ID and PNAP_CLIENT_SECRET are required."
 
-- name: Obtain phoenixNAP OAuth token
-  ansible.builtin.uri:
-    url: "{{ phoenixnap.auth_url }}"
-    method: POST
-    body_format: form-urlencoded
-    body:
-      grant_type: client_credentials
-      client_id: "{{ lookup('env', 'PNAP_CLIENT_ID') }}"
-      client_secret: "{{ lookup('env', 'PNAP_CLIENT_SECRET') }}"
-    return_content: true
-    status_code: 200
-  register: pnap_oauth
-  no_log: true
-
-- name: Store phoenixNAP access token for this play
-  ansible.builtin.set_fact:
-    pnap_token: "{{ pnap_oauth.json.access_token }}"
-  no_log: true
+- name: Refresh phoenixNAP OAuth token
+  ansible.builtin.include_tasks: refresh.yml

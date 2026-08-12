@@ -1,0 +1,58 @@
+---
+- name: Set EVPN peer verification facts
+  ansible.builtin.set_fact:
+    managed_kubeconfig: "artifacts/kubeconfigs/{{ site_item.value.cluster_name }}.kubeconfig"
+    evpn_peer_address: >-
+      {{ evpn.transport.addresses['c1' if site_item.key == 'sw1' else 'sw1']
+         if evpn.fabric_mode == 'self-managed-vxlan'
+         else evpn.peers[site_item.key] }}
+
+- name: Get FRR-K8s pods for BGP verification
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: v1
+    kind: Pod
+    namespace: openshift-frr-k8s
+  register: evpn_site_frr_pods
+
+- name: Build running FRR-K8s daemon pod list
+  ansible.builtin.set_fact:
+    evpn_running_frr_pods: >-
+      {{ evpn_site_frr_pods.resources
+         | rejectattr('metadata.name', 'search', 'statuscleaner')
+         | selectattr('status.phase', 'equalto', 'Running')
+         | list }}
+
+- name: Require a running FRR-K8s daemon pod
+  ansible.builtin.assert:
+    that:
+      - evpn_running_frr_pods | length > 0
+    fail_msg: >-
+      No running FRR-K8s daemon pod is available on {{ site_item.key }}.
+      Check oc get pods -n openshift-frr-k8s -o wide.
+
+- name: Select FRR-K8s daemon pod
+  ansible.builtin.set_fact:
+    evpn_frr_daemon_pod: "{{ (evpn_running_frr_pods | first).metadata.name }}"
+
+- name: Wait for base BGP session to the cross-site EVPN peer
+  kubernetes.core.k8s_exec:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    namespace: openshift-frr-k8s
+    pod: "{{ evpn_frr_daemon_pod }}"
+    container: frr
+    command: "vtysh -c 'show bgp neighbors {{ evpn_peer_address }}'"
+  register: evpn_bgp_neighbor_status
+  until: "'BGP state = Established' in (evpn_bgp_neighbor_status.stdout | default(''))"
+  retries: 60
+  delay: 5
+  changed_when: false
+
+- name: Report established EVPN underlay BGP session
+  ansible.builtin.debug:
+    msg: >-
+      {{ site_item.key }} base BGP is Established to {{ evpn_peer_address }}.
+      {% if evpn.fabric_mode == 'self-managed-vxlan' %}
+      The session is carried inside {{ evpn.transport.interface }} over
+      outer VXLAN UDP/{{ evpn.transport.udp_port }}.
+      {% endif %}

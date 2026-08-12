@@ -29,29 +29,14 @@
   register: status_bgp
   no_log: true
 
-- name: Build sanitized BGP peer-group status
-  ansible.builtin.set_fact:
-    status_bgp_sanitized: >-
-      {{ status_bgp_sanitized | default([]) + [
-        {
-          'location': item.location,
-          'status': item.status,
-          'asn': item.activeAsnDetails.asn | default(item.targetAsnDetails.asn),
-          'loopbacks': item.peeringLoopbacksV4 | default([])
-        }
-      ] }}
-  loop: "{{ status_bgp.json }}"
-  when: item.location in [sites.sw1.location, sites.c1.location]
-  no_log: true
-
-- name: Show sanitized BGP peer-group state
+- name: Show BGP peer-group state without passwords
   ansible.builtin.debug:
     msg: >-
-      {{ item.location }}: status={{ item.status }}, ASN={{ item.asn }},
-      loopbacks={{ item.loopbacks }}
-  loop: "{{ status_bgp_sanitized | default([]) }}"
-  loop_control:
-    label: "{{ item.location }}"
+      {{ item.location }}: status={{ item.status }},
+      ASN={{ item.activeAsnDetails.asn | default(item.targetAsnDetails.asn) }},
+      loopbacks={{ item.peeringLoopbacksV4 | default([]) }}
+  loop: "{{ status_bgp.json }}"
+  when: item.location in [sites.sw1.location, sites.c1.location]
 
 - name: Show RHACM install state
   kubernetes.core.k8s_info:
@@ -66,8 +51,11 @@
 - name: Explain EVPN state
   ansible.builtin.debug:
     msg: >-
-      EVPN apply={{ evpn.apply }}, fabric_confirmed={{ evpn.fabric_confirmed }},
-      shared VM subnet={{ evpn.vm_subnet }}, VNI={{ evpn.vni }}.
+      EVPN platform_apply={{ evpn.platform_apply | default(true) }},
+      fabric_mode={{ evpn.fabric_mode }},
+      transit={{ evpn.transport.addresses.sw1 }}<->{{ evpn.transport.addresses.c1 }}
+      over UDP/{{ evpn.transport.udp_port }}, shared VM subnet={{ evpn.vm_subnet }},
+      VNI={{ evpn.vni }}.
 
 - name: List phoenixNAP private networks
   ansible.builtin.uri:
@@ -93,58 +81,9 @@
         | list | first).vlanId) | default('not-created') }}
   loop: "{{ sites | dict2items }}"
 
-- name: Show LVM StorageClass state per site
-  kubernetes.core.k8s_info:
-    kubeconfig: "artifacts/kubeconfigs/{{ item.value.cluster_name }}.kubeconfig"
-    api_version: storage.k8s.io/v1
-    kind: StorageClass
-    name: "lvms-{{ lvm_storage.device_class }}"
+- name: Show managed-cluster EVPN object state
+  ansible.builtin.include_tasks: managed_evpn.yml
   loop: "{{ sites | dict2items }}"
   loop_control:
-    label: "{{ item.key }}"
-  register: status_lvms_sc
-  when: lvm_storage.enabled | bool
-
-- name: Report LVM StorageClass state
-  ansible.builtin.debug:
-    msg: >-
-      {{ item.item.key }}: lvms-{{ lvm_storage.device_class }}={{ 'ready' if item.resources | default([]) | length == 1 else 'not-created' }}
-  loop: "{{ status_lvms_sc.results | default([]) }}"
-  loop_control:
-    label: "{{ item.item.key | default('site') }}"
-  when:
-    - lvm_storage.enabled | bool
-    - item.skipped is not defined or not item.skipped
-
-- name: Read EVPN proof VMs when shared fabric is enabled
-  kubernetes.core.k8s_info:
-    kubeconfig: "artifacts/kubeconfigs/{{ item.value.cluster_name }}.kubeconfig"
-    api_version: kubevirt.io/v1
-    kind: VirtualMachine
-    name: "rhel9-{{ item.key }}"
-    namespace: "{{ evpn.namespace }}"
-  loop: "{{ sites | dict2items }}"
-  loop_control:
-    label: "{{ item.key }}"
-  register: status_evpn_vms
-  when:
-    - virtualization.enabled | bool
-    - evpn.apply | bool
-    - evpn.fabric_confirmed | bool
-    - evpn_test_vms.enabled | bool
-    - evpn_test_vms.apply | bool
-
-- name: Report EVPN proof VMs
-  ansible.builtin.debug:
-    msg: >-
-      {{ item.item.key }}: rhel9-{{ item.item.key }}={{
-        (item.resources[0].status.printableStatus | default('created'))
-        if item.resources | default([]) | length == 1 else 'not-created' }},
-      expected-IP={{ evpn_test_vms.ips[item.item.key] }}
-  loop: "{{ status_evpn_vms.results | default([]) }}"
-  loop_control:
-    label: "{{ item.item.key | default('site') }}"
-  when:
-    - evpn.apply | bool
-    - evpn.fabric_confirmed | bool
-    - item.skipped is not defined or not item.skipped
+    loop_var: site_item
+  when: evpn.enabled | bool

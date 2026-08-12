@@ -1,0 +1,68 @@
+---
+- name: Set EVPN BGP peer facts
+  ansible.builtin.set_fact:
+    managed_kubeconfig: "artifacts/kubeconfigs/{{ site_item.value.cluster_name }}.kubeconfig"
+    evpn_peer_address: >-
+      {{ evpn.transport.addresses['c1' if site_item.key == 'sw1' else 'sw1']
+         if evpn.fabric_mode == 'self-managed-vxlan'
+         else evpn.peers[site_item.key] }}
+    evpn_peer_asn_effective: >-
+      {{ sites['c1' if site_item.key == 'sw1' else 'sw1'].bgp_asn
+         if evpn.fabric_mode == 'self-managed-vxlan'
+         else evpn.peer_asn }}
+    evpn_router_id: >-
+      {{ evpn.transport.addresses[site_item.key]
+         if evpn.fabric_mode == 'self-managed-vxlan'
+         else site_item.value.vtep_ip }}
+
+- name: Create shared BGP authentication secret for self-managed fabric
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: "{{ evpn.bgp_auth.secret_name }}"
+        namespace: openshift-frr-k8s
+      type: kubernetes.io/basic-auth
+      stringData:
+        username: evpn
+        password: "{{ evpn_bgp_password }}"
+  no_log: true
+  when:
+    - evpn.fabric_mode == 'self-managed-vxlan'
+    - evpn.bgp_auth.enabled | bool
+
+- name: Build base EVPN BGP neighbor
+  ansible.builtin.set_fact:
+    evpn_neighbor_base:
+      address: "{{ evpn_peer_address }}"
+      asn: "{{ evpn_peer_asn_effective | int }}"
+
+- name: Add BGP authentication to self-managed neighbor
+  ansible.builtin.set_fact:
+    evpn_neighbor: >-
+      {{ evpn_neighbor_base | combine({'passwordSecret': evpn.bgp_auth.secret_name})
+         if (evpn.fabric_mode == 'self-managed-vxlan' and evpn.bgp_auth.enabled | bool)
+         else evpn_neighbor_base }}
+
+- name: Configure EVPN BGP peer
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: frrk8s.metallb.io/v1beta1
+      kind: FRRConfiguration
+      metadata:
+        name: evpn-fabric
+        namespace: openshift-frr-k8s
+        labels:
+          digitaldovey.net/evpn-fabric: enabled
+      spec:
+        nodeSelector: {}
+        bgp:
+          routers:
+            - asn: "{{ site_item.value.bgp_asn | int }}"
+              id: "{{ evpn_router_id }}"
+              neighbors: "{{ [evpn_neighbor] }}"

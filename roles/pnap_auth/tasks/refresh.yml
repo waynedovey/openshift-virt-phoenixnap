@@ -1,0 +1,24 @@
+---
+# phoenixNAP access tokens are intentionally short lived. Their developer
+# portal documents a 15-minute lifetime, while a bare-metal + Assisted
+# Installer/LACP cycle can exceed that. Keep token acquisition reusable so
+# long-running roles can refresh immediately before the next API phase.
+- name: Obtain fresh phoenixNAP OAuth token
+  ansible.builtin.uri:
+    url: "{{ phoenixnap.auth_url }}"
+    method: POST
+    body_format: form-urlencoded
+    body:
+      grant_type: client_credentials
+      client_id: "{{ lookup('env', 'PNAP_CLIENT_ID') }}"
+      client_secret: "{{ lookup('env', 'PNAP_CLIENT_SECRET') }}"
+    return_content: true
+    status_code: 200
+  register: pnap_oauth_refresh
+  no_log: true
+
+- name: Store fresh phoenixNAP access token for this play
+  ansible.builtin.set_fact:
+    pnap_token: "{{ pnap_oauth_refresh.json.access_token }}"
+    pnap_token_expires_in: "{{ pnap_oauth_refresh.json.expires_in | default(900) | int }}"
+  no_log: true

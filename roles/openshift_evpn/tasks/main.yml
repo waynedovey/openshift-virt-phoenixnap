@@ -1,27 +1,137 @@
 ---
-- name: Explain staged EVPN configuration
-  ansible.builtin.debug:
-    msg: >-
-      OpenShift EVPN is staged but not applied. Set evpn.apply=true only after
-      an external BGP EVPN fabric exists between the configured phoenixNAP sites; then set
-      evpn.fabric_confirmed=true and populate evpn.peers.sw1/c1.
-  when: not evpn.apply | bool
+- name: Check phoenixNAP server state artifacts for self-managed EVPN fabric
+  ansible.builtin.stat:
+    path: "artifacts/servers/{{ item }}.yml"
+  loop:
+    - sw1
+    - c1
+  register: evpn_server_artifact_stats
+  when: evpn.fabric_mode == 'self-managed-vxlan'
 
-- name: Validate external EVPN fabric inputs
+- name: Require phoenixNAP server state artifacts for self-managed EVPN fabric
   ansible.builtin.assert:
     that:
-      - evpn.fabric_confirmed | bool
-      - evpn.peers.sw1 | length > 0
-      - evpn.peers.c1 | length > 0
-      - evpn.peer_asn | int > 0
+      - evpn_server_artifact_stats.results | length == 2
+      - evpn_server_artifact_stats.results | map(attribute='stat.exists') | min
     fail_msg: >-
-      Refusing to configure OpenShift EVPN without confirmed external EVPN peers.
-      PhoenixNAP standard BGP peer groups alone are not treated as EVPN transport.
-  when: evpn.apply | bool
+      Self-managed EVPN fabric requires artifacts/servers/sw1.yml and
+      artifacts/servers/c1.yml. Run make deploy (or make provision) first so the
+      current phoenixNAP public addresses are recorded.
+  when: evpn.fabric_mode == 'self-managed-vxlan'
 
-- name: Configure EVPN per managed cluster
-  ansible.builtin.include_tasks: site.yml
+- name: Read phoenixNAP server state used by the self-managed EVPN fabric
+  ansible.builtin.set_fact:
+    evpn_server_state:
+      sw1: "{{ lookup('ansible.builtin.file', 'artifacts/servers/sw1.yml') | from_yaml }}"
+      c1: "{{ lookup('ansible.builtin.file', 'artifacts/servers/c1.yml') | from_yaml }}"
+  when: evpn.fabric_mode == 'self-managed-vxlan'
+
+- name: Determine EVPN fabric readiness
+  ansible.builtin.set_fact:
+    evpn_self_managed_ready: >-
+      {{
+        evpn.fabric_mode == 'self-managed-vxlan' and
+        (evpn_server_state.sw1.public_ip | default('') | length > 0) and
+        (evpn_server_state.c1.public_ip | default('') | length > 0)
+      }}
+    evpn_external_ready: >-
+      {{
+        evpn.fabric_mode == 'external' and
+        (evpn.fabric_confirmed | bool) and
+        ((evpn.peers.sw1 | default('') | string | length) > 0) and
+        ((evpn.peers.c1 | default('') | string | length) > 0) and
+        ((evpn.peer_asn | int) > 0)
+      }}
+
+- name: Publish effective EVPN fabric readiness
+  ansible.builtin.set_fact:
+    evpn_fabric_ready: "{{ (evpn_self_managed_ready | bool) or (evpn_external_ready | bool) }}"
+
+- name: Create local directory for generated EVPN secrets
+  ansible.builtin.file:
+    path: artifacts/secrets
+    state: directory
+    mode: '0700'
+  when:
+    - evpn.fabric_mode == 'self-managed-vxlan'
+    - evpn.bgp_auth.enabled | bool
+
+- name: Generate or reuse the shared EVPN BGP password
+  ansible.builtin.set_fact:
+    evpn_bgp_password: >-
+      {{ lookup('ansible.builtin.password',
+          'artifacts/secrets/evpn-bgp-password',
+          length=32,
+          chars=['ascii_letters', 'digits']) }}
+  no_log: true
+  when:
+    - evpn.fabric_mode == 'self-managed-vxlan'
+    - evpn.bgp_auth.enabled | bool
+
+- name: Enable OpenShift EVPN platform prerequisites on each managed cluster
+  ansible.builtin.include_tasks: platform.yml
   loop: "{{ sites | dict2items }}"
   loop_control:
     loop_var: site_item
-  when: evpn.apply | bool
+  when: evpn.platform_apply | default(true) | bool
+
+- name: Build the cross-site routed transit used as the lab EVPN underlay
+  ansible.builtin.include_tasks: transit.yml
+  loop: "{{ sites | dict2items }}"
+  loop_control:
+    loop_var: site_item
+  when:
+    - evpn.fabric_mode == 'self-managed-vxlan'
+    - evpn_self_managed_ready | bool
+
+- name: Require a complete EVPN fabric when requested
+  ansible.builtin.assert:
+    that:
+      - evpn_fabric_ready | bool
+    fail_msg: >-
+      EVPN platform support is enabled, but the selected fabric mode is not ready.
+      For self-managed-vxlan, make deploy must have valid public IP artifacts for
+      both SNO servers. For external mode, set EVPN_FABRIC_CONFIRMED=true,
+      EVPN_SW1_PEER, EVPN_C1_PEER and EVPN_PEER_ASN.
+  when: evpn.fabric_required | default(false) | bool
+
+- name: Explain staged external EVPN fabric configuration
+  ansible.builtin.debug:
+    msg: >-
+      OpenShift FRR-K8s, route advertisements, gateway mode, the EVPN namespace,
+      dummy VTEP interface and VTEP CR are enabled. External fabric integration is
+      staged because peer addresses are not confirmed. Set EVPN_FABRIC_CONFIRMED=true,
+      EVPN_SW1_PEER, EVPN_C1_PEER and EVPN_PEER_ASN, then rerun make deploy.
+  when:
+    - evpn.fabric_mode == 'external'
+    - not (evpn_external_ready | bool)
+
+# Bootstrap the two sites in phases. Do not wait for SW1 BGP before C1's peer
+# exists, otherwise a fresh two-site deployment deadlocks on the first site.
+- name: Configure base EVPN BGP peers on both managed clusters
+  ansible.builtin.include_tasks: peer.yml
+  loop: "{{ sites | dict2items }}"
+  loop_control:
+    loop_var: site_item
+  when: evpn_fabric_ready | bool
+
+- name: Verify base BGP peering after both peers exist
+  ansible.builtin.include_tasks: peer_verify.yml
+  loop: "{{ sites | dict2items }}"
+  loop_control:
+    loop_var: site_item
+  when: evpn_fabric_ready | bool
+
+- name: Create EVPN CUDN and route advertisements on both clusters
+  ansible.builtin.include_tasks: network.yml
+  loop: "{{ sites | dict2items }}"
+  loop_control:
+    loop_var: site_item
+  when: evpn_fabric_ready | bool
+
+- name: Verify EVPN address family and remote VTEP reachability
+  ansible.builtin.include_tasks: verify.yml
+  loop: "{{ sites | dict2items }}"
+  loop_control:
+    loop_var: site_item
+  when: evpn_fabric_ready | bool

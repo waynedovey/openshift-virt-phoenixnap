@@ -2,42 +2,57 @@
 - name: Show phoenixNAP budget-aware live server choices
   hosts: localhost
   gather_facts: false
-  vars:
-    # Availability is an explicit capacity-planning command, so always query
-    # live stock even when the configured lab servers already exist.
-    pnap_sku_force_live_selection: true
   pre_tasks:
-    - name: Require phoenixNAP iPXE-capable site locations
+    - name: Require native-iPXE-capable phoenixNAP locations
       ansible.builtin.assert:
         that:
-          - item.value.location in phoenixnap.ipxe_supported_locations
+          - sites.sw1.location in phoenixnap.ipxe_network.supported_locations
+          - sites.c1.location in phoenixnap.ipxe_network.supported_locations
+          - sites.sw1.location != sites.c1.location
         fail_msg: >-
-          {{ item.key }} uses {{ item.value.location }}, but phoenixNAP custom iPXE
-          provisioning is supported only in {{ phoenixnap.ipxe_supported_locations | join(', ') }}.
-      loop: "{{ sites | dict2items }}"
-      loop_control:
-        label: "{{ item.key }}@{{ item.value.location }}"
+          This lab provisions servers with phoenixNAP native `os: ipxe`.
+          Configured locations are SW1={{ sites.sw1.location }}, C1={{ sites.c1.location }}, but the
+          provider-supported native-iPXE list in this repo is
+          {{ phoenixnap.ipxe_network.supported_locations | join(', ') }}.
+          CHI currently rejects `os: ipxe`; use ASH (default) or NLD for C1, or implement
+          a separate RAM-OS/kexec bootstrap path before using CHI.
   roles:
     - role: pnap_auth
     - role: pnap_select_sku
-      when: phoenixnap.auto_select.enabled | bool
   tasks:
-    - name: Display top budget-qualified candidates per site
+    - name: Display existing deployed sites excluded from capacity requirements
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.key | upper }} / {{ sites[item.key].location }}: existing server
+          {{ item.value.hostname }} ({{ item.value.productCode }}, status={{ item.value.status }}) will be reused.
+          Remaining provider stock is informational and is not required by `make deploy`.
+      loop: "{{ pnap_existing_server_reuse_rows | dict2items }}"
+      loop_control:
+        label: "{{ item.key }} / {{ sites[item.key].location }}"
+      when: not (pnap_force_capacity_selection | default(false) | bool)
+
+    - name: Display top budget-qualified candidates for sites that still need capacity
       ansible.builtin.debug:
         msg: >-
           {{ item.key | upper }} / {{ sites[item.key].location }} candidates under
           ${{ '%.2f' | format(phoenixnap.auto_select.max_hourly_price | float) }}/h:
           {% for c in item.value %}{{ c.productCode }}=${{ '%.3f' | format(c.hourlyPrice | float) }}/h
           ({{ c.ramInGb }}GB/{{ c.cores }} cores, stock={{ c.availableQuantity }}){% if not loop.last %}; {% endif %}{% endfor %}
-      loop: "{{ pnap_sku_selection.candidates | dict2items }}"
+      loop: "{{ pnap_sku_selection.candidates | default({}) | dict2items }}"
       loop_control:
         label: "{{ item.key }} / {{ sites[item.key].location }}"
       when: phoenixnap.auto_select.enabled | bool
 
-    - name: Display final dynamic choice
+    - name: Display final dynamic capacity decision per site
       ansible.builtin.debug:
         msg: >-
-          Selected: SW1={{ pnap_selected_skus.sw1.productCode }} @ ${{ '%.3f' | format(pnap_selected_skus.sw1.hourlyPrice | float) }}/h;
-          C1={{ pnap_selected_skus.c1.productCode }} @ ${{ '%.3f' | format(pnap_selected_skus.c1.hourlyPrice | float) }}/h;
-          common SKU={{ pnap_sku_selection.commonSkuSelected }}.
+          {% if pnap_selected_skus[item.key].reusedExisting | default(false) | bool %}
+          {{ item.key | upper }}: REUSE {{ pnap_selected_skus[item.key].productCode }} already deployed in {{ item.value.location }}.
+          {% else %}
+          {{ item.key | upper }}: SELECT {{ pnap_selected_skus[item.key].productCode }} @
+          ${{ '%.3f' | format(pnap_selected_skus[item.key].hourlyPrice | float) }}/h in {{ item.value.location }}.
+          {% endif %}
+      loop: "{{ sites | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
       when: phoenixnap.auto_select.enabled | bool

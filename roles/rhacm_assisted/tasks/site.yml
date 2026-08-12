@@ -3,6 +3,7 @@
   ansible.builtin.set_fact:
     site_key: "{{ site_item.key }}"
     site: "{{ site_item.value }}"
+    site_ocp_imageset_name: "{{ rhacm_imageset_by_site[site_item.key] }}"
 
 - name: Create cluster namespace
   kubernetes.core.k8s:
@@ -70,29 +71,25 @@
         searchCollector:
           enabled: true
 
-- name: Read existing ClusterDeployment lifecycle state
+- name: Read existing ClusterDeployment state
   kubernetes.core.k8s_info:
     kubeconfig: "{{ rhacm.kubeconfig }}"
     api_version: hive.openshift.io/v1
     kind: ClusterDeployment
     name: "{{ site.cluster_name }}"
     namespace: "{{ site.cluster_name }}"
-  register: existing_clusterdeployment
+  register: existing_cluster_deployment
 
-- name: Record whether the managed cluster is already installed
+- name: Preserve ClusterDeployment installed state on reruns
   ansible.builtin.set_fact:
-    site_cluster_installed: >-
-      {{ (existing_clusterdeployment.resources | length == 1) and
-         (existing_clusterdeployment.resources[0].spec.installed | default(false) | bool) }}
+    cluster_deployment_installed: >-
+      {{
+        (existing_cluster_deployment.resources[0].spec.installed | default(false))
+        if (existing_cluster_deployment.resources | length > 0)
+        else false
+      }}
 
-- name: Report installed cluster lifecycle guard
-  ansible.builtin.debug:
-    msg: >-
-      {{ site.cluster_name }} is already installed. Preserving Hive/Assisted install-time
-      resources and skipping ClusterDeployment, AgentClusterInstall and InfraEnv reconciliation.
-  when: site_cluster_installed | bool
-
-- name: Create ClusterDeployment
+- name: Create or reconcile ClusterDeployment without reverting installed clusters
   kubernetes.core.k8s:
     kubeconfig: "{{ rhacm.kubeconfig }}"
     state: present
@@ -107,6 +104,9 @@
         clusterName: "{{ site.cluster_name }}"
         controlPlaneConfig:
           servingCertificates: {}
+        # Hive rejects true -> false. Preserve the live value on idempotent reruns;
+        # new/uninstalled ClusterDeployments still start with installed=false.
+        installed: "{{ cluster_deployment_installed | bool }}"
         clusterInstallRef:
           group: extensions.hive.openshift.io
           kind: AgentClusterInstall
@@ -119,7 +119,6 @@
                 cluster-name: "{{ site.cluster_name }}"
         pullSecretRef:
           name: assisted-pull-secret
-  when: not (site_cluster_installed | bool)
 
 - name: Create AgentClusterInstall
   kubernetes.core.k8s:
@@ -139,7 +138,7 @@
         clusterDeploymentRef:
           name: "{{ site.cluster_name }}"
         imageSetRef:
-          name: "{{ ocp_imageset_name }}"
+          name: "{{ site_ocp_imageset_name }}"
         networking:
           clusterNetwork:
             - cidr: "{{ site.cluster_network }}"
@@ -151,7 +150,6 @@
           controlPlaneAgents: 1
           workerAgents: 0
         sshPublicKey: "{{ lab_ssh_public_key }}"
-  when: not (site_cluster_installed | bool)
 
 - name: Verify AgentClusterInstall exists after creation
   kubernetes.core.k8s_info:
@@ -161,7 +159,6 @@
     name: "{{ site.cluster_name }}"
     namespace: "{{ site.cluster_name }}"
   register: aci_verify
-  when: not (site_cluster_installed | bool)
 
 - name: Require AgentClusterInstall before creating InfraEnv
   ansible.builtin.assert:
@@ -171,7 +168,6 @@
       AgentClusterInstall {{ site.cluster_name }} was not created.
       Check ClusterDeployment {{ site.cluster_name }} and the Hive/Assisted admission webhooks
       before waiting for InfraEnv boot artifacts.
-  when: not (site_cluster_installed | bool)
 
 - name: Create InfraEnv
   kubernetes.core.k8s:
@@ -195,7 +191,6 @@
         additionalNTPSources: "{{ rhacm.additional_ntp_sources }}"
         agentLabels:
           cluster-name: "{{ site.cluster_name }}"
-  when: not (site_cluster_installed | bool)
 
 - name: Append direct RHCOS rootfs URL to discovery kernel arguments
   kubernetes.core.k8s:
@@ -211,9 +206,7 @@
         kernelArguments:
           - operation: append
             value: "coreos.live.rootfs_url={{ rhacm_rootfs_url }}"
-  when:
-    - not (site_cluster_installed | bool)
-    - rhacm.direct_rootfs.enabled | bool
+  when: rhacm.direct_rootfs.enabled | bool
 
 - name: Wait for RHACM iPXE boot artifact
   kubernetes.core.k8s_info:
@@ -231,4 +224,3 @@
     - infraenv_info.resources[0].status.bootArtifacts.ipxeScript | length > 0
   retries: 60
   delay: 10
-  when: not (site_cluster_installed | bool)

@@ -1,0 +1,67 @@
+---
+- name: Set self-managed EVPN transit facts
+  ansible.builtin.set_fact:
+    managed_kubeconfig: "artifacts/kubeconfigs/{{ site_item.value.cluster_name }}.kubeconfig"
+    evpn_transit_local_public_ip: "{{ evpn_server_state[site_item.key].public_ip }}"
+    evpn_transit_remote_public_ip: >-
+      {{ evpn_server_state['c1' if site_item.key == 'sw1' else 'sw1'].public_ip }}
+    evpn_transit_local_ip: "{{ evpn.transport.addresses[site_item.key] }}"
+    evpn_transit_remote_ip: >-
+      {{ evpn.transport.addresses['c1' if site_item.key == 'sw1' else 'sw1'] }}
+
+- name: Create cross-site VXLAN transit interface for the EVPN underlay
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: nmstate.io/v1
+      kind: NodeNetworkConfigurationPolicy
+      metadata:
+        name: evpn-cross-site-transit
+      spec:
+        nodeSelector: {}
+        desiredState:
+          interfaces:
+            - name: "{{ evpn.transport.interface }}"
+              description: "Lab cross-site routed transit for OpenShift BGP EVPN"
+              type: vxlan
+              state: up
+              mtu: "{{ evpn.transport.mtu | int }}"
+              ipv4:
+                enabled: true
+                dhcp: false
+                address:
+                  - ip: "{{ evpn_transit_local_ip }}"
+                    prefix-length: "{{ evpn.transport.prefix_length | int }}"
+              ipv6:
+                enabled: false
+              vxlan:
+                base-iface: "{{ phoenixnap.ipxe_network.bond_name }}"
+                id: "{{ evpn.transport.vni | int }}"
+                local: "{{ evpn_transit_local_public_ip }}"
+                remote: "{{ evpn_transit_remote_public_ip }}"
+                learning: false
+                destination-port: "{{ evpn.transport.udp_port | int }}"
+
+- name: Wait for cross-site EVPN transit interface policy
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: nmstate.io/v1
+    kind: NodeNetworkConfigurationPolicy
+    name: evpn-cross-site-transit
+  register: evpn_transit_nncp
+  until: >-
+    evpn_transit_nncp.resources | length == 1 and
+    (evpn_transit_nncp.resources[0].status.conditions | default([])
+      | selectattr('type', 'equalto', 'Available')
+      | selectattr('status', 'equalto', 'True')
+      | list | length) > 0
+  retries: 90
+  delay: 10
+
+- name: Report cross-site EVPN transit
+  ansible.builtin.debug:
+    msg: >-
+      {{ site_item.key }}: {{ evpn.transport.interface }}={{ evpn_transit_local_ip }}/{{ evpn.transport.prefix_length }}
+      over VXLAN VNI {{ evpn.transport.vni }} UDP/{{ evpn.transport.udp_port }};
+      public outer {{ evpn_transit_local_public_ip }} -> {{ evpn_transit_remote_public_ip }}.

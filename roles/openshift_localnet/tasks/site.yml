@@ -88,19 +88,7 @@
 
 - name: Build VM workload namespace selector labels
   ansible.builtin.set_fact:
-    localnet_namespace_labels: >-
-      {{ dict([[vm_l2.namespace_label_key, vm_l2.namespace_label_value | string]]) }}
-
-- name: Require rendered VM workload namespace selector label
-  ansible.builtin.assert:
-    that:
-      - localnet_namespace_labels is mapping
-      - localnet_namespace_labels | length == 1
-      - vm_l2.namespace_label_key in localnet_namespace_labels
-      - vm_l2.namespace_label_key | length > 0
-    fail_msg: >-
-      Invalid vm_l2 namespace label configuration: key={{ vm_l2.namespace_label_key }}.
-      The label key must be rendered before it is sent to the Kubernetes API.
+    localnet_namespace_labels: "{{ {vm_l2.namespace_label_key: vm_l2.namespace_label_value} }}"
 
 - name: Create VM workload namespace
   kubernetes.core.k8s:

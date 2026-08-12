@@ -3,21 +3,24 @@
   hosts: localhost
   gather_facts: false
   pre_tasks:
-    - name: Require phoenixNAP iPXE-capable site locations
+    - name: Require native-iPXE-capable phoenixNAP locations
       ansible.builtin.assert:
         that:
-          - item.value.location in phoenixnap.ipxe_supported_locations
+          - sites.sw1.location in phoenixnap.ipxe_network.supported_locations
+          - sites.c1.location in phoenixnap.ipxe_network.supported_locations
+          - sites.sw1.location != sites.c1.location
         fail_msg: >-
-          {{ item.key }} uses {{ item.value.location }}, but phoenixNAP custom iPXE
-          provisioning is supported only in {{ phoenixnap.ipxe_supported_locations | join(', ') }}.
-          Move the site to an iPXE-capable location before provisioning.
-      loop: "{{ sites | dict2items }}"
-      loop_control:
-        label: "{{ item.key }}@{{ item.value.location }}"
+          This lab provisions servers with phoenixNAP native `os: ipxe`.
+          Configured locations are SW1={{ sites.sw1.location }}, C1={{ sites.c1.location }}, but the
+          provider-supported native-iPXE list in this repo is
+          {{ phoenixnap.ipxe_network.supported_locations | join(', ') }}.
+          CHI currently rejects `os: ipxe`; use ASH (default) or NLD for C1, or implement
+          a separate RAM-OS/kexec bootstrap path before using CHI.
   roles:
     - role: pnap_auth
+    # Always inventory existing servers first. In auto-select mode the role only
+    # asks Billing for live stock for sites that do not already have a server.
     - role: pnap_select_sku
-      when: phoenixnap.auto_select.enabled | bool
   tasks:
     - name: Require secret environment variables and files
       ansible.builtin.assert:
@@ -44,7 +47,7 @@
           - credential_files.results | map(attribute='stat.exists') | min
         fail_msg: "RHACM kubeconfig, pull secret, and SSH public key must all exist."
 
-    - name: Query requested phoenixNAP SKU availability per site
+    - name: Query requested phoenixNAP SKU availability only for missing sites in static-SKU mode
       ansible.builtin.uri:
         url: >-
           {{ phoenixnap.api_base }}/billing/v1/product-availability?productCategory=SERVER&productCode={{ item.value.server_type | default(phoenixnap.server_type) }}&location={{ item.value.location }}&minQuantity=1&showOnlyMinQuantityAvailable=false
@@ -56,7 +59,9 @@
       loop: "{{ sites | dict2items }}"
       register: pnap_site_availability_raw
       no_log: true
-      when: not (phoenixnap.auto_select.enabled | bool)
+      when:
+        - not (phoenixnap.auto_select.enabled | bool)
+        - item.key in pnap_sites_needing_capacity
 
     - name: Build sanitized requested-SKU availability map
       ansible.builtin.set_fact:
@@ -82,13 +87,15 @@
               )
             }
           }) }}
-      loop: "{{ pnap_site_availability_raw.results }}"
+      loop: "{{ pnap_site_availability_raw.results | default([]) }}"
       loop_control:
-        label: "{{ item.item.key }}"
+        label: "{{ item.item.key | default('skipped') }}"
       no_log: true
-      when: not (phoenixnap.auto_select.enabled | bool)
+      when:
+        - not (phoenixnap.auto_select.enabled | bool)
+        - not (item.skipped | default(false) | bool)
 
-    - name: Require requested SKU in each region
+    - name: Require requested static SKU only where a new server is missing
       ansible.builtin.assert:
         that:
           - pnap_site_availability[item.key].available | bool
@@ -100,39 +107,48 @@
       loop: "{{ sites | dict2items }}"
       loop_control:
         label: "{{ item.key }}={{ item.value.server_type | default(phoenixnap.server_type) }}@{{ item.value.location }}"
-      when: not (phoenixnap.auto_select.enabled | bool)
+      when:
+        - not (phoenixnap.auto_select.enabled | bool)
+        - item.key in pnap_sites_needing_capacity
 
-    - name: Display requested OpenShift Virtualization server shapes
+    - name: Report static-SKU sites that will reuse existing servers
       ansible.builtin.debug:
         msg: >-
-          Requested server types are available: SW1={{ sites.sw1.server_type | default(phoenixnap.server_type) }} in {{ sites.sw1.location }},
-          C1={{ sites.c1.server_type | default(phoenixnap.server_type) }} in {{ sites.c1.location }}. Servers are
-          provisioned HOURLY with explicit public management plus a site-local phoenixNAP private Layer2 VLAN.
-      when: not (phoenixnap.auto_select.enabled | bool)
-
-    - name: Display dynamically selected OpenShift Virtualization server shapes
-      ansible.builtin.debug:
-        msg: >-
-          Dynamic selection passed for {{ item.key }}={{ item.value.productCode }}
-          (${{ '%.3f' | format(item.value.hourlyPrice | float) }}/h) in {{ item.value.location }},
-          below the strict ${{ '%.2f' | format(phoenixnap.auto_select.max_hourly_price | float) }}/h per-server cap.
-      loop: "{{ pnap_selected_skus | default({}) | dict2items }}"
-      loop_control:
-        label: "{{ item.key }}={{ item.value.productCode }}"
-      when: phoenixnap.auto_select.enabled | bool
-
-    - name: Display existing phoenixNAP servers reused by preflight
-      ansible.builtin.debug:
-        msg: >-
-          Existing {{ item.key }} server {{ item.value.hostname }}
-          ({{ item.value.type }} in {{ item.value.location }}) will be preserved;
-          no live replacement stock is required for this site.
-      loop: "{{ pnap_existing_site_servers | default({}) | dict2items }}"
+          {{ item.key | upper }}: existing {{ item.value.node_hostname }} is already deployed in
+          {{ item.value.location }}; live stock is not a prerequisite for this rerun.
+      loop: "{{ sites | dict2items }}"
       loop_control:
         label: "{{ item.key }}"
       when:
-        - phoenixnap.auto_select.enabled | bool
-        - item.value | length > 0
+        - not (phoenixnap.auto_select.enabled | bool)
+        - item.key not in pnap_sites_needing_capacity
+
+    - name: Display requested static OpenShift Virtualization shapes for missing sites
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.key | upper }}: requested {{ item.value.server_type | default(phoenixnap.server_type) }}
+          is available in {{ item.value.location }} and will be provisioned HOURLY.
+      loop: "{{ sites | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      when:
+        - not (phoenixnap.auto_select.enabled | bool)
+        - item.key in pnap_sites_needing_capacity
+
+    - name: Summarize idempotent dynamic server decision
+      ansible.builtin.debug:
+        msg: >-
+          {% if pnap_selected_skus[item.key].reusedExisting | default(false) | bool %}
+          {{ item.key | upper }}: reuse existing {{ item.value.node_hostname }}
+          ({{ pnap_selected_skus[item.key].productCode }} in {{ item.value.location }}); no live stock required.
+          {% else %}
+          {{ item.key | upper }}: provision {{ pnap_selected_skus[item.key].productCode }} @
+          ${{ '%.3f' | format(pnap_selected_skus[item.key].hourlyPrice | float) }}/h in {{ item.value.location }}.
+          {% endif %}
+      loop: "{{ sites | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      when: phoenixnap.auto_select.enabled | bool
 
     - name: Verify RHACM hub access
       kubernetes.core.k8s_info:

@@ -1,16 +1,9 @@
 ---
-- name: Require iPXE-capable locations before selecting server SKUs
-  ansible.builtin.assert:
-    that:
-      - item.value.location in phoenixnap.ipxe_supported_locations
-    fail_msg: >-
-      {{ item.key }} location {{ item.value.location }} cannot provision os=ipxe.
-      Supported phoenixNAP iPXE locations: {{ phoenixnap.ipxe_supported_locations | join(', ') }}.
-  loop: "{{ sites | dict2items }}"
-  loop_control:
-    label: "{{ item.key }}@{{ item.value.location }}"
-
-- name: List existing phoenixNAP servers before live SKU selection
+# Capacity checks must be idempotent. A live-stock query is only relevant when
+# this run actually needs to create a server. Once a lab server already exists,
+# its SKU may legitimately show zero remaining provider inventory because this
+# deployment consumed the last unit.
+- name: List existing phoenixNAP servers before capacity selection
   ansible.builtin.uri:
     url: "{{ phoenixnap.api_base }}/bmc/v1/servers"
     method: GET
@@ -18,36 +11,97 @@
       Authorization: "Bearer {{ pnap_token }}"
     return_content: true
     status_code: 200
-  register: pnap_sku_existing_servers_raw
+  register: pnap_existing_servers_for_capacity
   no_log: true
 
-- name: Initialize existing-server and selector state
+- name: Initialize idempotent phoenixNAP capacity state
   ansible.builtin.set_fact:
-    pnap_existing_site_servers: {}
-    pnap_selector_site_args: []
+    pnap_existing_servers_by_site: {}
+    pnap_existing_server_reuse_rows: {}
+    pnap_sites_needing_capacity: []
+    pnap_selector_site_argv: []
 
-- name: Map existing phoenixNAP servers by configured site
+- name: Map configured sites to existing phoenixNAP servers
   ansible.builtin.set_fact:
-    pnap_existing_site_servers: >-
-      {{ pnap_existing_site_servers | combine({
-           item.key: (
-             pnap_sku_existing_servers_raw.json
-             | selectattr('hostname', 'equalto', item.value.node_hostname)
-             | list | first | default({})
-           )
-         }) }}
+    pnap_existing_servers_by_site: >-
+      {{ pnap_existing_servers_by_site | combine({
+        item.key: (
+          pnap_existing_servers_for_capacity.json | default([])
+          | selectattr('hostname', 'equalto', item.value.node_hostname)
+          | list | first | default({})
+        )
+      }) }}
   loop: "{{ sites | dict2items }}"
   loop_control:
     label: "{{ item.key }}={{ item.value.node_hostname }}"
 
-- name: Build selector arguments only for sites without an existing server
-  ansible.builtin.set_fact:
-    pnap_selector_site_args: >-
-      {{ pnap_selector_site_args + ['--site', item.key ~ '=' ~ item.value.location] }}
+- name: Require an existing hostname to remain in its configured physical site
+  ansible.builtin.assert:
+    that:
+      - >-
+        (pnap_existing_servers_by_site[item.key] | length == 0)
+        or ((pnap_existing_servers_by_site[item.key].location | default(item.value.location)) == item.value.location)
+    fail_msg: >-
+      Existing {{ item.value.node_hostname }} is in phoenixNAP location
+      {{ pnap_existing_servers_by_site[item.key].location | default('unknown') }}, but the lab now requests
+      {{ item.value.location }}. A server cannot move regions in place. Use `make destroy` for a full topology
+      change or explicitly reconcile the server before rerunning deploy.
   loop: "{{ sites | dict2items }}"
   loop_control:
     label: "{{ item.key }}@{{ item.value.location }}"
-  when: (pnap_sku_force_live_selection | default(false) | bool) or (pnap_existing_site_servers[item.key] | length == 0)
+  when: not (pnap_force_capacity_selection | default(false) | bool)
+
+- name: Build reusable existing-server SKU rows
+  ansible.builtin.set_fact:
+    pnap_existing_server_reuse_rows: >-
+      {{ pnap_existing_server_reuse_rows | combine({
+        item.key: {
+          'productCode': pnap_existing_servers_by_site[item.key].type | default('unknown'),
+          'location': pnap_existing_servers_by_site[item.key].location | default(item.value.location),
+          'hostname': item.value.node_hostname,
+          'serverId': pnap_existing_servers_by_site[item.key].id | default(''),
+          'status': pnap_existing_servers_by_site[item.key].status | default('unknown'),
+          'reusedExisting': true
+        }
+      }) }}
+  loop: "{{ sites | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}={{ item.value.node_hostname }}"
+  when:
+    - not (pnap_force_capacity_selection | default(false) | bool)
+    - pnap_existing_servers_by_site[item.key] | length > 0
+
+- name: Determine which sites actually need new phoenixNAP capacity
+  ansible.builtin.set_fact:
+    pnap_sites_needing_capacity: "{{ pnap_sites_needing_capacity + [item.key] }}"
+  loop: "{{ sites | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  when: >-
+    (pnap_force_capacity_selection | default(false) | bool)
+    or (pnap_existing_servers_by_site[item.key] | length == 0)
+
+- name: Report existing servers excluded from live-stock gating
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.key | upper }}: reusing existing {{ item.value.hostname }}
+      type={{ item.value.productCode }}, location={{ item.value.location }}, status={{ item.value.status }}.
+      Live SKU stock is intentionally not required for this site on an idempotent rerun.
+  loop: "{{ pnap_existing_server_reuse_rows | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  when:
+    - phoenixnap.auto_select.enabled | bool
+    - not (pnap_force_capacity_selection | default(false) | bool)
+
+- name: Build selector site arguments only for sites that need a new server
+  ansible.builtin.set_fact:
+    pnap_selector_site_argv: >-
+      {{ pnap_selector_site_argv + ['--site', item ~ '=' ~ sites[item].location] }}
+  loop: "{{ pnap_sites_needing_capacity }}"
+  when:
+    - phoenixnap.auto_select.enabled | bool
+    - pnap_sites_needing_capacity | length > 0
 
 - name: Build phoenixNAP dynamic SKU selector command
   ansible.builtin.set_fact:
@@ -58,7 +112,7 @@
           role_path ~ '/../../scripts/select_pnap_sku.py',
           '--api-base', phoenixnap.api_base
         ]
-        + pnap_selector_site_args
+        + pnap_selector_site_argv
         + [
           '--max-hourly-price', phoenixnap.auto_select.max_hourly_price | string,
           '--min-ram-gb', phoenixnap.auto_select.min_ram_gb | string,
@@ -67,14 +121,14 @@
           '--preferred-cores', phoenixnap.auto_select.preferred_cores | string,
           '--top', phoenixnap.auto_select.show_top_candidates | string
         ]
-        + (['--prefer-common'] if phoenixnap.auto_select.prefer_common_sku | bool else [])
-        + (['--require-common'] if phoenixnap.auto_select.require_common_sku | bool else [])
+        + (['--prefer-common'] if (phoenixnap.auto_select.prefer_common_sku | bool and pnap_sites_needing_capacity | length > 1) else [])
+        + (['--require-common'] if (phoenixnap.auto_select.require_common_sku | bool and pnap_sites_needing_capacity | length > 1) else [])
       }}
   when:
     - phoenixnap.auto_select.enabled | bool
-    - pnap_selector_site_args | length > 0
+    - pnap_sites_needing_capacity | length > 0
 
-- name: Select live phoenixNAP SKUs under the hourly budget
+- name: Select live phoenixNAP SKUs only for missing servers
   ansible.builtin.command:
     argv: "{{ pnap_selector_argv }}"
   environment:
@@ -85,61 +139,64 @@
   no_log: true
   when:
     - phoenixnap.auto_select.enabled | bool
-    - pnap_selector_site_args | length > 0
+    - pnap_sites_needing_capacity | length > 0
 
 - name: Parse sanitized phoenixNAP SKU selection
   ansible.builtin.set_fact:
     pnap_sku_selection: "{{ pnap_selector_raw.stdout | from_json }}"
   when:
     - phoenixnap.auto_select.enabled | bool
-    - pnap_selector_site_args | length > 0
+    - pnap_sites_needing_capacity | length > 0
 
-- name: Require a safe dynamic SKU selection
+- name: Publish no-capacity-required selection state
+  ansible.builtin.set_fact:
+    pnap_sku_selection:
+      ok: true
+      commonSkuSelected: false
+      sites: {}
+      candidates: {}
+      existingSites: "{{ pnap_existing_server_reuse_rows.keys() | list }}"
+  when:
+    - phoenixnap.auto_select.enabled | bool
+    - pnap_sites_needing_capacity | length == 0
+
+- name: Require live capacity selection to succeed when a server is actually missing
   ansible.builtin.assert:
     that:
       - pnap_sku_selection.ok | bool
-      - pnap_sku_selection.sites | default({}) | length > 0
     fail_msg: "{{ pnap_sku_selection.error | default('No phoenixNAP SKU satisfied the configured budget/sizing policy.') }}"
   when:
     - phoenixnap.auto_select.enabled | bool
-    - pnap_selector_site_args | length > 0
+    - pnap_sites_needing_capacity | length > 0
 
-- name: Publish effective selected SKUs
-  ansible.builtin.set_fact:
-    pnap_selected_skus: "{{ pnap_sku_selection.sites }}"
-  when:
-    - phoenixnap.auto_select.enabled | bool
-    - pnap_selector_site_args | length > 0
-
-- name: Publish empty SKU selection when all configured servers already exist
-  ansible.builtin.set_fact:
-    pnap_selected_skus: {}
-  when:
-    - phoenixnap.auto_select.enabled | bool
-    - pnap_selector_site_args | length == 0
-
-- name: Report dynamically selected server shapes
-  ansible.builtin.debug:
-    msg: >-
-      Dynamic SKU policy selected {{ item.key }}={{ item.value.productCode }} @
-      ${{ '%.3f' | format(item.value.hourlyPrice | float) }}/h
-      ({{ item.value.ramInGb }}GB/{{ item.value.cores }} cores,
-      stock={{ item.value.availableQuantity }}) for {{ item.value.location }}.
-  loop: "{{ pnap_selected_skus | dict2items }}"
+- name: Require a selected SKU for every site that needs new capacity
+  ansible.builtin.assert:
+    that:
+      - item in (pnap_sku_selection.sites | default({}))
+      - pnap_sku_selection.sites[item].productCode | default('') | length > 0
+    fail_msg: >-
+      phoenixNAP dynamic selection did not return a safe SKU for {{ item }} even though that site
+      requires a new server.
+  loop: "{{ pnap_sites_needing_capacity }}"
   loop_control:
-    label: "{{ item.key }}={{ item.value.productCode }}"
+    label: "{{ item }}"
   when: phoenixnap.auto_select.enabled | bool
 
-- name: Report existing servers preserved without live stock dependency
+- name: Publish effective selected or reused SKUs
+  ansible.builtin.set_fact:
+    pnap_selected_skus: >-
+      {{ (pnap_sku_selection.sites | default({}))
+         | combine(pnap_existing_server_reuse_rows | default({}), recursive=true) }}
+  when: phoenixnap.auto_select.enabled | bool
+
+- name: Report dynamically selected shapes for sites requiring new servers
   ansible.builtin.debug:
     msg: >-
-      {{ item.key }} already has phoenixNAP server {{ item.value.hostname }}
-      (type={{ item.value.type }}, location={{ item.value.location }}). Live SKU stock
-      selection is skipped for this site so a day-2 rerun does not depend on spare inventory.
-  loop: "{{ pnap_existing_site_servers | dict2items }}"
+      {{ item | upper }}: selected {{ pnap_selected_skus[item].productCode }} @
+      ${{ '%.3f' | format(pnap_selected_skus[item].hourlyPrice | float) }}/h in {{ sites[item].location }}
+      ({{ pnap_selected_skus[item].ramInGb }}GB/{{ pnap_selected_skus[item].cores }} cores,
+      stock={{ pnap_selected_skus[item].availableQuantity }}).
+  loop: "{{ pnap_sites_needing_capacity }}"
   loop_control:
-    label: "{{ item.key }}"
-  when:
-    - phoenixnap.auto_select.enabled | bool
-    - not (pnap_sku_force_live_selection | default(false) | bool)
-    - item.value | length > 0
+    label: "{{ item }}"
+  when: phoenixnap.auto_select.enabled | bool
