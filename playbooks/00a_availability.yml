@@ -37,7 +37,7 @@
           {{ item.key | upper }} / {{ sites[item.key].location }} candidates under
           ${{ '%.2f' | format(phoenixnap.auto_select.max_hourly_price | float) }}/h:
           {% for c in item.value %}{{ c.productCode }}=${{ '%.3f' | format(c.hourlyPrice | float) }}/h
-          ({{ c.ramInGb }}GB/{{ c.cores }} cores, stock={{ c.availableQuantity }}){% if not loop.last %}; {% endif %}{% endfor %}
+          ({{ c.ramInGb }}GB/{{ c.cores }} cores, disks={{ c.storageDeviceCount | default("?") }}, storage={{ c.storage | default("unknown") }}, stock={{ c.availableQuantity }}){% if not loop.last %}; {% endif %}{% endfor %}
       loop: "{{ pnap_sku_selection.candidates | default({}) | dict2items }}"
       loop_control:
         label: "{{ item.key }} / {{ sites[item.key].location }}"

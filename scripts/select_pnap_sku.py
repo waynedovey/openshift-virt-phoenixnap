@@ -15,6 +15,8 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
+from pnap_storage_devices import count_storage_devices
+
 
 def api_get(base: str, path: str, token: str, params: dict[str, Any]) -> Any:
     query = urllib.parse.urlencode(params, doseq=True)
@@ -83,6 +85,7 @@ def sanitize_product(product: dict[str, Any], plan: dict[str, Any], available_qu
         "cpuFrequency": metadata.get("cpuFrequency", 0),
         "network": metadata.get("network", ""),
         "storage": metadata.get("storage", ""),
+        "storageDeviceCount": count_storage_devices(metadata.get("storage", "")),
     }
 
 
@@ -93,6 +96,7 @@ def site_candidates(
     max_hourly_price: float,
     min_ram_gb: float,
     min_cores: float,
+    min_storage_devices: int,
 ) -> list[dict[str, Any]]:
     products = api_get(
         api_base,
@@ -132,7 +136,8 @@ def site_candidates(
         metadata = product.get("metadata") or {}
         ram = float(metadata.get("ramInGb") or 0)
         cores = float(metadata.get("cpuCount") or 0) * float(metadata.get("coresPerCpu") or 0)
-        if ram < min_ram_gb or cores < min_cores:
+        storage_device_count = count_storage_devices(metadata.get("storage", ""))
+        if ram < min_ram_gb or cores < min_cores or storage_device_count < min_storage_devices:
             continue
 
         hourly_plans = [
@@ -159,6 +164,7 @@ def main() -> int:
     parser.add_argument("--max-hourly-price", type=float, required=True)
     parser.add_argument("--min-ram-gb", type=float, default=64)
     parser.add_argument("--min-cores", type=float, default=6)
+    parser.add_argument("--min-storage-devices", type=int, default=1)
     parser.add_argument("--preferred-ram-gb", type=float, default=128)
     parser.add_argument("--preferred-cores", type=float, default=8)
     parser.add_argument("--prefer-common", action="store_true")
@@ -183,6 +189,7 @@ def main() -> int:
                 args.max_hourly_price,
                 args.min_ram_gb,
                 args.min_cores,
+                args.min_storage_devices,
             )
             candidates.sort(key=lambda c: candidate_sort_key(c, args.preferred_ram_gb, args.preferred_cores))
             candidates_by_site[name] = candidates
@@ -194,8 +201,14 @@ def main() -> int:
                     {
                         "ok": False,
                         "error": (
-                            "No live HOURLY server below ${:.2f}/hour met min {} GB RAM / {} cores in: {}"
-                        ).format(args.max_hourly_price, int(args.min_ram_gb), int(args.min_cores), ", ".join(empty)),
+                            "No live HOURLY server below ${:.2f}/hour met min {} GB RAM / {} cores / {} physical storage devices in: {}"
+                        ).format(
+                            args.max_hourly_price,
+                            int(args.min_ram_gb),
+                            int(args.min_cores),
+                            int(args.min_storage_devices),
+                            ", ".join(empty),
+                        ),
                         "sites": {},
                         "candidates": {k: v[: args.top] for k, v in candidates_by_site.items()},
                     }
@@ -251,6 +264,7 @@ def main() -> int:
                         "maxHourlyPriceExclusive": args.max_hourly_price,
                         "minRamGb": args.min_ram_gb,
                         "minCores": args.min_cores,
+                        "minStorageDevices": args.min_storage_devices,
                         "preferredRamGb": args.preferred_ram_gb,
                         "preferredCores": args.preferred_cores,
                     },

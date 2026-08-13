@@ -45,6 +45,9 @@ phoenixnap:
     # Hard minimum for this OpenShift Virtualization lab.
     min_ram_gb: 64
     min_cores: 6
+    # LVMS needs a dedicated empty disk in addition to the OpenShift install disk.
+    # The selector parses phoenixNAP's storage description and rejects one-disk SKUs.
+    min_storage_devices: 2
     # Prefer a shape around this size, then choose the cheapest qualifying SKU.
     preferred_ram_gb: 128
     preferred_cores: 8
@@ -163,6 +166,38 @@ dns_record_prefixes:
   - api
   - api-int
   - "*.apps"
+
+# Red Hat LVM Storage for both SNO clusters.
+#
+# This lab requires phoenixNAP SNO shapes with at least two physical storage devices.
+# Assisted Installer owns the complete installation disk, so the safe/supported
+# day-2 layout is:
+#   NVMe 0 -> RHCOS/OpenShift
+#   NVMe 1 -> LVMS vg1 / thin-pool-1
+#
+# The storage role discovers exactly one completely-unused non-install disk and
+# pins its stable /dev/disk/by-path path into the LVMCluster. It never wipes the
+# RHCOS installation disk.
+lvm_storage:
+  enabled: true
+  namespace: openshift-lvm-storage
+  subscription: lvms-operator
+  channel: stable-4.22
+  package: lvms-operator
+  source: redhat-operators
+  source_namespace: openshift-marketplace
+  lvmcluster_name: lvmcluster
+  device_class: vg1
+  thin_pool_name: thin-pool-1
+  # 90 is the maximum supported LVMS thin-pool percentage in OCP 4.22.
+  size_percent: 90
+  overprovision_ratio: 1
+  # Require enough raw capacity that the resulting 90% thin pool is >= 600 GiB.
+  # A qualifying two-disk phoenixNAP shape normally provides a ~1 TB dedicated secondary NVMe.
+  min_thin_pool_gib: 600
+  force_wipe: false
+  make_default: true
+  make_default_virt: true
 
 virtualization:
   enabled: true

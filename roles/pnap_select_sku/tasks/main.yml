@@ -18,8 +18,13 @@
   ansible.builtin.set_fact:
     pnap_existing_servers_by_site: {}
     pnap_existing_server_reuse_rows: {}
+    pnap_existing_storage_info_by_site: {}
     pnap_sites_needing_capacity: []
     pnap_selector_site_argv: []
+    pnap_forced_capacity_sites: >-
+      {{ pnap_force_capacity_sites
+         | default((sites.keys() | list)
+         if (pnap_force_capacity_selection | default(false) | bool) else []) }}
 
 - name: Map configured sites to existing phoenixNAP servers
   ansible.builtin.set_fact:
@@ -49,7 +54,60 @@
   loop: "{{ sites | dict2items }}"
   loop_control:
     label: "{{ item.key }}@{{ item.value.location }}"
-  when: not (pnap_force_capacity_selection | default(false) | bool)
+  when: item.key not in pnap_forced_capacity_sites
+
+- name: Parse physical storage count for reusable existing servers
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - "{{ role_path }}/../../scripts/pnap_storage_devices.py"
+      - --storage
+      - "{{ pnap_existing_servers_by_site[item.key].storage | default('') }}"
+  register: pnap_existing_storage_probe
+  changed_when: false
+  loop: "{{ sites | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}={{ pnap_existing_servers_by_site[item.key].type | default('unknown') }}"
+  when:
+    - lvm_storage.enabled | default(false) | bool
+    - phoenixnap.auto_select.min_storage_devices | default(1) | int > 1
+    - item.key not in pnap_forced_capacity_sites
+    - pnap_existing_servers_by_site[item.key] | length > 0
+
+- name: Build existing-server storage inventory map
+  ansible.builtin.set_fact:
+    pnap_existing_storage_info_by_site: >-
+      {{ pnap_existing_storage_info_by_site | combine({
+        item.item.key: (item.stdout | from_json)
+      }) }}
+  loop: "{{ pnap_existing_storage_probe.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.key | default('unknown') }}"
+  when:
+    - item.stdout is defined
+    - item.item is defined
+
+- name: Require reusable existing servers to satisfy LVMS disk-count policy
+  ansible.builtin.assert:
+    that:
+      - >-
+        (pnap_existing_storage_info_by_site.get(item.key, {}).get('storageDeviceCount', 0) | int)
+        >= (phoenixnap.auto_select.min_storage_devices | int)
+    fail_msg: >-
+      Existing {{ item.value.node_hostname }} ({{ pnap_existing_servers_by_site[item.key].type | default('unknown') }})
+      reports storage='{{ pnap_existing_servers_by_site[item.key].storage | default('unknown') }}', parsed as
+      {{ pnap_existing_storage_info_by_site.get(item.key, {}).get('storageDeviceCount', 0) }} physical device(s).
+      This lab has LVMS enabled and requires at least {{ phoenixnap.auto_select.min_storage_devices }} devices:
+      one installation disk plus one dedicated empty LVMS disk. The existing server will not be reused.
+      Run `make replace-site SITE={{ item.key }}` to replace only this site with a qualifying two-disk SKU.
+  loop: "{{ sites | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}={{ item.value.node_hostname }}"
+  when:
+    - lvm_storage.enabled | default(false) | bool
+    - phoenixnap.auto_select.min_storage_devices | default(1) | int > 1
+    - item.key not in pnap_forced_capacity_sites
+    - pnap_existing_servers_by_site[item.key] | length > 0
 
 - name: Build reusable existing-server SKU rows
   ansible.builtin.set_fact:
@@ -61,6 +119,8 @@
           'hostname': item.value.node_hostname,
           'serverId': pnap_existing_servers_by_site[item.key].id | default(''),
           'status': pnap_existing_servers_by_site[item.key].status | default('unknown'),
+          'storage': pnap_existing_servers_by_site[item.key].storage | default(''),
+          'storageDeviceCount': pnap_existing_storage_info_by_site.get(item.key, {}).get('storageDeviceCount', 0),
           'reusedExisting': true
         }
       }) }}
@@ -68,7 +128,7 @@
   loop_control:
     label: "{{ item.key }}={{ item.value.node_hostname }}"
   when:
-    - not (pnap_force_capacity_selection | default(false) | bool)
+    - item.key not in pnap_forced_capacity_sites
     - pnap_existing_servers_by_site[item.key] | length > 0
 
 - name: Determine which sites actually need new phoenixNAP capacity
@@ -78,7 +138,7 @@
   loop_control:
     label: "{{ item.key }}"
   when: >-
-    (pnap_force_capacity_selection | default(false) | bool)
+    (item.key in pnap_forced_capacity_sites)
     or (pnap_existing_servers_by_site[item.key] | length == 0)
 
 - name: Report existing servers excluded from live-stock gating
@@ -92,7 +152,6 @@
     label: "{{ item.key }}"
   when:
     - phoenixnap.auto_select.enabled | bool
-    - not (pnap_force_capacity_selection | default(false) | bool)
 
 - name: Build selector site arguments only for sites that need a new server
   ansible.builtin.set_fact:
@@ -117,6 +176,7 @@
           '--max-hourly-price', phoenixnap.auto_select.max_hourly_price | string,
           '--min-ram-gb', phoenixnap.auto_select.min_ram_gb | string,
           '--min-cores', phoenixnap.auto_select.min_cores | string,
+          '--min-storage-devices', phoenixnap.auto_select.min_storage_devices | default(1) | string,
           '--preferred-ram-gb', phoenixnap.auto_select.preferred_ram_gb | string,
           '--preferred-cores', phoenixnap.auto_select.preferred_cores | string,
           '--top', phoenixnap.auto_select.show_top_candidates | string
@@ -195,6 +255,8 @@
       {{ item | upper }}: selected {{ pnap_selected_skus[item].productCode }} @
       ${{ '%.3f' | format(pnap_selected_skus[item].hourlyPrice | float) }}/h in {{ sites[item].location }}
       ({{ pnap_selected_skus[item].ramInGb }}GB/{{ pnap_selected_skus[item].cores }} cores,
+      disks={{ pnap_selected_skus[item].storageDeviceCount | default('?') }},
+      storage={{ pnap_selected_skus[item].storage | default('unknown') }},
       stock={{ pnap_selected_skus[item].availableQuantity }}).
   loop: "{{ pnap_sites_needing_capacity }}"
   loop_control:

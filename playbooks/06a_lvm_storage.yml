@@ -2,6 +2,30 @@
 - name: Configure LVM Storage on both SNO clusters
   hosts: localhost
   gather_facts: false
+  pre_tasks:
+    - name: Require exported kubeconfigs for every managed SNO before LVM Storage
+      ansible.builtin.stat:
+        path: "artifacts/kubeconfigs/{{ item.value.cluster_name }}.kubeconfig"
+      register: lvm_kubeconfig_checks
+      loop: "{{ sites | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      when: lvm_storage.enabled | bool
+
+    - name: Require both managed clusters to be installed before LVM Storage
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists | default(false) | bool
+          - item.stat.isreg | default(false) | bool
+        fail_msg: >-
+          Missing managed-cluster kubeconfig {{ item.item.value.cluster_name }} at
+          artifacts/kubeconfigs/{{ item.item.value.cluster_name }}.kubeconfig.
+          Complete `make install` before `make storage`.
+      loop: "{{ lvm_kubeconfig_checks.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.key | default('unknown') }}"
+      when: lvm_storage.enabled | bool
+
   roles:
     - role: openshift_lvm_storage
       when: lvm_storage.enabled | bool

@@ -77,3 +77,24 @@
           {% else %}
           External mode uses the supplied provider EVPN peer addresses/ASN.
           {% endif %}
+
+- name: Validate LVM Storage project settings
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Validate LVM Storage project settings
+      ansible.builtin.assert:
+        that:
+          - lvm_storage.enabled is defined
+          - lvm_storage.namespace == 'openshift-lvm-storage'
+          - lvm_storage.package == 'lvms-operator'
+          - lvm_storage.channel == 'stable-4.22'
+          - lvm_storage.device_class | length > 0
+          - lvm_storage.size_percent | int >= 10
+          - lvm_storage.size_percent | int <= 90
+          - lvm_storage.overprovision_ratio | int >= 1
+          - lvm_storage.min_thin_pool_gib | int >= 1
+          - not (lvm_storage.force_wipe | bool)
+        fail_msg: >-
+          Invalid LVM Storage configuration. This lab requires OpenShift 4.22 LVMS,
+          a thin-pool percentage between 10 and 90, and safe non-destructive disk discovery.

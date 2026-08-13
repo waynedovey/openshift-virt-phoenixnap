@@ -145,11 +145,34 @@
       adopt or move a server in another region.
   when: evpn_fr_existing_server | length > 0
 
+- name: Resolve repository SKU selector for EVPN fabric router
+  ansible.builtin.set_fact:
+    evpn_fr_selector_script: "{{ role_path }}/../../scripts/select_pnap_sku.py"
+  when: evpn_fr_existing_server | length == 0
+
+- name: Verify repository SKU selector exists for EVPN fabric router
+  ansible.builtin.stat:
+    path: "{{ evpn_fr_selector_script }}"
+  register: evpn_fr_selector_script_stat
+  when: evpn_fr_existing_server | length == 0
+
+- name: Require repository SKU selector before fabric-router capacity selection
+  ansible.builtin.assert:
+    that:
+      - evpn_fr_selector_script_stat.stat.exists | default(false) | bool
+      - evpn_fr_selector_script_stat.stat.isreg | default(false) | bool
+      - evpn_fr_selector_script_stat.stat.readable | default(false) | bool
+    fail_msg: >-
+      phoenixNAP EVPN fabric-router SKU selector is missing or unreadable at
+      {{ evpn_fr_selector_script }}. Ensure the repository was extracted completely
+      before running make deploy.
+  when: evpn_fr_existing_server | length == 0
+
 - name: Select cheapest live hourly SKU for missing EVPN fabric router
   ansible.builtin.command:
     argv:
       - "{{ ansible_playbook_python }}"
-      - scripts/select_pnap_sku.py
+      - "{{ evpn_fr_selector_script }}"
       - --api-base
       - "{{ phoenixnap.api_base }}"
       - --site
@@ -170,8 +193,20 @@
     PNAP_ACCESS_TOKEN: "{{ pnap_token }}"
   register: evpn_fr_sku_command
   changed_when: false
+  failed_when: false
   when: evpn_fr_existing_server | length == 0
   no_log: true
+
+- name: Require EVPN fabric-router SKU selector command to execute cleanly
+  ansible.builtin.assert:
+    that:
+      - evpn_fr_sku_command.rc | default(1) | int == 0
+      - evpn_fr_sku_command.stdout | default('') | trim | length > 0
+    fail_msg: >-
+      phoenixNAP EVPN fabric-router SKU selector could not be executed successfully
+      (rc={{ evpn_fr_sku_command.rc | default('unknown') }}). The selector path is
+      {{ evpn_fr_selector_script }}. Credentials and raw command output are intentionally hidden.
+  when: evpn_fr_existing_server | length == 0
 
 - name: Parse sanitized fabric-router SKU selection
   ansible.builtin.set_fact:

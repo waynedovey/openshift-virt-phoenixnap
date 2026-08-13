@@ -2,12 +2,27 @@
 - name: Explicitly replace project servers whose immutable shape/network no longer matches
   hosts: localhost
   gather_facts: false
+  pre_tasks:
+    - name: Resolve replacement target sites
+      ansible.builtin.set_fact:
+        replace_target_sites: >-
+          {{ [replace_site] if (replace_site | default('') | length > 0) else (sites.keys() | list) }}
+
+    - name: Require valid replacement target sites
+      ansible.builtin.assert:
+        that:
+          - replace_target_sites | length > 0
+          - (replace_target_sites | difference(sites.keys() | list)) | length == 0
+        fail_msg: >-
+          Invalid replacement target. Use one of {{ sites.keys() | list | join(', ') }}.
+          Example: make replace-site SITE=c1
   roles:
     - role: pnap_auth
     # Replacement is intentionally different from an idempotent deploy: verify
-    # replacement capacity before any destructive action even when servers exist.
+    # replacement capacity before any destructive action. A targeted replacement
+    # only forces fresh capacity for that site; healthy peer sites remain reusable.
     - role: pnap_select_sku
       vars:
-        pnap_force_capacity_selection: true
+        pnap_force_capacity_sites: "{{ replace_target_sites }}"
       when: phoenixnap.auto_select.enabled | bool
     - role: pnap_replace_servers

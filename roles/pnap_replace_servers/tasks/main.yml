@@ -5,6 +5,11 @@
       - confirm_replace | default(false) | bool
     fail_msg: "Refusing destructive server replacement without confirm_replace=true."
 
+- name: Resolve replacement target sites for role
+  ansible.builtin.set_fact:
+    replace_target_sites: >-
+      {{ replace_target_sites | default([replace_site] if (replace_site | default('') | length > 0) else (sites.keys() | list)) }}
+
 - name: List current phoenixNAP servers
   ansible.builtin.uri:
     url: "{{ phoenixnap.api_base }}/bmc/v1/servers"
@@ -32,3 +37,4 @@
   loop: "{{ sites | dict2items }}"
   loop_control:
     loop_var: site_item
+  when: site_item.key in replace_target_sites

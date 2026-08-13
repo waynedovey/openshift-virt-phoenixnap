@@ -21,3 +21,8 @@ failure.
 
 The selector reads the OAuth bearer token only from its process environment. It outputs sanitized JSON
 containing product code, hourly price, RAM, core count and live stock; the token is never emitted.
+
+
+## LVMS disk-count guard
+
+When LVMS is enabled the default selector policy requires at least two physical storage devices. The sanitized selector output includes `storage` and `storageDeviceCount`, and one-disk shapes are rejected before provisioning.

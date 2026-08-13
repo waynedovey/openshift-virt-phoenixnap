@@ -1,3 +1,29 @@
+# 1.4.20 - 2026-08-13
+
+- Require at least two physical storage devices for dynamically selected SNO server SKUs when LVMS is enabled, preventing one-disk shapes such as the current C1 server from being selected for new deployments.
+- Parse phoenixNAP server/product storage descriptions conservatively and expose `storageDeviceCount` in sanitized selector output and availability reports.
+- Validate reusable existing phoenixNAP servers against the same disk-count policy before OpenShift/LVMS stages. A one-disk server now fails early with an explicit replacement instruction instead of reaching `make storage` and reporting zero candidates.
+- Add `make replace-site SITE=<sw1|c1>` so an incompatible site can be replaced without forcing a fresh SKU decision or destructive replacement for the healthy peer site. For installed SNOs, the workflow verifies old RHACM install state is fully removed before deprovisioning hardware.
+- Keep LVMS disk discovery fail-closed: the OpenShift installation disk is never wiped or shared day-2, and `forceWipeDevicesAndDestroyAllData` remains disabled.
+- Add unit tests for storage-description parsing and one-disk SKU rejection.
+
+# 1.4.19
+
+- Fix full deployment so `playbooks/06a_lvm_storage.yml` runs on both `sw1` and `c1` before OpenShift Virtualization.
+- Add the missing OpenShift 4.22 `lvm_storage` configuration using `lvms-operator` on `stable-4.22`.
+- Add `make storage` for idempotent day-2 LVMS reconciliation on existing clusters.
+- Use the dedicated empty secondary NVMe only; keep destructive disk wiping disabled.
+- Configure `lvms-vg1` as the cluster default and OpenShift Virtualization default StorageClass.
+- Document why an exact 300 GB RHCOS boot partition cannot be created non-destructively on the already-installed Assisted Installer clusters.
+
+## 1.4.18 - 2026-08-13
+
+- Fix EVPN fabric-router auto-provisioning failing at `Select cheapest live hourly SKU for missing EVPN fabric router` with a censored non-zero return code.
+- Resolve `scripts/select_pnap_sku.py` from `role_path` instead of relying on the process working directory, matching the existing `pnap_select_sku` role and making `make deploy` safe regardless of where Ansible executes the command task.
+- Validate that the selector script exists and is readable before capacity selection.
+- Run the credential-bearing selector command with `failed_when: false` and `no_log: true`, then emit a sanitized assertion for command-execution failures so future path/interpreter errors report the return code and resolved script path without exposing the phoenixNAP OAuth token.
+- No SNO, RHACM, private-network, or OpenShift rebuild is required. Replace the repository files and rerun `make deploy`; existing resources are reused idempotently.
+
 ## 1.4.17 - 2026-08-12
 
 - Replace the default nested `self-managed-vxlan` fabric with an external FRR **eBGP EVPN fabric-router** design. Live testing proved the phoenixNAP BGP Peer Groups establish IPv4 BGP but return `NoNeg` for L2VPN EVPN, while OpenShift FRR-K8s runs `bgpd ... -p 0` and therefore cannot accept a direct SW1↔C1 TCP/179 peering.

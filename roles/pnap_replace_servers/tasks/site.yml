@@ -55,9 +55,98 @@
 - name: Report matching server replacement
   ansible.builtin.debug:
     msg: >-
-      Deprovisioning {{ replace_site_server.hostname }} type={{ replace_site_server.type }},
-      networkType={{ replace_site_detail.json.networkType | default('unknown') }} so it can be recreated as
-      {{ replace_site_server_type }} with explicit public management + private Layer2 VLAN.
+      {{ site_item.key | upper }} will be rebuilt: current type={{ replace_site_server.type }},
+      storage={{ replace_site_detail.json.storage | default(replace_site_server.storage | default('unknown')) }},
+      desired type={{ replace_site_server_type }}. RHACM install state will be removed and verified absent
+      before phoenixNAP hardware is deprovisioned.
+  when: replace_site_required | bool
+
+# An installed AgentClusterInstall/ClusterDeployment must not survive a hardware replacement.
+# Otherwise a later `make deploy` sees spec.installed=true and preserves stale install state instead
+# of creating a new Assisted Installer flow. Reset hub-side site state first, and only destroy the
+# physical server after the reset is fully confirmed.
+- name: Find Host Inventory Agents before site reset
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ rhacm.kubeconfig }}"
+    api_version: agent-install.openshift.io/v1beta1
+    kind: Agent
+    namespace: "{{ site_item.value.cluster_name }}"
+  register: replace_agents
+  when: replace_site_required | bool
+
+- name: Delete stale Agent objects before site reset
+  kubernetes.core.k8s:
+    kubeconfig: "{{ rhacm.kubeconfig }}"
+    state: absent
+    api_version: agent-install.openshift.io/v1beta1
+    kind: Agent
+    name: "{{ item.metadata.name }}"
+    namespace: "{{ site_item.value.cluster_name }}"
+    wait: true
+    wait_timeout: 120
+  loop: "{{ replace_agents.resources | default([]) }}"
+  when: replace_site_required | bool
+
+- name: Start deletion of old RHACM ManagedCluster
+  ansible.builtin.command:
+    argv:
+      - oc
+      - --kubeconfig
+      - "{{ rhacm.kubeconfig }}"
+      - delete
+      - managedclusters.cluster.open-cluster-management.io
+      - "{{ site_item.value.cluster_name }}"
+      - --ignore-not-found=true
+      - --wait=false
+  register: replace_managedcluster_delete
+  changed_when: "'deleted' in replace_managedcluster_delete.stdout"
+  when: replace_site_required | bool
+
+- name: Start deletion of old RHACM site namespace and install state
+  ansible.builtin.command:
+    argv:
+      - oc
+      - --kubeconfig
+      - "{{ rhacm.kubeconfig }}"
+      - delete
+      - namespace
+      - "{{ site_item.value.cluster_name }}"
+      - --ignore-not-found=true
+      - --wait=false
+  register: replace_namespace_delete
+  changed_when: "'deleted' in replace_namespace_delete.stdout"
+  when: replace_site_required | bool
+
+- name: Wait for old RHACM site namespace to be fully removed
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ rhacm.kubeconfig }}"
+    api_version: v1
+    kind: Namespace
+    name: "{{ site_item.value.cluster_name }}"
+  register: replace_namespace_state
+  until: replace_namespace_state.resources | length == 0
+  retries: 60
+  delay: 5
+  when: replace_site_required | bool
+
+- name: Wait for old RHACM ManagedCluster to be fully removed
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ rhacm.kubeconfig }}"
+    api_version: cluster.open-cluster-management.io/v1
+    kind: ManagedCluster
+    name: "{{ site_item.value.cluster_name }}"
+  register: replace_managedcluster_state
+  until: replace_managedcluster_state.resources | length == 0
+  retries: 60
+  delay: 5
+  when: replace_site_required | bool
+
+- name: Confirm destructive site reset completed before hardware removal
+  ansible.builtin.debug:
+    msg: >-
+      {{ site_item.key | upper }} RHACM install state is absent. It is now safe to remove
+      phoenixNAP server {{ replace_site_server.hostname }}; the next `make deploy` will create
+      a fresh ClusterDeployment, AgentClusterInstall, InfraEnv and ManagedCluster.
   when: replace_site_required | bool
 
 - name: Deprovision incompatible hourly server
@@ -89,24 +178,11 @@
   when: replace_site_required | bool
   no_log: true
 
-- name: Find stale Host Inventory Agents
-  kubernetes.core.k8s_info:
-    kubeconfig: "{{ rhacm.kubeconfig }}"
-    api_version: agent-install.openshift.io/v1beta1
-    kind: Agent
-    namespace: "{{ site_item.value.cluster_name }}"
-  register: replace_agents
-  when: replace_site_required | bool
-
-- name: Delete stale Agent objects
-  kubernetes.core.k8s:
-    kubeconfig: "{{ rhacm.kubeconfig }}"
-    state: absent
-    api_version: agent-install.openshift.io/v1beta1
-    kind: Agent
-    name: "{{ item.metadata.name }}"
-    namespace: "{{ site_item.value.cluster_name }}"
-  loop: "{{ replace_agents.resources | default([]) }}"
+- name: Report targeted server replacement completion
+  ansible.builtin.debug:
+    msg: >-
+      {{ site_item.key | upper }} old server and RHACM install state are gone.
+      Run `make deploy` to provision and install the selected {{ replace_site_server_type }} replacement.
   when: replace_site_required | bool
 
 - name: Report no replacement required

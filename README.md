@@ -20,6 +20,7 @@ phoenixnap:
     max_hourly_price: 0.30   # strict: selected price must be < $0.30/h
     min_ram_gb: 64
     min_cores: 6
+    min_storage_devices: 2  # boot disk + dedicated LVMS disk
     preferred_ram_gb: 128
     preferred_cores: 8
     prefer_common_sku: true
@@ -31,9 +32,10 @@ Selection order is deliberately cost-aware:
 1. Must have live stock in the target region.
 2. Must use a `HOURLY` / `HOUR` pricing plan strictly below the configured cap.
 3. Must satisfy the hard RAM/core minimums.
-4. Prefer a SKU closest to the preferred 128 GB / 8-core lab target.
-5. Among equally suitable shapes, choose the lower hourly price.
-6. Prefer the same SKU in PHX and ASH. If no common SKU qualifies, select independently per site unless `require_common_sku: true`.
+4. Must expose at least two physical storage devices when LVMS is enabled.
+5. Prefer a SKU closest to the preferred 128 GB / 8-core lab target.
+6. Among equally suitable shapes, choose the lower hourly price.
+7. Prefer the same SKU in PHX and ASH. If no common SKU qualifies, select independently per site unless `require_common_sku: true`.
 
 Run:
 
@@ -84,7 +86,7 @@ replacement workflow when you intentionally want the selected shape to replace a
 
 ```bash
 make private-networks
-make replace-servers
+make replace-site SITE=c1   # replace only the incompatible site
 make deploy
 ```
 
@@ -103,7 +105,7 @@ networks are separate L2 broadcast domains; the EVPN layer remains responsible f
 
 The tested phoenixNAP BGP Peer Groups establish ordinary IPv4 BGP, but the PHX/ASH service did not negotiate the L2VPN EVPN address family. OpenShift FRR-K8s also runs `bgpd` with `-p 0`, so the two SNO FRR instances are active dialers and cannot be used as each other's passive TCP/179 fabric peer.
 
-Version 1.4.17 therefore defaults to `EVPN_FABRIC_MODE=fabric-router`. Both SNO clusters establish eBGP/MP-BGP EVPN to a small external FRR fabric router (AS65000 by default). The fabric router uses normal eBGP re-advertisement, prepends AS65000, and preserves the originating EVPN next-hop with `attribute-unchanged next-hop`; it carries control-plane traffic only, not VM traffic.
+Version 1.4.18 therefore defaults to `EVPN_FABRIC_MODE=fabric-router`. Both SNO clusters establish eBGP/MP-BGP EVPN to a small external FRR fabric router (AS65000 by default). The fabric router uses normal eBGP re-advertisement, prepends AS65000, and preserves the originating EVPN next-hop with `attribute-unchanged next-hop`; it carries control-plane traffic only, not VM traffic.
 
 The actual OpenShift EVPN data plane remains direct between the SNO public addresses:
 
@@ -341,7 +343,7 @@ The resulting public network is DHCP on `bond0` in `802.3ad` mode. Site-local pr
 
 ## Two-site EVPN lab fabric
 
-Version 1.4.17 defaults to `EVPN_FABRIC_MODE=fabric-router`. OpenShift FRR-K8s on SW1 and C1 actively dials an external FRR fabric router. The router re-advertises L2VPN EVPN routes with AS65000 prepended and the originating VTEP next-hop unchanged; the VNI5050 VXLAN data path stays direct over UDP/4789.
+Version 1.4.18 defaults to `EVPN_FABRIC_MODE=fabric-router`. OpenShift FRR-K8s on SW1 and C1 actively dials an external FRR fabric router. The router re-advertises L2VPN EVPN routes with AS65000 prepended and the originating VTEP next-hop unchanged; the VNI5050 VXLAN data path stays direct over UDP/4789.
 
 The old `self-managed-vxlan` VNI4090/UDP4790 design is retained only as an explicit diagnostic mode because the tested PHX↔ASH carrier did not pass traffic. See `docs/evpn.md` for the fabric-router configuration, safe auto-provision option and verification flow.
 
@@ -352,3 +354,14 @@ phoenixNAP access tokens are short-lived. Long `make deploy` runs automatically 
 ### Legacy self-managed transit mode
 
 `EVPN_FABRIC_MODE=self-managed-vxlan` is retained for diagnostics only. It still creates `evpn-transit0` and validates the remote `192.168.254.x` route before BGP, but it is not recommended for the tested PHX/ASH path. The default fabric-router design removes this nested carrier entirely.
+
+
+## LVM Storage
+
+`make deploy` installs Red Hat LVM Storage on both `sw1` and `c1` using a dedicated unused secondary device. Dynamic SNO SKU selection now requires at least two physical storage devices, and existing one-disk servers are rejected before the LVMS stage. To reconcile storage only on existing clusters, run:
+
+```bash
+make storage
+```
+
+The resulting default StorageClass is `lvms-vg1`. If an existing site was created with only one physical disk, use `make replace-site SITE=<site>` after reviewing the replacement action. See `docs/lvm-storage.md` for the disk-safety model.

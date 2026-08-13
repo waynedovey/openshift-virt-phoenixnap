@@ -7,7 +7,7 @@ ANSIBLE_GALAXY := $(VENV)/bin/ansible-galaxy
 ANSIBLE_LINT := $(VENV)/bin/ansible-lint
 PROJECT_VERSION := $(shell cat VERSION 2>/dev/null || echo unknown)
 
-.PHONY: version bootstrap validate availability preflight prepare-hub private-networks bgp replace-servers provision dns install virt nmstate vm-l2 evpn-fabric-router evpn status deploy destroy lint clean-venv
+.PHONY: version bootstrap validate availability preflight prepare-hub private-networks bgp replace-servers replace-site provision dns install storage virt nmstate vm-l2 evpn-fabric-router evpn status deploy destroy lint clean-venv
 
 $(ANSIBLE_PLAYBOOK): requirements.txt requirements.yml
 	$(PYTHON) -m venv $(VENV)
@@ -45,6 +45,10 @@ bgp: $(ANSIBLE_PLAYBOOK)
 replace-servers: $(ANSIBLE_PLAYBOOK)
 	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) playbooks/04_replace_servers.yml -e confirm_replace=true
 
+replace-site: $(ANSIBLE_PLAYBOOK)
+	@test -n "$(SITE)" || (echo "ERROR: SITE is required (example: make replace-site SITE=c1)" && exit 2)
+	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) playbooks/04_replace_servers.yml -e confirm_replace=true -e replace_site=$(SITE)
+
 provision: $(ANSIBLE_PLAYBOOK)
 	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) playbooks/04_provision_servers.yml
 
@@ -53,6 +57,9 @@ dns: $(ANSIBLE_PLAYBOOK)
 
 install: $(ANSIBLE_PLAYBOOK)
 	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) playbooks/06_wait_and_export.yml
+
+storage: $(ANSIBLE_PLAYBOOK)
+	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) playbooks/06a_lvm_storage.yml
 
 virt: $(ANSIBLE_PLAYBOOK)
 	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) playbooks/07_virtualization.yml

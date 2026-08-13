@@ -6,7 +6,7 @@ OpenShift 4.22 EVPN expects `FRRConfiguration` peers toward an external EVPN-cap
 
 The tested phoenixNAP BGP Peer Groups successfully established IPv4 BGP, but did not negotiate L2VPN EVPN. A second live test showed that OpenShift FRR-K8s runs `bgpd` with `-p 0`: it actively dials configured peers but does not listen on TCP/179, so SW1 and C1 cannot act as each other's provider-facing passive peer.
 
-The default v1.4.17 topology is therefore:
+The default v1.4.18 topology is therefore:
 
 ```text
                               FRR fabric router
