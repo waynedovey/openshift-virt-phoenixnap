@@ -1,0 +1,61 @@
+---
+- name: Set fabric-router cleanup site facts
+  ansible.builtin.set_fact:
+    managed_kubeconfig: "artifacts/kubeconfigs/{{ site_item.value.cluster_name }}.kubeconfig"
+
+- name: Remove known temporary FRR peer tests from troubleshooting
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: frrk8s.metallb.io/v1beta1
+    kind: FRRConfiguration
+    name: "{{ item }}"
+    namespace: openshift-frr-k8s
+    state: absent
+  loop:
+    - direct-evpn-fabric
+    - pnap-bgp-test
+
+- name: Remove known temporary BGP authentication secrets from troubleshooting
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: v1
+    kind: Secret
+    name: "{{ item }}"
+    namespace: openshift-frr-k8s
+    state: absent
+  loop:
+    - direct-evpn-bgp-auth
+    - pnap-bgp-auth
+
+- name: Reconcile the old nested VXLAN carrier to absent
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: nmstate.io/v1
+      kind: NodeNetworkConfigurationPolicy
+      metadata:
+        name: evpn-cross-site-transit
+      spec:
+        nodeSelector: {}
+        desiredState:
+          interfaces:
+            - name: "{{ evpn.transport.interface }}"
+              type: vxlan
+              state: absent
+
+- name: Wait for legacy nested VXLAN carrier removal
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: nmstate.io/v1
+    kind: NodeNetworkConfigurationPolicy
+    name: evpn-cross-site-transit
+  register: evpn_legacy_transit_cleanup
+  until: >-
+    evpn_legacy_transit_cleanup.resources | length == 1 and
+    (evpn_legacy_transit_cleanup.resources[0].status.conditions | default([])
+      | selectattr('type', 'equalto', 'Available')
+      | selectattr('status', 'equalto', 'True')
+      | list | length) > 0
+  retries: 60
+  delay: 5

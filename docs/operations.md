@@ -22,11 +22,16 @@ source .env
 make validate
 make preflight
 make prepare-hub
-make bgp
+make private-networks
+make bgp              # optional phoenixNAP IPv4 BGP only
 make provision
 make dns
 make install
 make virt
+make nmstate
+make vm-l2
+make evpn-fabric-router          # only provisions when EVPN_FR_AUTO_PROVISION=true
+make evpn
 make status
 ```
 
@@ -36,7 +41,16 @@ Or run all safe stages:
 make deploy
 ```
 
-`make deploy` enables the OpenShift EVPN prerequisites on both SNO clusters and, in the default `self-managed-vxlan` mode, builds the PHX↔ASH transit automatically. It then configures `FRRConfiguration`, the EVPN CUDN and `RouteAdvertisements`, waits for base BGP and MP-BGP EVPN establishment, and verifies that each site learns the remote VTEP route. Use `EVPN_FABRIC_MODE=external` only when connecting to a real provider/DC EVPN fabric.
+`make deploy` uses `EVPN_FABRIC_MODE=fabric-router` by default. It points both OpenShift FRR-K8s instances at an external FRR EVPN fabric router, reconciles the public SNO IPv4 addresses as unmanaged VTEPs, creates the EVPN CUDN and `RouteAdvertisements`, waits for base BGP and L2VPN EVPN negotiation, and verifies direct routing to the remote public VTEP.
+
+Automatic fabric-router provisioning is opt-in because it adds a third billable hourly server:
+
+```bash
+export EVPN_FR_AUTO_PROVISION=true
+make deploy
+```
+
+Alternatively keep `EVPN_FR_AUTO_PROVISION=false` and supply `EVPN_FR_ADDRESS` plus `EVPN_FR_BGP_PASSWORD`.
 
 ## Destruction
 
@@ -44,7 +58,7 @@ make deploy
 make destroy
 ```
 
-The destroy target requires explicit confirmation internally. It removes the two cluster namespaces/ManagedClusters, Cloudflare records, only phoenixNAP BGP peer groups recorded as created by this project, and deprovisions matching hourly servers with their automatically purchased IP blocks.
+The destroy target requires explicit confirmation internally. It removes the two cluster namespaces/ManagedClusters, Cloudflare records, only phoenixNAP BGP peer groups recorded as created by this project, and deprovisions matching hourly servers. If `artifacts/evpn/fabric-router.yml` records a repository-owned auto-provisioned fabric router, destroy verifies the server ID/hostname and removes that third hourly server too.
 
 ## Rerun and teardown resilience
 

@@ -28,6 +28,15 @@
   loop_control:
     loop_var: site_item
 
+- name: Check for repository-owned auto-provisioned EVPN fabric router
+  ansible.builtin.stat:
+    path: artifacts/evpn/fabric-router.yml
+  register: destroy_evpn_fr_artifact
+
+- name: Remove repository-owned EVPN fabric router
+  ansible.builtin.include_tasks: fabric_router.yml
+  when: destroy_evpn_fr_artifact.stat.exists | bool
+
 - name: Check project BGP ownership files
   ansible.builtin.stat:
     path: "artifacts/bgp/{{ item.key }}.yml"

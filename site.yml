@@ -10,5 +10,6 @@
 - import_playbook: playbooks/07_virtualization.yml
 - import_playbook: playbooks/07b_nmstate.yml
 - import_playbook: playbooks/07c_vm_localnet.yml
+- import_playbook: playbooks/07d_evpn_fabric_router.yml
 - import_playbook: playbooks/08_evpn.yml
 - import_playbook: playbooks/09_status.yml

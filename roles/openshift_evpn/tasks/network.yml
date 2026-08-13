@@ -5,11 +5,23 @@
     evpn_peer_address: >-
       {{ evpn.transport.addresses['c1' if site_item.key == 'sw1' else 'sw1']
          if evpn.fabric_mode == 'self-managed-vxlan'
-         else evpn.peers[site_item.key] }}
+         else (evpn_fabric_router_address
+               if evpn.fabric_mode == 'fabric-router'
+               else evpn.peers[site_item.key]) }}
     evpn_peer_asn_effective: >-
       {{ sites['c1' if site_item.key == 'sw1' else 'sw1'].bgp_asn
          if evpn.fabric_mode == 'self-managed-vxlan'
-         else evpn.peer_asn }}
+         else (evpn.fabric_router.asn
+               if evpn.fabric_mode == 'fabric-router'
+               else evpn.peer_asn) }}
+    evpn_effective_vtep_ip: >-
+      {{ evpn_site_public_ips[site_item.key]
+         if evpn.fabric_mode == 'fabric-router'
+         else site_item.value.vtep_ip }}
+    evpn_effective_vtep_cidr: >-
+      {{ evpn_site_public_ips[site_item.key] ~ '/32'
+         if evpn.fabric_mode == 'fabric-router'
+         else evpn.legacy_vtep_cidr }}
     evpn_site_addressing: "{{ evpn.addressing[site_item.key] }}"
 
 - name: Create shared Layer2 EVPN ClusterUserDefinedNetwork
@@ -115,8 +127,8 @@
       local_asn: {{ site_item.value.bgp_asn }}
       peer: {{ evpn_peer_address }}
       peer_asn: {{ evpn_peer_asn_effective }}
-      vtep_ip: {{ site_item.value.vtep_ip }}
-      vtep_cidr: {{ evpn.vtep_cidr }}
+      vtep_ip: {{ evpn_effective_vtep_ip }}
+      vtep_cidr: {{ evpn_effective_vtep_cidr }}
       namespace: {{ evpn.namespace }}
       cudn: {{ evpn.network_name }}
       vm_subnet: {{ evpn.vm_subnet }}
@@ -126,4 +138,5 @@
       reserved_subnets: {{ evpn_site_addressing.reserved_subnets | to_json }}
       vni: {{ evpn.vni }}
       route_target: {{ evpn.route_target }}
-      transit_interface: {{ evpn.transport.interface if evpn.fabric_mode == 'self-managed-vxlan' else 'external' }}
+      dataplane: direct-vxlan-udp-4789
+      legacy_transit_interface: {{ evpn.transport.interface if evpn.fabric_mode == 'self-managed-vxlan' else 'none' }}

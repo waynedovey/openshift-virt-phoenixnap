@@ -1,0 +1,15 @@
+---
+- name: Optionally provision phoenixNAP FRR EVPN fabric router
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - role: pnap_auth
+      when:
+        - evpn.enabled | bool
+        - evpn.fabric_mode == 'fabric-router'
+        - evpn.fabric_router.auto_provision | bool
+    - role: pnap_evpn_fabric_router
+      when:
+        - evpn.enabled | bool
+        - evpn.fabric_mode == 'fabric-router'
+        - evpn.fabric_router.auto_provision | bool

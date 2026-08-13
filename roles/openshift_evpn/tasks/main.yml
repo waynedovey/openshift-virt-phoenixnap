@@ -1,30 +1,73 @@
 ---
-- name: Check phoenixNAP server state artifacts for self-managed EVPN fabric
+- name: Check SNO server state artifacts for EVPN modes that use public node addresses
   ansible.builtin.stat:
     path: "artifacts/servers/{{ item }}.yml"
   loop:
     - sw1
     - c1
   register: evpn_server_artifact_stats
-  when: evpn.fabric_mode == 'self-managed-vxlan'
+  when: evpn.fabric_mode in ['fabric-router', 'self-managed-vxlan']
 
-- name: Require phoenixNAP server state artifacts for self-managed EVPN fabric
+- name: Require SNO server state artifacts for public-address EVPN modes
   ansible.builtin.assert:
     that:
       - evpn_server_artifact_stats.results | length == 2
       - evpn_server_artifact_stats.results | map(attribute='stat.exists') | min
     fail_msg: >-
-      Self-managed EVPN fabric requires artifacts/servers/sw1.yml and
-      artifacts/servers/c1.yml. Run make deploy (or make provision) first so the
-      current phoenixNAP public addresses are recorded.
-  when: evpn.fabric_mode == 'self-managed-vxlan'
+      {{ evpn.fabric_mode }} requires artifacts/servers/sw1.yml and
+      artifacts/servers/c1.yml so the current SNO public addresses are known.
+      Run make deploy (or make provision/install) first.
+  when: evpn.fabric_mode in ['fabric-router', 'self-managed-vxlan']
 
-- name: Read phoenixNAP server state used by the self-managed EVPN fabric
+- name: Read SNO server state used by EVPN
   ansible.builtin.set_fact:
     evpn_server_state:
       sw1: "{{ lookup('ansible.builtin.file', 'artifacts/servers/sw1.yml') | from_yaml }}"
       c1: "{{ lookup('ansible.builtin.file', 'artifacts/servers/c1.yml') | from_yaml }}"
-  when: evpn.fabric_mode == 'self-managed-vxlan'
+  when: evpn.fabric_mode in ['fabric-router', 'self-managed-vxlan']
+
+- name: Publish current SNO public addresses used by EVPN
+  ansible.builtin.set_fact:
+    evpn_site_public_ips:
+      sw1: "{{ evpn_server_state.sw1.public_ip }}"
+      c1: "{{ evpn_server_state.c1.public_ip }}"
+  when: evpn.fabric_mode in ['fabric-router', 'self-managed-vxlan']
+
+- name: Check auto-provisioned EVPN fabric-router artifact
+  ansible.builtin.stat:
+    path: artifacts/evpn/fabric-router.yml
+  register: evpn_fabric_router_artifact
+  when:
+    - evpn.fabric_mode == 'fabric-router'
+    - evpn.fabric_router.auto_provision | bool
+
+- name: Require auto-provisioned EVPN fabric-router artifact
+  ansible.builtin.assert:
+    that:
+      - evpn_fabric_router_artifact.stat.exists | default(false) | bool
+    fail_msg: >-
+      EVPN_FR_AUTO_PROVISION=true but artifacts/evpn/fabric-router.yml is absent.
+      Run `make evpn-fabric-router` or rerun `make deploy`; the fabric-router stage must
+      complete before OpenShift EVPN peering is configured.
+  when:
+    - evpn.fabric_mode == 'fabric-router'
+    - evpn.fabric_router.auto_provision | bool
+
+- name: Read auto-provisioned EVPN fabric-router state
+  ansible.builtin.set_fact:
+    evpn_fabric_router_state: >-
+      {{ lookup('ansible.builtin.file', 'artifacts/evpn/fabric-router.yml') | from_yaml }}
+  when:
+    - evpn.fabric_mode == 'fabric-router'
+    - evpn.fabric_router.auto_provision | bool
+
+- name: Resolve effective EVPN fabric-router address
+  ansible.builtin.set_fact:
+    evpn_fabric_router_address: >-
+      {{ evpn.fabric_router.address
+         if (evpn.fabric_router.address | length > 0)
+         else ((evpn_fabric_router_state | default({})).public_ip | default('')) }}
+  when: evpn.fabric_mode == 'fabric-router'
 
 - name: Determine EVPN fabric readiness
   ansible.builtin.set_fact:
@@ -33,6 +76,12 @@
         evpn.fabric_mode == 'self-managed-vxlan' and
         (evpn_server_state.sw1.public_ip | default('') | length > 0) and
         (evpn_server_state.c1.public_ip | default('') | length > 0)
+      }}
+    evpn_fabric_router_ready: >-
+      {{
+        evpn.fabric_mode == 'fabric-router' and
+        (evpn_fabric_router_address | default('') | length > 0) and
+        ((evpn.fabric_router.asn | int) > 0)
       }}
     evpn_external_ready: >-
       {{
@@ -45,7 +94,10 @@
 
 - name: Publish effective EVPN fabric readiness
   ansible.builtin.set_fact:
-    evpn_fabric_ready: "{{ (evpn_self_managed_ready | bool) or (evpn_external_ready | bool) }}"
+    evpn_fabric_ready: >-
+      {{ (evpn_self_managed_ready | bool) or
+         (evpn_fabric_router_ready | bool) or
+         (evpn_external_ready | bool) }}
 
 - name: Create local directory for generated EVPN secrets
   ansible.builtin.file:
@@ -53,10 +105,10 @@
     state: directory
     mode: '0700'
   when:
-    - evpn.fabric_mode == 'self-managed-vxlan'
+    - evpn.fabric_mode in ['fabric-router', 'self-managed-vxlan']
     - evpn.bgp_auth.enabled | bool
 
-- name: Generate or reuse the shared EVPN BGP password
+- name: Generate or reuse legacy self-managed EVPN BGP password
   ansible.builtin.set_fact:
     evpn_bgp_password: >-
       {{ lookup('ansible.builtin.password',
@@ -68,6 +120,55 @@
     - evpn.fabric_mode == 'self-managed-vxlan'
     - evpn.bgp_auth.enabled | bool
 
+- name: Read generated fabric-router BGP password for auto-provisioned fabric
+  ansible.builtin.set_fact:
+    evpn_bgp_password: >-
+      {{ lookup('ansible.builtin.password',
+          'artifacts/secrets/evpn-fabric-router-password',
+          length=32,
+          chars=['ascii_letters', 'digits']) }}
+  no_log: true
+  when:
+    - evpn.fabric_mode == 'fabric-router'
+    - evpn.fabric_router.auto_provision | bool
+    - evpn.bgp_auth.enabled | bool
+
+- name: Use supplied fabric-router BGP password for externally managed fabric router
+  ansible.builtin.set_fact:
+    evpn_bgp_password: "{{ evpn.fabric_router.password }}"
+  no_log: true
+  when:
+    - evpn.fabric_mode == 'fabric-router'
+    - not (evpn.fabric_router.auto_provision | bool)
+    - evpn.bgp_auth.enabled | bool
+
+- name: Publish empty BGP password when authentication is disabled
+  ansible.builtin.set_fact:
+    evpn_bgp_password: ''
+  when:
+    - evpn.fabric_mode in ['fabric-router', 'self-managed-vxlan']
+    - not (evpn.bgp_auth.enabled | bool)
+
+- name: Require a complete EVPN fabric when requested
+  ansible.builtin.assert:
+    that:
+      - evpn_fabric_ready | bool
+    fail_msg: >-
+      EVPN platform support is enabled, but {{ evpn.fabric_mode }} is not ready.
+      For fabric-router mode either set EVPN_FR_AUTO_PROVISION=true or provide
+      EVPN_FR_ADDRESS (and EVPN_FR_BGP_PASSWORD when authentication is enabled).
+      For external mode set EVPN_FABRIC_CONFIRMED=true plus peer addresses/ASN.
+  when: evpn.fabric_required | default(false) | bool
+
+- name: Clean diagnostic and legacy EVPN state before fabric-router reconciliation
+  ansible.builtin.include_tasks: cleanup_legacy.yml
+  loop: "{{ sites | dict2items }}"
+  loop_control:
+    loop_var: site_item
+  when:
+    - evpn.fabric_mode == 'fabric-router'
+    - evpn_fabric_router_ready | bool
+
 - name: Enable OpenShift EVPN platform prerequisites on each managed cluster
   ansible.builtin.include_tasks: platform.yml
   loop: "{{ sites | dict2items }}"
@@ -75,7 +176,7 @@
     loop_var: site_item
   when: evpn.platform_apply | default(true) | bool
 
-- name: Build the cross-site routed transit used as the lab EVPN underlay
+- name: Build the legacy cross-site routed transit used as the lab EVPN underlay
   ansible.builtin.include_tasks: transit.yml
   loop: "{{ sites | dict2items }}"
   loop_control:
@@ -84,30 +185,8 @@
     - evpn.fabric_mode == 'self-managed-vxlan'
     - evpn_self_managed_ready | bool
 
-- name: Require a complete EVPN fabric when requested
-  ansible.builtin.assert:
-    that:
-      - evpn_fabric_ready | bool
-    fail_msg: >-
-      EVPN platform support is enabled, but the selected fabric mode is not ready.
-      For self-managed-vxlan, make deploy must have valid public IP artifacts for
-      both SNO servers. For external mode, set EVPN_FABRIC_CONFIRMED=true,
-      EVPN_SW1_PEER, EVPN_C1_PEER and EVPN_PEER_ASN.
-  when: evpn.fabric_required | default(false) | bool
-
-- name: Explain staged external EVPN fabric configuration
-  ansible.builtin.debug:
-    msg: >-
-      OpenShift FRR-K8s, route advertisements, gateway mode, the EVPN namespace,
-      dummy VTEP interface and VTEP CR are enabled. External fabric integration is
-      staged because peer addresses are not confirmed. Set EVPN_FABRIC_CONFIRMED=true,
-      EVPN_SW1_PEER, EVPN_C1_PEER and EVPN_PEER_ASN, then rerun make deploy.
-  when:
-    - evpn.fabric_mode == 'external'
-    - not (evpn_external_ready | bool)
-
-# Bootstrap the two sites in phases. Do not wait for SW1 BGP before C1's peer
-# exists, otherwise a fresh two-site deployment deadlocks on the first site.
+# Configure both sites before either verification loop so fresh deployments do
+# not deadlock waiting for a peer that has not been created yet.
 - name: Configure base EVPN BGP peers on both managed clusters
   ansible.builtin.include_tasks: peer.yml
   loop: "{{ sites | dict2items }}"
@@ -115,7 +194,7 @@
     loop_var: site_item
   when: evpn_fabric_ready | bool
 
-- name: Verify base BGP peering after both peers exist
+- name: Verify base BGP peering after all peers exist
   ansible.builtin.include_tasks: peer_verify.yml
   loop: "{{ sites | dict2items }}"
   loop_control:

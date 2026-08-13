@@ -102,7 +102,10 @@ phoenixnap:
   reconcile_existing_private_networks: true
   fail_on_existing_private_network_reconcile_error: false
   bgp:
-    enabled: true
+    # phoenixNAP BGP Peer Groups are ordinary IPv4 BGP. Live testing showed
+    # that AS65400 does not negotiate the L2VPN EVPN AFI/SAFI, so these are
+    # optional and are not part of the OpenShift EVPN fabric.
+    enabled: "{{ lookup('env', 'PNAP_BGP_ENABLED') | default('false', true) | bool }}"
     asn: 65401
     advertised_routes: NONE
 
@@ -123,6 +126,7 @@ sites:
     host_prefix: 23
     service_network: 172.30.0.0/16
     bgp_asn: 65011
+    # Legacy/external-provider dummy VTEP. fabric-router mode derives the public IP instead.
     vtep_ip: 10.255.50.11
     private_l2:
       name: ocp-sw1-vm-l2
@@ -141,6 +145,7 @@ sites:
     host_prefix: 23
     service_network: 172.31.0.0/16
     bgp_asn: 65021
+    # Legacy/external-provider dummy VTEP. fabric-router mode derives the public IP instead.
     vtep_ip: 10.255.50.21
     private_l2:
       name: ocp-c1-vm-l2
@@ -193,36 +198,74 @@ vm_l2:
 
 # OpenShift EVPN platform enablement is part of `make deploy`.
 #
-# Default lab mode builds a self-managed cross-site routed transit using a
-# point-to-point NMState VXLAN interface between the two SNO public addresses.
-# BGP EVPN then runs *inside* that transit and keeps the actual OpenShift VTEP
-# addresses private (10.255.50.11/32 and 10.255.50.21/32).
+# The default fabric mode is now an external eBGP EVPN fabric router. Live
+# testing proved two important constraints in this lab:
+#   * phoenixNAP BGP Peer Groups establish IPv4 BGP but do not negotiate
+#     L2VPN EVPN.
+#   * OpenShift FRR-K8s starts bgpd with -p 0, so two FRR-K8s speakers cannot
+#     be used as each other's passive TCP/179 fabric peer.
 #
-# This is a deterministic LAB fabric, not a replacement for a production EVPN
-# provider fabric. Set EVPN_FABRIC_MODE=external to use real provider peers.
+# A small FRR fabric router solves the control-plane problem while the actual
+# OpenShift VXLAN data plane stays direct between the two SNO public IPs on
+# UDP/4789. It is intentionally a normal eBGP transit router, not a transparent
+# transparent route-server semantics: AS65000 is prepended, while the EVPN next-hop is preserved.
 evpn:
   enabled: true
   platform_apply: true
   fabric_required: true
-  fabric_mode: "{{ lookup('env', 'EVPN_FABRIC_MODE') | default('self-managed-vxlan', true) }}"
+  fabric_mode: "{{ lookup('env', 'EVPN_FABRIC_MODE') | default('fabric-router', true) }}"
 
   namespace: evpn-vms
   network_name: evpn-vm-net
   vm_subnet: 10.50.50.0/24
   vm_mtu: 1400
 
-  # OpenShift EVPN data-plane VTEPs. These stay on dummy interfaces.
-  vtep_cidr: 10.255.50.0/24
+  # OpenShift EVPN data plane. In fabric-router mode the existing public
+  # br-ex IPv4 address on each SNO is used as the unmanaged VTEP, with an
+  # exact /32 VTEP CIDR. Red Hat documents the dummy-interface pattern as a
+  # recommendation for redundant fabric peering, not a requirement.
   vni: 5050
   route_target: "65000:5050"
+  legacy_vtep_cidr: 10.255.50.0/24
 
-  # Self-managed cross-site routed underlay. This transport VXLAN is only the
-  # lab carrier for BGP and the real EVPN/VXLAN packets. It deliberately uses
-  # a different VNI and UDP port from OpenShift EVPN (VNI 5050 / UDP 4789).
+  # Default lab fabric. The fabric router carries only MP-BGP EVPN
+  # control-plane traffic. VXLAN VNI 5050 / UDP 4789 remains direct PHX<->ASH.
+  fabric_router:
+    auto_provision: "{{ lookup('env', 'EVPN_FR_AUTO_PROVISION') | default('false', true) | bool }}"
+    address: "{{ lookup('env', 'EVPN_FR_ADDRESS') | default('', true) }}"
+    asn: "{{ lookup('env', 'EVPN_FR_ASN') | default('65000', true) | int }}"
+    router_id: "{{ lookup('env', 'EVPN_FR_ROUTER_ID') | default('10.255.255.1', true) }}"
+    hostname: "{{ lookup('env', 'EVPN_FR_HOSTNAME') | default('evpn-fr.' ~ base_domain, true) }}"
+    location: "{{ lookup('env', 'EVPN_FR_LOCATION') | default('PHX', true) }}"
+    os: "{{ lookup('env', 'EVPN_FR_OS') | default('ubuntu/jammy', true) }}"
+    password: "{{ lookup('env', 'EVPN_FR_BGP_PASSWORD') | default('', true) }}"
+    auto_select:
+      max_hourly_price: "{{ lookup('env', 'EVPN_FR_MAX_HOURLY_PRICE') | default('0.30', true) | float }}"
+      min_ram_gb: 8
+      min_cores: 2
+      preferred_ram_gb: 16
+      preferred_cores: 2
+      show_top_candidates: 5
+
+  bgp_auth:
+    enabled: "{{ lookup('env', 'EVPN_BGP_AUTH_ENABLED') | default('true', true) | bool }}"
+    secret_name: evpn-bgp-auth
+
+  # A real external/DC EVPN fabric remains supported. In this mode the
+  # original dummy VTEPs are retained because the provider fabric is expected
+  # to route the private VTEP CIDR.
+  fabric_confirmed: "{{ lookup('env', 'EVPN_FABRIC_CONFIRMED') | default('false', true) | bool }}"
+  peer_asn: "{{ lookup('env', 'EVPN_PEER_ASN') | default('65000', true) | int }}"
+  peers:
+    sw1: "{{ lookup('env', 'EVPN_SW1_PEER') | default('', true) }}"
+    c1: "{{ lookup('env', 'EVPN_C1_PEER') | default('', true) }}"
+
+  # Retained only as an explicit legacy diagnostic mode. It is no longer the
+  # default because the live PHX<->ASH UDP/4790 carrier did not pass traffic.
   transport:
     interface: evpn-transit0
     vni: 4090
-    udp_port: 4790
+    udp_port: "{{ lookup('env', 'EVPN_TRANSIT_UDP_PORT') | default('4790', true) | int }}"
     mtu: 1450
     prefix_length: 30
     addresses:
@@ -231,7 +274,7 @@ evpn:
 
   # Each cluster has its own OVN IPAM database. Keep one shared /24 and split
   # automatic allocations/gateway infrastructure by site to prevent duplicate
-  # addresses while preserving a single stretched Layer-2 EVPN segment.
+  # addresses while preserving one Layer-2 EVPN segment.
   addressing:
     sw1:
       default_gateway: 10.50.50.1
@@ -243,18 +286,6 @@ evpn:
       infrastructure_subnet: 10.50.50.128/28
       reserved_subnets:
         - 10.50.50.0/25
-
-  bgp_auth:
-    enabled: true
-    secret_name: evpn-bgp-auth
-
-  # External provider mode remains supported. These are ignored by the default
-  # self-managed-vxlan mode.
-  fabric_confirmed: "{{ lookup('env', 'EVPN_FABRIC_CONFIRMED') | default('false', true) | bool }}"
-  peer_asn: "{{ lookup('env', 'EVPN_PEER_ASN') | default('65000', true) | int }}"
-  peers:
-    sw1: "{{ lookup('env', 'EVPN_SW1_PEER') | default('', true) }}"
-    c1: "{{ lookup('env', 'EVPN_C1_PEER') | default('', true) }}"
 
 wait:
   server_seconds: 1800

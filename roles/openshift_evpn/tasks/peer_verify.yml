@@ -5,7 +5,9 @@
     evpn_peer_address: >-
       {{ evpn.transport.addresses['c1' if site_item.key == 'sw1' else 'sw1']
          if evpn.fabric_mode == 'self-managed-vxlan'
-         else evpn.peers[site_item.key] }}
+         else (evpn_fabric_router_address
+               if evpn.fabric_mode == 'fabric-router'
+               else evpn.peers[site_item.key]) }}
 
 - name: Get FRR-K8s pods for BGP verification
   kubernetes.core.k8s_info:
@@ -35,7 +37,76 @@
   ansible.builtin.set_fact:
     evpn_frr_daemon_pod: "{{ (evpn_running_frr_pods | first).metadata.name }}"
 
-- name: Wait for base BGP session to the cross-site EVPN peer
+- name: Verify FRR can resolve the legacy self-managed peer route
+  kubernetes.core.k8s_exec:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    namespace: openshift-frr-k8s
+    pod: "{{ evpn_frr_daemon_pod }}"
+    container: frr
+    command: "vtysh -c 'show ip route {{ evpn_peer_address }}/32'"
+  register: evpn_peer_route_status
+  changed_when: false
+  failed_when: false
+  when: evpn.fabric_mode == 'self-managed-vxlan'
+
+- name: Require FRR to see the legacy self-managed transit route before BGP
+  ansible.builtin.assert:
+    that:
+      - evpn_peer_route_status.rc | default(1) | int == 0
+      - evpn.transport.interface in (evpn_peer_route_status.stdout | default(''))
+    fail_msg: >-
+      {{ site_item.key }} FRR cannot resolve {{ evpn_peer_address }} through
+      {{ evpn.transport.interface }}. This is the legacy nested-VXLAN mode.
+  when: evpn.fabric_mode == 'self-managed-vxlan'
+
+- name: Get SNO node for legacy host-level transit probe
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: v1
+    kind: Node
+  register: evpn_transit_probe_nodes
+  when: evpn.fabric_mode == 'self-managed-vxlan'
+
+- name: Select SNO node for legacy host-level transit probe
+  ansible.builtin.set_fact:
+    evpn_transit_probe_node: "{{ evpn_transit_probe_nodes.resources[0].metadata.name }}"
+  when:
+    - evpn.fabric_mode == 'self-managed-vxlan'
+    - evpn_transit_probe_nodes.resources | length == 1
+
+- name: Probe the legacy cross-site VXLAN transit from the node network namespace
+  ansible.builtin.command:
+    argv:
+      - oc
+      - --kubeconfig
+      - "{{ managed_kubeconfig }}"
+      - debug
+      - "node/{{ evpn_transit_probe_node }}"
+      - --
+      - chroot
+      - /host
+      - /usr/bin/ping
+      - -c
+      - '3'
+      - -W
+      - '2'
+      - "{{ evpn_peer_address }}"
+  register: evpn_transit_ping
+  changed_when: false
+  failed_when: false
+  when: evpn.fabric_mode == 'self-managed-vxlan'
+
+- name: Require IP reachability across the legacy nested VXLAN carrier
+  ansible.builtin.assert:
+    that:
+      - evpn_transit_ping.rc | default(1) | int == 0
+    fail_msg: >-
+      {{ site_item.key }} cannot reach {{ evpn_peer_address }} through the legacy
+      outer VXLAN VNI {{ evpn.transport.vni }} / UDP{{ evpn.transport.udp_port }}.
+      Use fabric-router mode on the tested PHX/ASH lab instead of changing BGP.
+  when: evpn.fabric_mode == 'self-managed-vxlan'
+
+- name: Wait for base BGP session to the EVPN fabric peer
   kubernetes.core.k8s_exec:
     kubeconfig: "{{ managed_kubeconfig }}"
     namespace: openshift-frr-k8s
@@ -44,15 +115,45 @@
     command: "vtysh -c 'show bgp neighbors {{ evpn_peer_address }}'"
   register: evpn_bgp_neighbor_status
   until: "'BGP state = Established' in (evpn_bgp_neighbor_status.stdout | default(''))"
-  retries: 60
+  retries: 120
   delay: 5
   changed_when: false
+  failed_when: false
+
+- name: Extract final base BGP state for a useful failure
+  ansible.builtin.set_fact:
+    evpn_bgp_state_summary: >-
+      {{ (evpn_bgp_neighbor_status.stdout | default('')
+          | regex_search('BGP state = [^\n]+'))
+         | default('BGP state unavailable', true) }}
+    evpn_bgp_reset_summary: >-
+      {{ (evpn_bgp_neighbor_status.stdout | default('')
+          | regex_search('Last reset [^\n]+'))
+         | default('Last reset unavailable', true) }}
+
+- name: Require base BGP session to become Established
+  ansible.builtin.assert:
+    that:
+      - "'BGP state = Established' in (evpn_bgp_neighbor_status.stdout | default(''))"
+    fail_msg: >-
+      {{ site_item.key }} BGP to {{ evpn_peer_address }} did not establish.
+      {{ evpn_bgp_state_summary }}; {{ evpn_bgp_reset_summary }}.
+      {% if evpn.fabric_mode == 'fabric-router' %}
+      Verify that the FRR fabric router is listening on TCP/179, that its client
+      definition uses {{ evpn_site_public_ips[site_item.key] }} AS{{ site_item.value.bgp_asn }},
+      and that the same BGP password is configured on both ends. OpenShift FRR-K8s
+      is an active dialer and intentionally does not listen on TCP/179.
+      {% elif evpn.fabric_mode == 'self-managed-vxlan' %}
+      The legacy nested carrier must pass traffic before BGP can establish.
+      {% else %}
+      Verify the external provider peer address, ASN, routing and policy.
+      {% endif %}
 
 - name: Report established EVPN underlay BGP session
   ansible.builtin.debug:
     msg: >-
       {{ site_item.key }} base BGP is Established to {{ evpn_peer_address }}.
-      {% if evpn.fabric_mode == 'self-managed-vxlan' %}
-      The session is carried inside {{ evpn.transport.interface }} over
-      outer VXLAN UDP/{{ evpn.transport.udp_port }}.
+      {% if evpn.fabric_mode == 'fabric-router' %}
+      The fabric router is the MP-BGP control-plane rendezvous; VXLAN traffic is
+      not sent through the fabric router.
       {% endif %}

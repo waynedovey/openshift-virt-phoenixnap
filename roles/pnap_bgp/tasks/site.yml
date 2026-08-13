@@ -31,6 +31,11 @@
          if existing_bgp_group | length > 0
          else created_bgp_group.json.id }}
 
+- name: Refresh phoenixNAP OAuth token before BGP readiness polling
+  ansible.builtin.include_role:
+    name: pnap_auth
+    tasks_from: refresh.yml
+
 - name: Wait for BGP peer group to become READY
   ansible.builtin.uri:
     url: "{{ phoenixnap.api_base }}/networks/v1/bgp-peer-groups/{{ bgp_group_id }}"
@@ -40,10 +45,27 @@
     return_content: true
     status_code: 200
   register: bgp_group_ready
-  until: bgp_group_ready.json.status == 'READY'
+  failed_when: false
+  until: >-
+    ((bgp_group_ready.status | default(0) | int) == 200) and
+    (((bgp_group_ready.json | default({})).status | default('')) == 'READY')
   retries: 60
   delay: 10
+  ignore_errors: true
   no_log: true
+
+- name: Require BGP peer group to become READY
+  ansible.builtin.assert:
+    that:
+      - (bgp_group_ready.status | default(0) | int) == 200
+      - ((bgp_group_ready.json | default({})).status | default('')) == 'READY'
+    fail_msg: >-
+      phoenixNAP BGP peer group {{ bgp_group_id }} in {{ site_item.value.location }}
+      did not become READY after polling.
+      Last HTTP status={{ bgp_group_ready.status | default('unknown') }};
+      last API state={{ (bgp_group_ready.json | default({})).status | default('missing-json') }};
+      error={{ bgp_group_ready.msg | default('no message returned') }}.
+      The OAuth header remains hidden. Re-run make deploy; existing peer groups are reused.
 
 - name: Create BGP state directory
   ansible.builtin.file:

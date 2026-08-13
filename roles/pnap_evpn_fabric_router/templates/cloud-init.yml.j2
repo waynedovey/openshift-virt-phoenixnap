@@ -1,0 +1,57 @@
+#cloud-config
+package_update: true
+packages:
+  - frr
+  - frr-pythontools
+write_files:
+  - path: /etc/frr/frr.conf
+    owner: root:root
+    permissions: '0640'
+    content: |
+      frr defaults traditional
+      hostname evpn-fabric-router
+      log syslog informational
+      service integrated-vtysh-config
+      !
+      router bgp {{ evpn.fabric_router.asn | int }}
+       bgp router-id {{ evpn.fabric_router.router_id }}
+       no bgp ebgp-requires-policy
+       no bgp default ipv4-unicast
+       neighbor {{ evpn_fr_sw1_public_ip }} remote-as {{ sites.sw1.bgp_asn | int }}
+{% if evpn.bgp_auth.enabled | bool %}       neighbor {{ evpn_fr_sw1_public_ip }} password {{ evpn_fr_bgp_password }}
+{% endif %}       neighbor {{ evpn_fr_sw1_public_ip }} ebgp-multihop 255
+       neighbor {{ evpn_fr_c1_public_ip }} remote-as {{ sites.c1.bgp_asn | int }}
+{% if evpn.bgp_auth.enabled | bool %}       neighbor {{ evpn_fr_c1_public_ip }} password {{ evpn_fr_bgp_password }}
+{% endif %}       neighbor {{ evpn_fr_c1_public_ip }} ebgp-multihop 255
+       !
+       address-family ipv4 unicast
+        neighbor {{ evpn_fr_sw1_public_ip }} activate
+        neighbor {{ evpn_fr_sw1_public_ip }} attribute-unchanged next-hop
+        neighbor {{ evpn_fr_c1_public_ip }} activate
+        neighbor {{ evpn_fr_c1_public_ip }} attribute-unchanged next-hop
+       exit-address-family
+       !
+       address-family l2vpn evpn
+        neighbor {{ evpn_fr_sw1_public_ip }} activate
+        neighbor {{ evpn_fr_sw1_public_ip }} attribute-unchanged next-hop
+        neighbor {{ evpn_fr_c1_public_ip }} activate
+        neighbor {{ evpn_fr_c1_public_ip }} attribute-unchanged next-hop
+       exit-address-family
+      exit
+      !
+      line vty
+      !
+  - path: /usr/local/sbin/configure-evpn-fabric-router.sh
+    owner: root:root
+    permissions: '0750'
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      sed -ri 's/^zebra=.*/zebra=yes/' /etc/frr/daemons
+      sed -ri 's/^bgpd=.*/bgpd=yes/' /etc/frr/daemons
+      chown frr:frr /etc/frr/frr.conf
+      chmod 0640 /etc/frr/frr.conf
+      systemctl enable frr
+      systemctl restart frr
+runcmd:
+  - [bash, -lc, '/usr/local/sbin/configure-evpn-fabric-router.sh']

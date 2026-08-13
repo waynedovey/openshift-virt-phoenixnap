@@ -5,8 +5,13 @@
     evpn_peer_address: >-
       {{ evpn.transport.addresses['c1' if site_item.key == 'sw1' else 'sw1']
          if evpn.fabric_mode == 'self-managed-vxlan'
-         else evpn.peers[site_item.key] }}
-    evpn_remote_vtep: "{{ sites['c1' if site_item.key == 'sw1' else 'sw1'].vtep_ip }}"
+         else (evpn_fabric_router_address
+               if evpn.fabric_mode == 'fabric-router'
+               else evpn.peers[site_item.key]) }}
+    evpn_remote_vtep: >-
+      {{ evpn_site_public_ips['c1' if site_item.key == 'sw1' else 'sw1']
+         if evpn.fabric_mode == 'fabric-router'
+         else sites['c1' if site_item.key == 'sw1' else 'sw1'].vtep_ip }}
 
 - name: Get FRR-K8s pods for final EVPN verification
   kubernetes.core.k8s_info:
@@ -40,14 +45,80 @@
     namespace: openshift-frr-k8s
     pod: "{{ evpn_frr_daemon_pod }}"
     container: frr
-    command: "vtysh -c 'show bgp l2vpn evpn summary established'"
+    command: "vtysh -c 'show bgp l2vpn evpn summary'"
   register: evpn_l2vpn_established
-  until: "evpn_peer_address in (evpn_l2vpn_established.stdout | default(''))"
+  until: >-
+    evpn_peer_address in (evpn_l2vpn_established.stdout | default('')) and
+    'NoNeg' not in (evpn_l2vpn_established.stdout | default('')) and
+    'Connect' not in (evpn_l2vpn_established.stdout | default('')) and
+    'Active' not in (evpn_l2vpn_established.stdout | default(''))
   retries: 90
   delay: 5
   changed_when: false
+  failed_when: false
 
-- name: Wait for remote OpenShift VTEP route in the EVPN underlay
+- name: Require MP-BGP EVPN negotiation to succeed
+  ansible.builtin.assert:
+    that:
+      - evpn_peer_address in (evpn_l2vpn_established.stdout | default(''))
+      - "'NoNeg' not in (evpn_l2vpn_established.stdout | default(''))"
+      - "'Connect' not in (evpn_l2vpn_established.stdout | default(''))"
+      - "'Active' not in (evpn_l2vpn_established.stdout | default(''))"
+    fail_msg: >-
+      {{ site_item.key }} did not negotiate L2VPN EVPN with {{ evpn_peer_address }}.
+      {% if evpn.fabric_mode == 'fabric-router' %}
+      Confirm the fabric router activates this client under `address-family l2vpn evpn`
+      and negotiates the L2VPN EVPN address family. IPv4-only BGP is not sufficient.
+      {% else %}
+      Confirm the provider fabric supports and negotiates the L2VPN EVPN AFI/SAFI.
+      {% endif %}
+
+- name: Get SNO node for direct remote-VTEP reachability verification
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: v1
+    kind: Node
+  register: evpn_verify_nodes
+  when: evpn.fabric_mode == 'fabric-router'
+
+- name: Require exactly one SNO node for direct remote-VTEP verification
+  ansible.builtin.assert:
+    that:
+      - evpn_verify_nodes.resources | length == 1
+    fail_msg: "Expected one SNO node on {{ site_item.key }} for EVPN VTEP verification."
+  when: evpn.fabric_mode == 'fabric-router'
+
+- name: Verify the remote public VTEP is routable directly through the host network
+  ansible.builtin.command:
+    argv:
+      - oc
+      - --kubeconfig
+      - "{{ managed_kubeconfig }}"
+      - debug
+      - "node/{{ evpn_verify_nodes.resources[0].metadata.name }}"
+      - --
+      - chroot
+      - /host
+      - ip
+      - route
+      - get
+      - "{{ evpn_remote_vtep }}"
+  register: evpn_remote_public_vtep_route
+  changed_when: false
+  when: evpn.fabric_mode == 'fabric-router'
+
+- name: Require direct routing to the remote public VTEP
+  ansible.builtin.assert:
+    that:
+      - evpn_remote_public_vtep_route.rc | default(1) | int == 0
+      - evpn_remote_vtep in (evpn_remote_public_vtep_route.stdout | default(''))
+    fail_msg: >-
+      {{ site_item.key }} cannot route directly to remote VTEP {{ evpn_remote_vtep }}.
+      Fabric-router mode keeps VXLAN UDP/4789 in the PHX<->ASH data path; the route
+      server is control-plane only.
+  when: evpn.fabric_mode == 'fabric-router'
+
+- name: Wait for remote OpenShift VTEP route in fabric-routed modes
   kubernetes.core.k8s_exec:
     kubeconfig: "{{ managed_kubeconfig }}"
     namespace: openshift-frr-k8s
@@ -59,6 +130,7 @@
   retries: 90
   delay: 5
   changed_when: false
+  when: evpn.fabric_mode != 'fabric-router'
 
 - name: Read EVPN Type-2 MAC/IP route table
   kubernetes.core.k8s_exec:
@@ -73,6 +145,9 @@
 - name: Report final EVPN fabric state
   ansible.builtin.debug:
     msg:
-      - "{{ site_item.key }}: MP-BGP EVPN Established to {{ evpn_peer_address }}"
-      - "{{ site_item.key }}: remote VTEP {{ evpn_remote_vtep }}/32 is present in FRR routing"
+      - "{{ site_item.key }}: MP-BGP EVPN negotiated with {{ evpn_peer_address }}"
+      - >-
+          {{ site_item.key }}: remote VTEP {{ evpn_remote_vtep }} is
+          {{ 'directly routable over the public underlay' if evpn.fabric_mode == 'fabric-router'
+             else 'present in the fabric routing table' }}
       - "Type-2 routes appear after EVPN workloads are running; current table lines={{ evpn_type2_routes.stdout_lines | default([]) | length }}"

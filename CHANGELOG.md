@@ -1,3 +1,54 @@
+## 1.4.17 - 2026-08-12
+
+- Replace the default nested `self-managed-vxlan` fabric with an external FRR **eBGP EVPN fabric-router** design. Live testing proved the phoenixNAP BGP Peer Groups establish IPv4 BGP but return `NoNeg` for L2VPN EVPN, while OpenShift FRR-K8s runs `bgpd ... -p 0` and therefore cannot accept a direct SW1↔C1 TCP/179 peering.
+- Use the existing SNO public IPv4 addresses as the unmanaged OpenShift VTEPs in fabric-router mode (`131.153.236.243/32` on SW1 and `103.67.202.133/32` on C1 in the current lab), eliminating the private dummy VTEP dependency for this single-fabric-peer topology.
+- Keep the EVPN data plane direct PHX↔ASH on OpenShift's fixed VXLAN UDP/4789 / VNI5050 path. Live packet tests confirmed UDP/4789 and TCP/179 reachability in both directions between the public SNO addresses.
+- Add an optional phoenixNAP fabric-router provisioning role and `make evpn-fabric-router`. Auto-provisioning is **off by default** (`EVPN_FR_AUTO_PROVISION=false`) because enabling it creates a third billable hourly server; an externally managed fabric router can instead be supplied with `EVPN_FR_ADDRESS` and `EVPN_FR_BGP_PASSWORD`.
+- Configure the fabric router as AS65000 with normal eBGP re-advertisement. AS65000 is prepended to forwarded routes (so OpenShift FRR-K8s default first-AS enforcement remains valid), while `attribute-unchanged next-hop` preserves the originating public VTEP for direct VXLAN forwarding.
+- Clean up the temporary `direct-evpn-fabric` / `pnap-bgp-test` diagnostics and reconcile the legacy `evpn-transit0` interface absent when fabric-router mode is selected.
+- Harden EVPN verification: require base BGP Established, reject L2VPN `NoNeg`/`Connect`/`Active`, and verify direct host routing to the remote public VTEP in fabric-router mode.
+- Extend `make destroy` to verify and deprovision a repository-owned auto-provisioned fabric router recorded in `artifacts/evpn/fabric-router.yml`, preventing a third hourly server from being left billable.
+- Keep `external` provider-fabric mode and the old `self-managed-vxlan` mode available; the latter is now explicitly legacy/diagnostic only.
+
+## 1.4.16
+
+- Revert the self-managed outer carrier to UDP/4790. v1.4.15 incorrectly moved the carrier onto UDP/4789, which is the OpenShift EVPN data-plane port and caused the live `evpn-cross-site-transit` NNCP to become `Degraded/FailedToConfigure`.
+- Reinstate validation that rejects UDP/4789 for the outer lab carrier so the transport cannot collide with the OpenShift EVPN VXLAN endpoint.
+- Add per-node NMState enactment collection when the transit NNCP fails instead of ending with only `Unknown error`.
+- Add a host-network ping probe across `192.168.254.0/30` before waiting on BGP. A failed probe now identifies the outer VXLAN carrier/provider path as the blocker; BGP is only tested after the tunnel actually carries IP traffic.
+- Add `EVPN_BGP_AUTH_ENABLED` (default `true`) as a controlled diagnostic override without weakening the default configuration.
+
+## 1.4.15 - 2026-08-12
+
+- Fix the remaining self-managed EVPN underlay stall where FRR can resolve the remote `192.168.254.x/32` route but BGP stays `Active` / `Waiting for peer OPEN`.
+- Move the lab carrier VXLAN from the non-standard UDP/4790 default to standard UDP/4789. OpenShift 4.22 EVPN itself uses UDP/4789 and does not support a custom EVPN VXLAN destination port, so using the same standard port with a separate carrier VNI (4090) removes an unnecessary non-standard firewall/provider-path dependency.
+- Make the carrier destination port overrideable with `EVPN_TRANSIT_UDP_PORT`, defaulting to `4789`.
+- Keep the carrier and OpenShift EVPN isolated by VNI (`4090` for the lab carrier, `5050` for the OpenShift EVPN network); the shared UDP destination port is intentional.
+- Improve the BGP timeout diagnostic to distinguish route presence from actual VXLAN dataplane reachability.
+- No server, RHACM, private-network, or cluster rebuild is required; rerun `make deploy` to reconcile the existing `evpn-cross-site-transit` NNCPs in place.
+
+## 1.4.14 - 2026-08-12
+
+- Fix the self-managed EVPN underlay stopping in FRR `BGP state = Active` with `No path to specified Neighbor`.
+- Add an explicit `/32` route to the opposite `192.168.254.x` transit endpoint through `evpn-transit0` in routing table 254, so FRR-K8s has deterministic peer reachability even when NetworkManager's implicit connected route is not visible as expected.
+- Enable `ebgpMultiHop` for the self-managed VXLAN BGP neighbor only; external/provider EVPN mode is unchanged.
+- Verify the peer route from FRR before waiting for BGP, and replace the previous `Unknown error` timeout with a concise final BGP-state/reset diagnostic.
+- No phoenixNAP server, RHACM, or cluster rebuild is required; rerun `make deploy`.
+
+## 1.4.13 - 2026-08-12
+
+- Hardened phoenixNAP BGP peer-group readiness polling against transient `uri` results that do not contain a JSON body.
+- Refreshes the phoenixNAP OAuth token immediately before each BGP peer-group readiness wait.
+- The BGP READY loop now safely retries missing/failed HTTP responses instead of crashing while evaluating `bgp_group_ready.json.status`.
+- Added a sanitized post-poll assertion that reports the final HTTP/API state without exposing OAuth headers.
+- No server, RHACM, private-network, or OpenShift rebuild is required; rerun `make deploy`.
+
+## 1.4.12 - 2026-08-12
+
+- Fixed OpenShift 4.22 FRR-K8s `FRRConfiguration` BGP authentication schema: `neighbors[].passwordSecret` is now emitted as a SecretReference object with `name`, not as a bare string.
+- This resolves the API 422 `passwordSecret ... must be of type object` failure when creating `FRRConfiguration/evpn-fabric`.
+- Keeps the existing `kubernetes.io/basic-auth` secret in `openshift-frr-k8s`; no RHACM or phoenixNAP resources are recreated.
+
 ## 1.4.11 - 2026-08-12
 
 - Carry forward the v1.4.10 idempotent AgentClusterInstall fix unchanged.

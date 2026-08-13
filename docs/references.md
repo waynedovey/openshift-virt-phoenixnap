@@ -21,3 +21,8 @@ These are the primary references used when assembling the automation.
 ## Cloudflare
 
 - DNS record API: https://developers.cloudflare.com/api/resources/dns/subresources/records/methods/create/
+
+## FRRouting
+
+- FRR BGP `attribute-unchanged next-hop`, eBGP first-AS enforcement and EVPN behavior: https://docs.frrouting.org/en/latest/bgp.html
+- FRR EVPN control plane: https://docs.frrouting.org/en/latest/evpn.html

@@ -108,7 +108,36 @@
           k8s.ovn.org/primary-user-defined-network: ""
 
 # Kubernetes NMState is installed by playbooks/07b_nmstate.yml.
-- name: Create dummy VTEP interface
+- name: Resolve effective VTEP address and CIDR for this fabric mode
+  ansible.builtin.set_fact:
+    evpn_effective_vtep_ip: >-
+      {{ evpn_site_public_ips[site_item.key]
+         if evpn.fabric_mode == 'fabric-router'
+         else site_item.value.vtep_ip }}
+    evpn_effective_vtep_cidr: >-
+      {{ (evpn_site_public_ips[site_item.key] ~ '/32')
+         if evpn.fabric_mode == 'fabric-router'
+         else evpn.legacy_vtep_cidr }}
+
+- name: Remove legacy dummy VTEP interface when the public SNO address is the VTEP
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: nmstate.io/v1
+      kind: NodeNetworkConfigurationPolicy
+      metadata:
+        name: evpn-vtep
+      spec:
+        nodeSelector: {}
+        desiredState:
+          interfaces:
+            - name: evpn-vtep0
+              type: dummy
+              state: absent
+  when: evpn.fabric_mode == 'fabric-router'
+
+- name: Create dummy VTEP interface for provider/legacy fabric modes
   kubernetes.core.k8s:
     kubeconfig: "{{ managed_kubeconfig }}"
     state: present
@@ -127,13 +156,14 @@
               ipv4:
                 enabled: true
                 address:
-                  - ip: "{{ site_item.value.vtep_ip }}"
+                  - ip: "{{ evpn_effective_vtep_ip }}"
                     prefix-length: 32
                 dhcp: false
               ipv6:
                 enabled: false
+  when: evpn.fabric_mode != 'fabric-router'
 
-- name: Wait for dummy VTEP interface policy
+- name: Wait for VTEP interface policy reconciliation
   kubernetes.core.k8s_info:
     kubeconfig: "{{ managed_kubeconfig }}"
     api_version: nmstate.io/v1
@@ -161,7 +191,7 @@
       spec:
         mode: Unmanaged
         cidrs:
-          - "{{ evpn.vtep_cidr }}"
+          - "{{ evpn_effective_vtep_cidr }}"
 
 - name: Wait for VTEP acceptance
   kubernetes.core.k8s_info:
@@ -178,3 +208,14 @@
       | list | length) > 0
   retries: 90
   delay: 10
+
+- name: Report effective OpenShift EVPN VTEP
+  ansible.builtin.debug:
+    msg: >-
+      {{ site_item.key }} VTEP={{ evpn_effective_vtep_ip }} CIDR={{ evpn_effective_vtep_cidr }}.
+      {% if evpn.fabric_mode == 'fabric-router' %}
+      This is the existing public br-ex primary IPv4 address; OpenShift VXLAN UDP/4789
+      can therefore travel directly between PHX and ASH without a nested carrier.
+      {% else %}
+      The VTEP is hosted on the evpn-vtep0 dummy interface and must be routed by the fabric.
+      {% endif %}

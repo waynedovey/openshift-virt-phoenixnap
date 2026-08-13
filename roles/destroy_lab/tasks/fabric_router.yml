@@ -1,0 +1,128 @@
+---
+- name: Read repository-owned EVPN fabric-router state
+  ansible.builtin.set_fact:
+    destroy_evpn_fr_state: "{{ lookup('ansible.builtin.file', 'artifacts/evpn/fabric-router.yml') | from_yaml }}"
+
+- name: Require a server ID in the EVPN fabric-router ownership artifact
+  ansible.builtin.assert:
+    that:
+      - destroy_evpn_fr_state.id | default('') | length > 0
+      - destroy_evpn_fr_state.hostname | default('') | length > 0
+    fail_msg: >-
+      artifacts/evpn/fabric-router.yml exists but does not contain a usable server
+      ID/hostname. Refusing to guess which phoenixNAP server to deprovision.
+
+- name: Refresh EVPN fabric-router lifecycle state before teardown
+  ansible.builtin.uri:
+    url: "{{ phoenixnap.api_base }}/bmc/v1/servers/{{ destroy_evpn_fr_state.id }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ pnap_token }}"
+    return_content: true
+    status_code: [200, 404]
+  register: destroy_evpn_fr_live
+  no_log: true
+
+- name: Verify the fabric-router ownership artifact still points at the expected server
+  ansible.builtin.assert:
+    that:
+      - >-
+        destroy_evpn_fr_live.status == 404 or
+        (destroy_evpn_fr_live.json.hostname | default('')) == destroy_evpn_fr_state.hostname
+    fail_msg: >-
+      Fabric-router artifact ID {{ destroy_evpn_fr_state.id }} now belongs to hostname
+      {{ destroy_evpn_fr_live.json.hostname | default('unknown') }}, not
+      {{ destroy_evpn_fr_state.hostname }}. Refusing a potentially destructive delete.
+
+- name: Publish EVPN fabric-router teardown state
+  ansible.builtin.set_fact:
+    destroy_evpn_fr_exists: "{{ destroy_evpn_fr_live.status == 200 }}"
+    destroy_evpn_fr_status: >-
+      {{ destroy_evpn_fr_live.json.status | default('absent') }}
+
+- name: Report EVPN fabric-router teardown state
+  ansible.builtin.debug:
+    msg: >-
+      Repository-owned EVPN fabric router {{ destroy_evpn_fr_state.hostname }}
+      lifecycle state={{ destroy_evpn_fr_status }}. It will be removed so make destroy
+      does not leave a third hourly server billable.
+
+- name: Request EVPN fabric-router deprovision
+  ansible.builtin.uri:
+    url: "{{ phoenixnap.api_base }}/bmc/v1/servers/{{ destroy_evpn_fr_state.id }}/actions/deprovision"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ pnap_token }}"
+      Content-Type: application/json
+    body_format: json
+    body:
+      deleteIpBlocks: "{{ phoenixnap.delete_ip_blocks_on_destroy | bool }}"
+    return_content: true
+    status_code: [200, 202, 404, 409]
+  register: destroy_evpn_fr_deprovision
+  when:
+    - destroy_evpn_fr_exists | bool
+    - destroy_evpn_fr_status != 'deleting'
+  no_log: true
+
+- name: Retry EVPN fabric-router deprovision after lifecycle conflict
+  ansible.builtin.uri:
+    url: "{{ phoenixnap.api_base }}/bmc/v1/servers/{{ destroy_evpn_fr_state.id }}/actions/deprovision"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ pnap_token }}"
+      Content-Type: application/json
+    body_format: json
+    body:
+      deleteIpBlocks: "{{ phoenixnap.delete_ip_blocks_on_destroy | bool }}"
+    return_content: true
+    status_code: [200, 202, 404, 409]
+  register: destroy_evpn_fr_retry
+  until: destroy_evpn_fr_retry.status in [200, 202, 404]
+  retries: "{{ phoenixnap.destroy_deprovision_conflict_retries | default(24) | int }}"
+  delay: "{{ phoenixnap.destroy_poll_seconds | default(10) | int }}"
+  when:
+    - destroy_evpn_fr_deprovision is not skipped
+    - destroy_evpn_fr_deprovision.status | default(0) == 409
+  no_log: true
+
+- name: Require EVPN fabric-router deprovision to be accepted
+  ansible.builtin.assert:
+    that:
+      - >-
+        (not (destroy_evpn_fr_exists | bool)) or
+        (destroy_evpn_fr_status == 'deleting') or
+        (destroy_evpn_fr_deprovision.status | default(0) in [200, 202, 404]) or
+        (destroy_evpn_fr_retry.status | default(0) in [200, 202, 404])
+    fail_msg: >-
+      phoenixNAP did not accept deprovision for {{ destroy_evpn_fr_state.hostname }}.
+      The playbook will not silently leave a potentially billable fabric router behind.
+
+- name: Wait until EVPN fabric router is fully removed
+  ansible.builtin.uri:
+    url: "{{ phoenixnap.api_base }}/bmc/v1/servers/{{ destroy_evpn_fr_state.id }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ pnap_token }}"
+    return_content: false
+    status_code: [200, 404]
+  register: destroy_evpn_fr_absent
+  until: destroy_evpn_fr_absent.status == 404
+  retries: "{{ phoenixnap.destroy_server_delete_retries | default(60) | int }}"
+  delay: "{{ phoenixnap.destroy_poll_seconds | default(10) | int }}"
+  when: destroy_evpn_fr_exists | bool
+  no_log: true
+
+- name: Remove local EVPN fabric-router ownership and password artifacts
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - artifacts/evpn/fabric-router.yml
+    - artifacts/secrets/evpn-fabric-router-password
+
+- name: Report EVPN fabric-router removal
+  ansible.builtin.debug:
+    msg: >-
+      EVPN fabric router {{ destroy_evpn_fr_state.hostname }} is absent from phoenixNAP
+      and its local ownership/password artifacts have been removed.

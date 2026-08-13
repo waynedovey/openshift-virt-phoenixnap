@@ -1,0 +1,329 @@
+---
+- name: Require fabric-router auto provisioning only in fabric-router fabric mode
+  ansible.builtin.assert:
+    that:
+      - evpn.fabric_mode == 'fabric-router'
+      - evpn.fabric_router.auto_provision | bool
+    fail_msg: >-
+      The phoenixNAP EVPN fabric-router role is only used when
+      EVPN_FABRIC_MODE=fabric-router and EVPN_FR_AUTO_PROVISION=true.
+
+- name: Require SNO server state before provisioning EVPN fabric router
+  ansible.builtin.stat:
+    path: "artifacts/servers/{{ item }}.yml"
+  loop:
+    - sw1
+    - c1
+  register: evpn_fr_sno_artifact_stats
+
+- name: Require both SNO server artifacts for fabric-router client addresses
+  ansible.builtin.assert:
+    that:
+      - evpn_fr_sno_artifact_stats.results | map(attribute='stat.exists') | min
+    fail_msg: >-
+      The EVPN fabric router needs the current SW1/C1 public addresses. Run the
+      normal SNO provisioning/export stages first so artifacts/servers/sw1.yml
+      and artifacts/servers/c1.yml exist.
+
+- name: Read SNO public addresses for EVPN fabric-router clients
+  ansible.builtin.set_fact:
+    evpn_fr_sno_state:
+      sw1: "{{ lookup('ansible.builtin.file', 'artifacts/servers/sw1.yml') | from_yaml }}"
+      c1: "{{ lookup('ansible.builtin.file', 'artifacts/servers/c1.yml') | from_yaml }}"
+
+- name: Publish EVPN fabric-router client addresses
+  ansible.builtin.set_fact:
+    evpn_fr_sw1_public_ip: "{{ evpn_fr_sno_state.sw1.public_ip }}"
+    evpn_fr_c1_public_ip: "{{ evpn_fr_sno_state.c1.public_ip }}"
+
+- name: Require valid SNO public addresses before fabric-router creation
+  ansible.builtin.assert:
+    that:
+      - evpn_fr_sw1_public_ip | length > 0
+      - evpn_fr_c1_public_ip | length > 0
+      - evpn_fr_sw1_public_ip != evpn_fr_c1_public_ip
+    fail_msg: "SW1/C1 public IP artifacts are incomplete; cannot build the EVPN fabric router."
+
+- name: Create local secret directory for EVPN fabric router
+  ansible.builtin.file:
+    path: artifacts/secrets
+    state: directory
+    mode: '0700'
+  when: evpn.bgp_auth.enabled | bool
+
+- name: Generate or reuse fabric-router BGP authentication password
+  ansible.builtin.set_fact:
+    evpn_fr_bgp_password: >-
+      {{ lookup('ansible.builtin.password',
+          'artifacts/secrets/evpn-fabric-router-password',
+          length=32,
+          chars=['ascii_letters', 'digits']) }}
+  no_log: true
+  when: evpn.bgp_auth.enabled | bool
+
+- name: Publish empty fabric-router password when BGP authentication is disabled
+  ansible.builtin.set_fact:
+    evpn_fr_bgp_password: ''
+  when: not (evpn.bgp_auth.enabled | bool)
+
+- name: Read SSH public key for EVPN fabric router
+  ansible.builtin.set_fact:
+    evpn_fr_ssh_public_key: "{{ lookup('ansible.builtin.file', ssh_public_key.path) | trim }}"
+
+- name: Check existing repository ownership state for EVPN fabric router
+  ansible.builtin.stat:
+    path: artifacts/evpn/fabric-router.yml
+  register: evpn_fr_ownership_artifact
+
+- name: Read existing repository EVPN fabric-router ownership state
+  ansible.builtin.set_fact:
+    evpn_fr_owned_state: "{{ lookup('ansible.builtin.file', 'artifacts/evpn/fabric-router.yml') | from_yaml }}"
+  when: evpn_fr_ownership_artifact.stat.exists | bool
+
+- name: List existing phoenixNAP servers before EVPN fabric-router provisioning
+  ansible.builtin.uri:
+    url: "{{ phoenixnap.api_base }}/bmc/v1/servers"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ pnap_token }}"
+    return_content: true
+    status_code: 200
+  register: evpn_fr_existing_servers
+  no_log: true
+
+- name: Find existing EVPN fabric-router by hostname
+  ansible.builtin.set_fact:
+    evpn_fr_existing_server: >-
+      {{ (evpn_fr_existing_servers.json
+          | selectattr('hostname', 'equalto', evpn.fabric_router.hostname)
+          | list | first) | default({}) }}
+
+- name: Refuse to adopt an unowned same-hostname fabric router
+  ansible.builtin.assert:
+    that:
+      - evpn_fr_ownership_artifact.stat.exists | bool
+    fail_msg: >-
+      phoenixNAP already has {{ evpn.fabric_router.hostname }}, but this checkout has no
+      artifacts/evpn/fabric-router.yml ownership record. Refusing to overwrite or silently
+      adopt an unknown third server. Inspect that server and either restore its ownership
+      artifact, use it explicitly with EVPN_FR_ADDRESS, or remove it intentionally.
+  when: evpn_fr_existing_server | length > 0
+
+- name: Require owned existing fabric-router ID to match live server
+  ansible.builtin.assert:
+    that:
+      - evpn_fr_owned_state.id | default('') == evpn_fr_existing_server.id
+      - evpn_fr_owned_state.hostname | default('') == evpn.fabric_router.hostname
+    fail_msg: >-
+      The local EVPN fabric-router ownership artifact does not match the live server ID.
+      Refusing to adopt or modify the server automatically.
+  when:
+    - evpn_fr_existing_server | length > 0
+    - evpn_fr_ownership_artifact.stat.exists | bool
+
+- name: Require owned fabric-router client addresses to match current SNO public IPs
+  ansible.builtin.assert:
+    that:
+      - evpn_fr_owned_state.sw1_client | default('') == evpn_fr_sw1_public_ip
+      - evpn_fr_owned_state.c1_client | default('') == evpn_fr_c1_public_ip
+    fail_msg: >-
+      SW1/C1 public IPs changed since the fabric router was provisioned. The existing
+      fabric-router FRR configuration would peer to stale client addresses. Run make destroy
+      (or intentionally remove/rebuild only the owned fabric router) before reprovisioning it.
+  when:
+    - evpn_fr_existing_server | length > 0
+    - evpn_fr_ownership_artifact.stat.exists | bool
+
+- name: Require existing fabric router to remain in configured location
+  ansible.builtin.assert:
+    that:
+      - evpn_fr_existing_server.location == evpn.fabric_router.location
+    fail_msg: >-
+      Existing {{ evpn.fabric_router.hostname }} is in
+      {{ evpn_fr_existing_server.location | default('unknown') }}, but fabric-router
+      location is {{ evpn.fabric_router.location }}. The role will not silently
+      adopt or move a server in another region.
+  when: evpn_fr_existing_server | length > 0
+
+- name: Select cheapest live hourly SKU for missing EVPN fabric router
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - scripts/select_pnap_sku.py
+      - --api-base
+      - "{{ phoenixnap.api_base }}"
+      - --site
+      - "rs={{ evpn.fabric_router.location }}"
+      - --max-hourly-price
+      - "{{ evpn.fabric_router.auto_select.max_hourly_price | string }}"
+      - --min-ram-gb
+      - "{{ evpn.fabric_router.auto_select.min_ram_gb | string }}"
+      - --min-cores
+      - "{{ evpn.fabric_router.auto_select.min_cores | string }}"
+      - --preferred-ram-gb
+      - "{{ evpn.fabric_router.auto_select.preferred_ram_gb | string }}"
+      - --preferred-cores
+      - "{{ evpn.fabric_router.auto_select.preferred_cores | string }}"
+      - --top
+      - "{{ evpn.fabric_router.auto_select.show_top_candidates | string }}"
+  environment:
+    PNAP_ACCESS_TOKEN: "{{ pnap_token }}"
+  register: evpn_fr_sku_command
+  changed_when: false
+  when: evpn_fr_existing_server | length == 0
+  no_log: true
+
+- name: Parse sanitized fabric-router SKU selection
+  ansible.builtin.set_fact:
+    evpn_fr_sku_selection: "{{ evpn_fr_sku_command.stdout | from_json }}"
+  when: evpn_fr_existing_server | length == 0
+
+- name: Require live fabric-router capacity below configured hourly cap
+  ansible.builtin.assert:
+    that:
+      - evpn_fr_sku_selection.ok | default(false) | bool
+      - evpn_fr_sku_selection.sites.rs.productCode | default('') | length > 0
+    fail_msg: >-
+      {{ evpn_fr_sku_selection.error | default('No fabric-router SKU selected') }}.
+      Increase EVPN_FR_MAX_HOURLY_PRICE or choose another EVPN_FR_LOCATION.
+  when: evpn_fr_existing_server | length == 0
+
+- name: Report fabric-router SKU before billable provisioning
+  ansible.builtin.debug:
+    msg: >-
+      EVPN fabric router: selecting {{ evpn_fr_sku_selection.sites.rs.productCode }}
+      in {{ evpn.fabric_router.location }} at
+      ${{ '%.4f' | format(evpn_fr_sku_selection.sites.rs.hourlyPrice | float) }}/hour.
+      This is a third phoenixNAP hourly server used only for MP-BGP EVPN control-plane traffic.
+  when: evpn_fr_existing_server | length == 0
+
+- name: Render fabric-router cloud-init with FRR EVPN configuration
+  ansible.builtin.set_fact:
+    evpn_fr_cloud_init: "{{ lookup('ansible.builtin.template', 'cloud-init.yml.j2') }}"
+  when: evpn_fr_existing_server | length == 0
+  no_log: true
+
+- name: Provision phoenixNAP EVPN fabric-router
+  ansible.builtin.uri:
+    url: "{{ phoenixnap.api_base }}/bmc/v1/servers?force=true"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ pnap_token }}"
+      Content-Type: application/json
+    body_format: json
+    body:
+      hostname: "{{ evpn.fabric_router.hostname }}"
+      description: "OpenShift 4.22 EVPN fabric router - {{ project_name }}"
+      location: "{{ evpn.fabric_router.location }}"
+      os: "{{ evpn.fabric_router.os }}"
+      type: "{{ evpn_fr_sku_selection.sites.rs.productCode }}"
+      pricingModel: "{{ phoenixnap.pricing_model }}"
+      networkType: PUBLIC_ONLY
+      installDefaultSshKeys: false
+      sshKeys:
+        - "{{ evpn_fr_ssh_public_key }}"
+      osConfiguration:
+        cloudInit:
+          userData: "{{ evpn_fr_cloud_init | b64encode }}"
+    return_content: true
+    status_code: [200, 201, 202, 400, 409, 422]
+  register: evpn_fr_create
+  when: evpn_fr_existing_server | length == 0
+  no_log: true
+
+- name: Publish sanitized fabric-router provisioning error
+  ansible.builtin.set_fact:
+    evpn_fr_create_error: >-
+      {{ (evpn_fr_create.json | default({})).message
+         | default('phoenixNAP rejected EVPN fabric-router provisioning') }}
+      {{ (evpn_fr_create.json | default({})).validationErrors | default([]) | to_json }}
+  when:
+    - evpn_fr_existing_server | length == 0
+    - evpn_fr_create.status | default(0) | int not in [200, 201, 202]
+
+- name: Require phoenixNAP fabric-router provisioning to succeed
+  ansible.builtin.assert:
+    that:
+      - >-
+        evpn_fr_existing_server | length > 0 or
+        evpn_fr_create.status | default(0) | int in [200, 201, 202]
+    fail_msg: >-
+      EVPN fabric-router provisioning failed: {{ evpn_fr_create_error | default('unknown API error') }}.
+      No OpenShift EVPN peer changes have been applied yet.
+
+- name: Select EVPN fabric-router ID from an existing owned server
+  ansible.builtin.set_fact:
+    evpn_fr_server_id: "{{ evpn_fr_existing_server.id }}"
+  when: evpn_fr_existing_server | length > 0
+
+- name: Select EVPN fabric-router ID from a newly provisioned server
+  ansible.builtin.set_fact:
+    evpn_fr_server_id: "{{ evpn_fr_create.json.id }}"
+  when: evpn_fr_existing_server | length == 0
+
+- name: Create EVPN artifact directory immediately after ownership is known
+  ansible.builtin.file:
+    path: artifacts/evpn
+    state: directory
+    mode: '0700'
+
+- name: Save provisional ownership immediately for a newly provisioned fabric router
+  ansible.builtin.copy:
+    dest: artifacts/evpn/fabric-router.yml
+    mode: '0600'
+    content: |
+      id: {{ evpn_fr_server_id }}
+      hostname: {{ evpn.fabric_router.hostname }}
+      location: {{ evpn.fabric_router.location }}
+      os: {{ evpn.fabric_router.os }}
+      type: {{ evpn_fr_sku_selection.sites.rs.productCode }}
+      public_ip: pending
+      asn: {{ evpn.fabric_router.asn }}
+      router_id: {{ evpn.fabric_router.router_id }}
+      sw1_client: {{ evpn_fr_sw1_public_ip }}
+      c1_client: {{ evpn_fr_c1_public_ip }}
+  when: evpn_fr_existing_server | length == 0
+
+- name: Wait for EVPN fabric-router to become powered on with a public IP
+  ansible.builtin.uri:
+    url: "{{ phoenixnap.api_base }}/bmc/v1/servers/{{ evpn_fr_server_id }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ pnap_token }}"
+    return_content: true
+    status_code: 200
+  register: evpn_fr_live
+  until: >-
+    (evpn_fr_live.json.status | default('')) == 'powered-on' and
+    (evpn_fr_live.json.publicIpAddresses | default([]) | length) > 0
+  retries: 90
+  delay: 10
+  no_log: true
+
+- name: Publish effective EVPN fabric-router state
+  ansible.builtin.set_fact:
+    evpn_fr_public_ip: "{{ evpn_fr_live.json.publicIpAddresses | first }}"
+    evpn_fr_effective_type: "{{ evpn_fr_live.json.type }}"
+
+- name: Save non-secret EVPN fabric-router state
+  ansible.builtin.copy:
+    dest: artifacts/evpn/fabric-router.yml
+    mode: '0600'
+    content: |
+      id: {{ evpn_fr_server_id }}
+      hostname: {{ evpn.fabric_router.hostname }}
+      location: {{ evpn.fabric_router.location }}
+      os: {{ evpn.fabric_router.os }}
+      type: {{ evpn_fr_effective_type }}
+      public_ip: {{ evpn_fr_public_ip }}
+      asn: {{ evpn.fabric_router.asn }}
+      router_id: {{ evpn.fabric_router.router_id }}
+      sw1_client: {{ evpn_fr_sw1_public_ip }}
+      c1_client: {{ evpn_fr_c1_public_ip }}
+
+- name: Report EVPN fabric-router endpoint
+  ansible.builtin.debug:
+    msg: >-
+      EVPN fabric router {{ evpn.fabric_router.hostname }} is powered on at
+      {{ evpn_fr_public_ip }} (AS{{ evpn.fabric_router.asn }}). Cloud-init installs
+      FRR and enables TCP/179; SW1/C1 will dial this peer during the EVPN stage.

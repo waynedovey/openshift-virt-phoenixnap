@@ -5,17 +5,23 @@
     evpn_peer_address: >-
       {{ evpn.transport.addresses['c1' if site_item.key == 'sw1' else 'sw1']
          if evpn.fabric_mode == 'self-managed-vxlan'
-         else evpn.peers[site_item.key] }}
+         else (evpn_fabric_router_address
+               if evpn.fabric_mode == 'fabric-router'
+               else evpn.peers[site_item.key]) }}
     evpn_peer_asn_effective: >-
       {{ sites['c1' if site_item.key == 'sw1' else 'sw1'].bgp_asn
          if evpn.fabric_mode == 'self-managed-vxlan'
-         else evpn.peer_asn }}
+         else (evpn.fabric_router.asn
+               if evpn.fabric_mode == 'fabric-router'
+               else evpn.peer_asn) }}
     evpn_router_id: >-
       {{ evpn.transport.addresses[site_item.key]
          if evpn.fabric_mode == 'self-managed-vxlan'
-         else site_item.value.vtep_ip }}
+         else (evpn_site_public_ips[site_item.key]
+               if evpn.fabric_mode == 'fabric-router'
+               else site_item.value.vtep_ip) }}
 
-- name: Create shared BGP authentication secret for self-managed fabric
+- name: Create BGP authentication secret for lab-managed EVPN fabric
   kubernetes.core.k8s:
     kubeconfig: "{{ managed_kubeconfig }}"
     state: present
@@ -31,23 +37,27 @@
         password: "{{ evpn_bgp_password }}"
   no_log: true
   when:
-    - evpn.fabric_mode == 'self-managed-vxlan'
+    - evpn.fabric_mode in ['fabric-router', 'self-managed-vxlan']
     - evpn.bgp_auth.enabled | bool
 
 - name: Build base EVPN BGP neighbor
   ansible.builtin.set_fact:
-    evpn_neighbor_base:
-      address: "{{ evpn_peer_address }}"
-      asn: "{{ evpn_peer_asn_effective | int }}"
+    evpn_neighbor_base: >-
+      {{ {'address': evpn_peer_address, 'asn': (evpn_peer_asn_effective | int)}
+         | combine({'ebgpMultiHop': true}
+           if evpn.fabric_mode in ['fabric-router', 'self-managed-vxlan'] else {}) }}
 
-- name: Add BGP authentication to self-managed neighbor
+# FRR-K8s v1beta1 on this OpenShift 4.22 cluster expects passwordSecret as a
+# SecretReference object with a name field.
+- name: Add BGP authentication to lab-managed neighbor
   ansible.builtin.set_fact:
     evpn_neighbor: >-
-      {{ evpn_neighbor_base | combine({'passwordSecret': evpn.bgp_auth.secret_name})
-         if (evpn.fabric_mode == 'self-managed-vxlan' and evpn.bgp_auth.enabled | bool)
+      {{ evpn_neighbor_base | combine({'passwordSecret': {'name': evpn.bgp_auth.secret_name}})
+         if (evpn.fabric_mode in ['fabric-router', 'self-managed-vxlan'] and
+             evpn.bgp_auth.enabled | bool)
          else evpn_neighbor_base }}
 
-- name: Configure EVPN BGP peer
+- name: Configure EVPN BGP peer toward fabric
   kubernetes.core.k8s:
     kubeconfig: "{{ managed_kubeconfig }}"
     state: present
@@ -66,3 +76,13 @@
             - asn: "{{ site_item.value.bgp_asn | int }}"
               id: "{{ evpn_router_id }}"
               neighbors: "{{ [evpn_neighbor] }}"
+
+- name: Report canonical EVPN BGP peer
+  ansible.builtin.debug:
+    msg: >-
+      {{ site_item.key }} FRR-K8s AS{{ site_item.value.bgp_asn }} will actively dial
+      {{ evpn_peer_address }} AS{{ evpn_peer_asn_effective }}.
+      {% if evpn.fabric_mode == 'fabric-router' %}
+      The provider-facing listener is the external FRR fabric router; FRR-K8s itself
+      intentionally runs bgpd with -p 0 and does not accept direct peer connections.
+      {% endif %}

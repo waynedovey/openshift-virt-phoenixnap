@@ -17,8 +17,31 @@
       {{ ((status_servers.json | selectattr('hostname', 'equalto', item.value.node_hostname) | list | first).status) | default('not-found') }}
   loop: "{{ sites | dict2items }}"
 
+- name: Check auto-provisioned EVPN fabric-router artifact
+  ansible.builtin.stat:
+    path: artifacts/evpn/fabric-router.yml
+  register: status_evpn_fr_artifact
+  when:
+    - evpn.enabled | bool
+    - evpn.fabric_mode == 'fabric-router'
+    - evpn.fabric_router.auto_provision | bool
 
-- name: List phoenixNAP BGP peer groups
+- name: Read auto-provisioned EVPN fabric-router state
+  ansible.builtin.set_fact:
+    status_evpn_fr_state: "{{ lookup('ansible.builtin.file', 'artifacts/evpn/fabric-router.yml') | from_yaml }}"
+  when:
+    - status_evpn_fr_artifact.stat.exists | default(false) | bool
+
+- name: Show auto-provisioned EVPN fabric-router state
+  ansible.builtin.debug:
+    msg: >-
+      EVPN fabric router: {{ status_evpn_fr_state.hostname }} =
+      {{ ((status_servers.json | selectattr('id', 'equalto', status_evpn_fr_state.id) | list | first).status) | default('not-found') }},
+      public_ip={{ status_evpn_fr_state.public_ip }}, AS{{ status_evpn_fr_state.asn }}.
+  when:
+    - status_evpn_fr_artifact.stat.exists | default(false) | bool
+
+- name: List optional phoenixNAP IPv4 BGP peer groups
   ansible.builtin.uri:
     url: "{{ phoenixnap.api_base }}/networks/v1/bgp-peer-groups"
     method: GET
@@ -28,15 +51,19 @@
     status_code: 200
   register: status_bgp
   no_log: true
+  when: phoenixnap.bgp.enabled | bool
 
-- name: Show BGP peer-group state without passwords
+- name: Show optional phoenixNAP IPv4 BGP peer-group state without passwords
   ansible.builtin.debug:
     msg: >-
       {{ item.location }}: status={{ item.status }},
       ASN={{ item.activeAsnDetails.asn | default(item.targetAsnDetails.asn) }},
-      loopbacks={{ item.peeringLoopbacksV4 | default([]) }}
-  loop: "{{ status_bgp.json }}"
-  when: item.location in [sites.sw1.location, sites.c1.location]
+      loopbacks={{ item.peeringLoopbacksV4 | default([]) }}.
+      This peer-group service is not used as the OpenShift EVPN fabric.
+  loop: "{{ status_bgp.json | default([]) }}"
+  when:
+    - phoenixnap.bgp.enabled | bool
+    - item.location in [sites.sw1.location, sites.c1.location]
 
 - name: Show RHACM install state
   kubernetes.core.k8s_info:
@@ -48,14 +75,33 @@
   loop: "{{ sites | dict2items }}"
   register: status_aci
 
-- name: Explain EVPN state
+- name: Explain fabric-router EVPN state
   ansible.builtin.debug:
     msg: >-
       EVPN platform_apply={{ evpn.platform_apply | default(true) }},
-      fabric_mode={{ evpn.fabric_mode }},
+      fabric_mode=fabric-router, fabric-router={{ evpn.fabric_router.address if evpn.fabric_router.address | length > 0 else 'auto-provisioned' }}
+      AS{{ evpn.fabric_router.asn }}, shared VM subnet={{ evpn.vm_subnet }}, VNI={{ evpn.vni }}.
+      MP-BGP EVPN uses the fabric router for control-plane exchange; VXLAN UDP/4789
+      remains direct between the SNO public VTEPs.
+  when: evpn.fabric_mode == 'fabric-router'
+
+- name: Explain legacy self-managed EVPN state
+  ansible.builtin.debug:
+    msg: >-
+      EVPN platform_apply={{ evpn.platform_apply | default(true) }},
+      fabric_mode=self-managed-vxlan,
       transit={{ evpn.transport.addresses.sw1 }}<->{{ evpn.transport.addresses.c1 }}
       over UDP/{{ evpn.transport.udp_port }}, shared VM subnet={{ evpn.vm_subnet }},
+      VNI={{ evpn.vni }}. This legacy mode is retained only for diagnostics.
+  when: evpn.fabric_mode == 'self-managed-vxlan'
+
+- name: Explain external EVPN state
+  ansible.builtin.debug:
+    msg: >-
+      EVPN platform_apply={{ evpn.platform_apply | default(true) }},
+      fabric_mode=external, peer ASN={{ evpn.peer_asn }}, shared VM subnet={{ evpn.vm_subnet }},
       VNI={{ evpn.vni }}.
+  when: evpn.fabric_mode == 'external'
 
 - name: List phoenixNAP private networks
   ansible.builtin.uri:

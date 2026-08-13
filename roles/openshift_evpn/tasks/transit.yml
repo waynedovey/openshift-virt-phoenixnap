@@ -42,6 +42,16 @@
                 remote: "{{ evpn_transit_remote_public_ip }}"
                 learning: false
                 destination-port: "{{ evpn.transport.udp_port | int }}"
+          # FRR-K8s resolves BGP neighbors from the host main routing table.
+          # Keep an explicit host route to the opposite transit endpoint so the
+          # overlay remains reachable even if NetworkManager does not expose the
+          # VXLAN connected prefix to table 254 in the way FRR expects.
+          routes:
+            config:
+              - destination: "{{ evpn_transit_remote_ip }}/32"
+                next-hop-interface: "{{ evpn.transport.interface }}"
+                table-id: 254
+                metric: 50
 
 - name: Wait for cross-site EVPN transit interface policy
   kubernetes.core.k8s_info:
@@ -58,6 +68,54 @@
       | list | length) > 0
   retries: 90
   delay: 10
+  ignore_errors: true
+
+- name: Read NMState enactments when the transit policy is not Available
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: nmstate.io/v1
+    kind: NodeNetworkConfigurationEnactment
+  register: evpn_transit_nnce
+  failed_when: false
+  when: >-
+    evpn_transit_nncp.resources | default([]) | length != 1 or
+    (evpn_transit_nncp.resources[0].status.conditions | default([])
+      | selectattr('type', 'equalto', 'Available')
+      | selectattr('status', 'equalto', 'True')
+      | list | length) == 0
+
+- name: Build NMState transit failure summary
+  ansible.builtin.set_fact:
+    evpn_transit_nnce_errors: >-
+      {{ evpn_transit_nnce.resources | default([])
+         | selectattr('metadata.name', 'search', 'evpn-cross-site-transit')
+         | map(attribute='status')
+         | map(attribute='conditions')
+         | list }}
+  when: >-
+    evpn_transit_nncp.resources | default([]) | length != 1 or
+    (evpn_transit_nncp.resources[0].status.conditions | default([])
+      | selectattr('type', 'equalto', 'Available')
+      | selectattr('status', 'equalto', 'True')
+      | list | length) == 0
+
+- name: Require cross-site EVPN transit policy to become Available
+  ansible.builtin.assert:
+    that:
+      - evpn_transit_nncp.resources | default([]) | length == 1
+      - >-
+        (evpn_transit_nncp.resources[0].status.conditions | default([])
+          | selectattr('type', 'equalto', 'Available')
+          | selectattr('status', 'equalto', 'True')
+          | list | length) > 0
+    fail_msg: >-
+      {{ site_item.key }} NNCP/evpn-cross-site-transit did not become Available.
+      The requested outer carrier is VXLAN VNI {{ evpn.transport.vni }} on
+      UDP/{{ evpn.transport.udp_port }}. NNCE condition summary:
+      {{ evpn_transit_nnce_errors | default([]) }}.
+      Run 'oc --kubeconfig {{ managed_kubeconfig }} get nnce -o yaml' for the full
+      per-node NMState error. UDP/4789 is intentionally rejected for this outer
+      carrier because it is reserved for the OpenShift EVPN data plane.
 
 - name: Report cross-site EVPN transit
   ansible.builtin.debug:
