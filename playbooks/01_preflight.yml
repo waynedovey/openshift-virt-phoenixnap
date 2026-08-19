@@ -140,10 +140,10 @@
         msg: >-
           {% if pnap_selected_skus[item.key].reusedExisting | default(false) | bool %}
           {{ item.key | upper }}: reuse existing {{ item.value.node_hostname }}
-          ({{ pnap_selected_skus[item.key].productCode }} in {{ item.value.location }}); no live stock required.
+          ({{ pnap_selected_skus[item.key].productCode }} in {{ pnap_selected_skus[item.key].location }}); no live stock required.
           {% else %}
           {{ item.key | upper }}: provision {{ pnap_selected_skus[item.key].productCode }} @
-          ${{ '%.3f' | format(pnap_selected_skus[item.key].hourlyPrice | float) }}/h in {{ item.value.location }}.
+          ${{ '%.3f' | format(pnap_selected_skus[item.key].hourlyPrice | float) }}/h in {{ pnap_selected_skus[item.key].location }}.
           {% endif %}
       loop: "{{ sites | dict2items }}"
       loop_control:

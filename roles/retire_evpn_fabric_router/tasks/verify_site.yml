@@ -1,0 +1,80 @@
+---
+- name: Set legacy-server retirement verification facts for site
+  ansible.builtin.set_fact:
+    retire_site_kubeconfig: "artifacts/kubeconfigs/{{ retire_site_item.value.cluster_name }}.kubeconfig"
+    retire_site_peer: "{{ retire_evpn_public_ips[evpn.embedded_router.site] }}"
+    retire_remote_vtep: >-
+      {{ retire_evpn_public_ips['c1' if retire_site_item.key == 'sw1' else 'sw1'] }}
+
+- name: Read FRR-K8s pods before legacy-server retirement
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ retire_site_kubeconfig }}"
+    api_version: v1
+    kind: Pod
+    namespace: openshift-frr-k8s
+  register: retire_site_frr_pods
+
+- name: Build running FRR-K8s daemon list before legacy-server retirement
+  ansible.builtin.set_fact:
+    retire_site_running_frr_pods: >-
+      {{ retire_site_frr_pods.resources
+          | rejectattr('metadata.name', 'search', 'statuscleaner')
+          | selectattr('status.phase', 'equalto', 'Running')
+          | list }}
+
+- name: Require running FRR-K8s daemon before legacy-server retirement
+  ansible.builtin.assert:
+    that:
+      - retire_site_running_frr_pods | length > 0
+    fail_msg: >-
+      No running FRR-K8s daemon found on {{ retire_site_item.key }}. Refusing to
+      deprovision the legacy third EVPN server.
+
+- name: Select running FRR-K8s daemon before legacy-server retirement
+  ansible.builtin.set_fact:
+    retire_site_frr_pod: "{{ (retire_site_running_frr_pods | first).metadata.name }}"
+
+- name: Read embedded BGP neighbor before legacy-server retirement
+  kubernetes.core.k8s_exec:
+    kubeconfig: "{{ retire_site_kubeconfig }}"
+    namespace: openshift-frr-k8s
+    pod: "{{ retire_site_frr_pod }}"
+    container: frr
+    command: "vtysh -c 'show bgp neighbors {{ retire_site_peer }}'"
+  register: retire_site_bgp
+  changed_when: false
+
+- name: Read EVPN Type-3 routes before legacy-server retirement
+  kubernetes.core.k8s_exec:
+    kubeconfig: "{{ retire_site_kubeconfig }}"
+    namespace: openshift-frr-k8s
+    pod: "{{ retire_site_frr_pod }}"
+    container: frr
+    command: "vtysh -c 'show bgp l2vpn evpn route type 3'"
+  register: retire_site_type3
+  changed_when: false
+
+- name: Read EVPN VNI state before legacy-server retirement
+  kubernetes.core.k8s_exec:
+    kubeconfig: "{{ retire_site_kubeconfig }}"
+    namespace: openshift-frr-k8s
+    pod: "{{ retire_site_frr_pod }}"
+    container: frr
+    command: "vtysh -c 'show evpn vni'"
+  register: retire_site_vni
+  changed_when: false
+
+- name: Require verified embedded EVPN path before legacy-server retirement
+  ansible.builtin.assert:
+    that:
+      - "'BGP state = Established' in (retire_site_bgp.stdout | default(''))"
+      - retire_remote_vtep in (retire_site_type3.stdout | default(''))
+      - (evpn.vni | string) in (retire_site_vni.stdout | default(''))
+      - >-
+        ((retire_site_vni.stdout | default(''))
+          | regex_search('(?m)^' ~ (evpn.vni | string) ~ '\\s+L2\\s+\\S+\\s+\\d+\\s+\\d+\\s+[1-9]\\d*\\s+')) is not none
+    fail_msg: >-
+      {{ retire_site_item.key }} has not proved the embedded EVPN path yet.
+      Expected BGP Established to {{ retire_site_peer }}, remote Type-3 VTEP
+      {{ retire_remote_vtep }}, and at least one remote VTEP for VNI {{ evpn.vni }}.
+      Refusing to deprovision the legacy third server.

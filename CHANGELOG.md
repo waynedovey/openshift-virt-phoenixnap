@@ -1,3 +1,139 @@
+## 1.4.38
+
+- Fix the v1.4.37 loopback BGP canary regression: FRR-K8s cannot establish the authenticated hosting-leaf session to `127.0.0.1:1179` while sourcing it from the public VTEP address. Both leaves now use the hosting SNO public TCP/1179 endpoint, matching the authenticated session path already proven in v1.4.36.
+- Fix the underlying asymmetric EVPN issue instead of changing the transport endpoint. The host-network route-server now enables FRR `bgp allow-martian-nexthop`, allowing EVPN NLRI from the hosting leaf whose preserved next-hop is the same public IP that is local on the route-server host.
+- Keep `attribute-unchanged next-hop`, TCP-MD5 authentication, `/32` dynamic-listen restrictions, and the stronger v1.4.37 Type-3/Remote-VTEP validation gates.
+- Align canonical peers, canaries, status, and legacy-retirement verification on the single NAT-free public TCP/1179 route-server endpoint.
+
+# 1.4.37
+
+- Fix asymmetric EVPN propagation discovered after the authenticated v1.4.36 cutover: SW1 received C1 EVPN routes, but the embedded route server accepted zero EVPN prefixes from SW1, leaving C1 with no remote Type-2/Type-3 routes and `Remote VTEPs=0`.
+- Keep the embedded FRR route server on `hostNetwork: true`, but make the hosting SNO peer to `127.0.0.1:1179` while the remote SNO continues to peer to the hosting public IP. Both sessions remain NAT-free and TCP-MD5 authenticated, while avoiding a same-source/same-destination public-IP BGP session on the hosting SNO.
+- Use the same loopback/public endpoint split in migration canaries, canonical FRRConfiguration peers, verification, and legacy-router retirement checks.
+- Strengthen final EVPN verification: embedded-router mode now requires the remote Type-3 VTEP and at least one remote VTEP in VNI 5050 on both SNOs before migration is considered healthy.
+- Update status and documentation to show the local loopback BGP endpoint separately from the remote public listener.
+
+# 1.4.36
+
+- Keep BGP authentication enabled by default while removing Kubernetes NAT from the embedded route-server BGP path.
+- Run the embedded FRR route-server explicitly with `hostNetwork: true`; both SW1 and C1 now dial the hosting SNO public IP on TCP/1179.
+- Retain the ClusterIP Service only for health/discovery; it is no longer used as a BGP peer endpoint.
+- Restrict dynamic FRR listen ranges to the two known public VTEP /32 addresses instead of `0.0.0.0/0`.
+- Do not use plain TCP reachability probes against an MD5-protected BGP listener; authenticated canaries are the end-to-end reachability gate.
+- Fix legacy retirement verification so both sites validate the NAT-free public route-server endpoint.
+- This follows live proof that both canaries establish with authentication disabled while the ClusterIP path fails with TCP-MD5 enabled.
+
+## 1.4.35
+
+- Fix the v1.4.34 regression where moving the embedded FRR route server to `hostNetwork` made the local loopback probe succeed but caused the remote SNO public TCP/1179 probe to fail. Live 1.4.33 testing had already proved the normal-pod `hostPort` path is reachable from the remote SNO.
+- Restore normal pod networking plus `hostPort: 1179`: the hosting SNO uses the ClusterIP Service and the remote SNO uses the hosting public IP.
+- Fix the original local canary problem by changing the embedded FRR listener from fixed source-IP neighbors to a password-protected dynamic eBGP peer-group (`bgp listen range`). This tolerates Kubernetes Service/hostPort transport address translation while FRR-K8s still binds each session to its public VTEP `sourceaddress`.
+- Preserve EVPN next hops with `attribute-unchanged next-hop`, keep VNI 5050 VXLAN direct between the public SNO VTEPs, and retain the non-disruptive canary before canonical peer replacement.
+- Add loop labels to the SNO probe tasks so Ansible no longer dumps the entire Node object into normal migration logs.
+
+## 1.4.34
+
+- Fix the embedded EVPN BGP canary failure where SW1 dialed the route-server through a ClusterIP (`172.30.x.x:1179`) while binding the session to the public VTEP source address. The TCP health probe succeeded, but the Service path can translate the connection before it reaches bgpd, so the passive route-server neighbor does not reliably see the configured public peer identity.
+- Run the embedded FRR route-server with `hostNetwork: true` on the existing SW1 SNO and use a NAT-free control-plane path: the hosting FRR-K8s speaker dials `127.0.0.1:1179`, while the remote speaker dials the hosting SNO public IP on TCP/1179. Both continue to use their public VTEP addresses as `sourceaddress`.
+- Keep the ClusterIP Service only as an optional discovery/health object; it is no longer used as a BGP peer endpoint. Remove the now-redundant `hostPort` mapping because the host-networked bgpd listens directly on TCP/1179.
+- Preserve the migration guard: the old third-server peer is not replaced until both non-disruptive canaries establish. Improve the canary failure message with the final BGP state/reset summary.
+- Keep VXLAN VNI 5050 direct between the two public SNO VTEPs; the embedded route-server remains control-plane only.
+
+## 1.4.33
+
+- Fix embedded EVPN migration failing while reading the live FRRConfiguration OpenAPI schema with `object of type 'method' has no attribute 'properties'`.
+- Use explicit bracket notation for nested CRD schema map keys, especially the literal OpenAPI `items` keys, so Jinja does not resolve them as Python `dict.items` methods.
+- Keep the v1.4.32 architecture unchanged: the embedded AS65000 FRR route-server remains on the existing SW1 SNO, FRR-K8s uses `neighbor.port` + `neighbor.sourceaddress`, TCP/1179 carries BGP control-plane traffic, and VXLAN VNI 5050 stays direct between the two public SNO VTEPs.
+- Preserve the guarded migration order and do not retire the legacy third server until embedded BGP and EVPN validation succeeds.
+
+## 1.4.32
+
+- Restore the embedded no-third-server EVPN route-server design after live testing proved OpenShift FRR-K8s on both SNOs has no passive TCP/179 listener, so direct leaf-to-leaf BGP cannot establish.
+- Fix the FRRConfiguration capability check by reading the served CRD OpenAPI schema directly through Kubernetes instead of using `oc explain`, which returned false negatives for nested `neighbors.port` / `neighbors.sourceaddress` fields.
+- Require both `neighbor.port` and `neighbor.sourceaddress` before migration, matching the live OpenShift 4.22 CRDs verified on SW1 and C1.
+- Run the embedded FRR route server as a normal pod on the existing SW1 SNO, exposed locally by a ClusterIP Service and remotely by hostPort TCP/1179. Both FRR-K8s speakers explicitly source their sessions from their own public VTEP addresses.
+- Keep the VXLAN VNI 5050 data path direct between the two SNO public VTEPs; the embedded FRR process remains control-plane only.
+- Preserve the fail-safe migration order: deploy and probe TCP/1179, establish non-disruptive BGP canaries, replace the canonical peers, verify EVPN/remote VTEPs, then allow legacy `evpn-fr` retirement.
+- Normalize stale `EVPN_FABRIC_MODE=direct-peering` and `fabric-router` values to `embedded-router`.
+
+## 1.4.31
+
+- Temporarily tested direct SNO-to-SNO BGP on TCP/179. The guarded live migration proved both OpenShift FRR-K8s daemons were active-only clients with no passive TCP/179 listener, so neither leaf could accept the other's session. The safety gate left the working legacy fabric untouched. This design is superseded by 1.4.32.
+
+## 1.4.30
+
+- Fix embedded EVPN migration on OpenShift 4.22 clusters whose live FRRConfiguration CRD does not expose `neighbor.sourceaddress`. The route-server pod now uses `hostNetwork`; the hosting FRR-K8s speaker peers to `127.0.0.1:1179` and the remote speaker peers to the hosting SNO public IP on TCP/1179.
+- Require only the documented `neighbor.port` field, retain the non-disruptive BGP canary, and keep the legacy third-server fabric untouched until both embedded sessions establish.
+- Run the embedded FRR route server in passive-neighbor mode so OpenShift FRR-K8s remains the active BGP client on both sites.
+
+# 1.4.29
+
+- Raise the default phoenixNAP automatic-selection ceiling from a strict `< $0.30/hour` to a strict `< $0.40/hour` per SNO.
+- Keep the v1.4.28 all-region capacity search: PHX (US SW1), ASH (US E1), and NLD (EU W1) are all checked before capacity selection fails.
+- Preserve the existing hard requirements of at least 64 GB RAM, 6 CPU cores, 2 physical storage devices, and two distinct physical regions.
+- Keep live hourly-rate reporting so candidates above/below the `$0.40/hour` ceiling are visible during `make availability` and `make preflight`.
+
+# 1.4.28
+
+- Treat PHX (US SW1), ASH (US E1), and NLD (EU W1) as a live capacity pool for automatic phoenixNAP placement instead of hard-failing when one configured region is out of stock.
+- Require the two logical SNO sites to land in at least two distinct physical regions. Existing live SNO placement is preserved and counts toward that requirement.
+- Query every supported region before failing and print live HOURLY SKU prices, stock, RAM/CPU and disk counts, including hardware-minimum candidates that are above the configured hourly cap.
+- Dynamically adopt the selected physical region for downstream private-network and server provisioning while keeping logical site names (`sw1`, `c1`) stable.
+
+# 1.4.27
+
+- Make the 1.4.26 no-third-server migration safe for existing working trees that still export `EVPN_FABRIC_MODE=fabric-router`; the legacy value is now normalized to `embedded-router` instead of failing validation.
+- Fix idempotent phoenixNAP preflight capacity detection. Existing servers are still matched by configured hostname first, but if phoenixNAP reports a different hostname the role now recovers the server by the repository-owned `artifacts/servers/<site>.yml` `server_id`, only when that ID is present in the current live `/servers` response. This prevents a healthy existing SW1/C1 from being mistaken for missing capacity.
+- Add sanitized diagnostics showing which live server ID/hostname is being reused during preflight.
+
+# Changelog
+
+## 1.4.26
+
+- Remove provisioning of the third phoenixNAP `evpn-fr` server from the active design. The default is now `EVPN_FABRIC_MODE=embedded-router`.
+- Add an embedded FRR EVPN route-server Deployment on an existing SNO (SW1 by default). The hosting FRR-K8s leaf peers through a ClusterIP Service while the remote leaf peers to TCP/1179 on the hosting SNO public IP; VXLAN UDP/4789 remains direct between the public OpenShift VTEPs.
+- Preserve each leaf public VTEP as the BGP source with FRR-K8s `neighbor.sourceaddress` and use the supported custom neighbor `port`, avoiding direct FRR-K8s-to-FRR-K8s passive peering.
+- Add fail-safe `make evpn-migrate`: deploy/probe the embedded listener before peer changes, require base BGP + L2VPN EVPN + remote Type-3/VTEP verification, and only then deprovision a repository-owned legacy `evpn-fr` server.
+- Add `make evpn-router` and `make evpn-retire-legacy`. Remove the old third-server provisioning playbook/role so a current deployment cannot accidentally create another billable EVPN server.
+- Keep the legacy fabric-router teardown helper only for ownership-verified cleanup of older deployments.
+- Keep the v1.4.25 deterministic proof VMs and `cloud-user`/SSH login behavior unchanged.
+
+# 1.4.25 - 2026-08-17
+
+- Fix RHEL 9 EVPN proof VM administration by explicitly configuring the `cloud-user` password, enabling SSH password authentication, installing the repository public key in NoCloud user-data, and enabling `sshd` during first boot.
+- Default the disposable lab console password to `redhat`; override it with `EVPN_TEST_VM_PASSWORD` before `make test-vms`.
+- Add a proof-VM `bootstrap_revision` annotation and safe recreation logic. When first-boot/cloud-init behavior changes, `make test-vms` now deletes and recreates only the disposable proof VM and root DataVolume so the new cloud-init runs; EVPN CUDN, VTEP, BGP, and fabric-router resources are left untouched.
+- Keep the deterministic EVPN addresses (`10.50.50.50` / `10.50.50.150`) and MACs unchanged.
+
+# 1.4.24 - 2026-08-17
+
+- Fix EVPN proof VM admission with the common `rhel.9` VirtualMachine preference by expressing the requested vCPU count as sockets, matching the preference CPU topology.
+- This resolves `insufficient CPU resources of 0 vCPU ... preference requires 1 vCPU provided as sockets` while retaining the RHEL 9 preference and the existing 2-vCPU lab size.
+
+# 1.4.23 - 2026-08-17
+
+- Correct the 1.4.22 primary-CUDN regression that removed `subnets`/IPAM and caused the API 422 `Subnets is required with ipam.mode is Enabled or unset`. OpenShift 4.22 primary Layer2 CUDNs keep OVN IPAM enabled and require a subnet.
+- Restore `10.50.50.0/24`, `ipam.mode: Enabled`, and `ipam.lifecycle: Persistent` on the EVPN CUDN. Preserve the site-specific gateway and infrastructure ranges.
+- Make the requested proof addresses deterministic without conflicting independent cluster allocators: SW1 reserves every workload address except `10.50.50.50`; C1 reserves every workload address except `10.50.50.150`.
+- Change the proof VMs to obtain the primary-UDN address with DHCP and verify that KubeVirt reports exactly the expected persistent address before declaring the VM ready.
+- Harden immutable CUDN reconciliation so a missing CUDN is recreated, an old/mismatched empty CUDN is safely replaced, and an already-correct CUDN remains idempotent after proof VMs exist.
+- Keep the 1.4.22 fabric-router `ip nht resolve-via-default` and EVPN next-hop preservation fixes unchanged.
+
+# 1.4.22 - 2026-08-17
+
+- Fix the EVPN proof path end-to-end: `make deploy` now invokes `playbooks/08a_test_vms.yml`, and `make test-vms` is available for a focused rerun.
+- Replace per-cluster OVN IPAM on the stretched Layer-2 CUDN with manual static addressing. Existing legacy `evpn-vm-net` objects are detected and safely recreated only when the `evpn-vms` namespace contains no VMs/VMIs.
+- Create dedicated EVPN proof VMs `rhel9-sw1` (`10.50.50.50/24`, MAC `02:50:50:00:00:11`) and `rhel9-c1` (`10.50.50.150/24`, MAC `02:50:50:00:00:21`) on the primary EVPN CUDN with KubeVirt `l2bridge` binding.
+- Fix the stale proof-VM gate that referenced nonexistent `evpn.apply`; fabric-router and self-managed modes can now create proof VMs directly, while external mode still requires `EVPN_FABRIC_CONFIRMED=true`.
+- Persist `ip nht resolve-via-default` in the auto-provisioned FRR fabric-router configuration so public OpenShift VTEP nexthops remain valid when reached through the default route. The fabric-router role now also reconciles and saves these critical FRR settings over SSH on an already-owned router, so an existing lab does not require a rebuild. The EVPN neighbor configuration continues to preserve the original next hop so VXLAN UDP/4789 stays direct between SNOs.
+- Include the 1.4.21 FRR cleanup ordering/CRD-awareness fix so this patch applies cleanly to the unmodified 1.4.20 repository.
+
+# 1.4.21 - 2026-08-17
+
+- Fix `make deploy` failing in fabric-router EVPN cleanup with `Failed to find exact match for frrk8s.metallb.io/v1beta1.FRRConfiguration` on clusters where the FRR routing capability has not yet created the `FRRConfiguration` CRD.
+- Reorder EVPN platform prerequisite reconciliation ahead of legacy FRR cleanup so OpenShift can enable FRR/route advertisements and publish the required CRDs before custom resources are addressed.
+- Make legacy diagnostic cleanup explicitly CRD-aware: `direct-evpn-fabric` and `pnap-bgp-test` are deleted only when `frrconfigurations.frrk8s.metallb.io` is present.
+
 # 1.4.20 - 2026-08-13
 
 - Require at least two physical storage devices for dynamically selected SNO server SKUs when LVMS is enabled, preventing one-disk shapes such as the current C1 server from being selected for new deployments.

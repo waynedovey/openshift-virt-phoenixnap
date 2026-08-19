@@ -5,8 +5,10 @@
     evpn_peer_address: >-
       {{ evpn.transport.addresses['c1' if site_item.key == 'sw1' else 'sw1']
          if evpn.fabric_mode == 'self-managed-vxlan'
-         else (evpn_fabric_router_address
-               if evpn.fabric_mode == 'fabric-router'
+         else ((evpn_embedded_router_local_address
+                if site_item.key == evpn.embedded_router.site
+                else evpn_embedded_router_public_address)
+               if evpn.fabric_mode == 'embedded-router'
                else evpn.peers[site_item.key]) }}
 
 - name: Get FRR-K8s pods for BGP verification
@@ -103,7 +105,7 @@
     fail_msg: >-
       {{ site_item.key }} cannot reach {{ evpn_peer_address }} through the legacy
       outer VXLAN VNI {{ evpn.transport.vni }} / UDP{{ evpn.transport.udp_port }}.
-      Use fabric-router mode on the tested PHX/ASH lab instead of changing BGP.
+      Use embedded-router mode on the tested PHX/ASH lab instead of changing BGP.
   when: evpn.fabric_mode == 'self-managed-vxlan'
 
 - name: Wait for base BGP session to the EVPN fabric peer
@@ -138,11 +140,11 @@
     fail_msg: >-
       {{ site_item.key }} BGP to {{ evpn_peer_address }} did not establish.
       {{ evpn_bgp_state_summary }}; {{ evpn_bgp_reset_summary }}.
-      {% if evpn.fabric_mode == 'fabric-router' %}
-      Verify that the FRR fabric router is listening on TCP/179, that its client
-      definition uses {{ evpn_site_public_ips[site_item.key] }} AS{{ site_item.value.bgp_asn }},
+      {% if evpn.fabric_mode == 'embedded-router' %}
+      Verify that the embedded FRR route server is reachable at {{ evpn_peer_address }}:{{ evpn.embedded_router.listener_port }},
+      that it sees the client as {{ evpn_site_public_ips[site_item.key] }} AS{{ site_item.value.bgp_asn }},
       and that the same BGP password is configured on both ends. OpenShift FRR-K8s
-      is an active dialer and intentionally does not listen on TCP/179.
+      is an active dialer and intentionally does not provide the passive listener.
       {% elif evpn.fabric_mode == 'self-managed-vxlan' %}
       The legacy nested carrier must pass traffic before BGP can establish.
       {% else %}
@@ -153,7 +155,7 @@
   ansible.builtin.debug:
     msg: >-
       {{ site_item.key }} base BGP is Established to {{ evpn_peer_address }}.
-      {% if evpn.fabric_mode == 'fabric-router' %}
-      The fabric router is the MP-BGP control-plane rendezvous; VXLAN traffic is
-      not sent through the fabric router.
+      {% if evpn.fabric_mode == 'embedded-router' %}
+      The embedded route server is the MP-BGP control-plane rendezvous; VXLAN
+      traffic remains direct between the SNO public VTEPs.
       {% endif %}

@@ -32,7 +32,7 @@
           - rhacm.existing_hub | bool
           - rhacm.api | length > 0
           - phoenixnap.auto_select.max_hourly_price | float > 0
-          - phoenixnap.auto_select.max_hourly_price | float <= 0.30
+          - phoenixnap.auto_select.max_hourly_price | float <= 0.40
           - phoenixnap.auto_select.min_ram_gb | int >= 32
           - phoenixnap.auto_select.min_cores | int >= 4
           - phoenixnap.network_type == 'PUBLIC_AND_PRIVATE'
@@ -41,35 +41,56 @@
           - evpn.vm_subnet | length > 0
           - sites.sw1.private_l2.cidr != sites.c1.private_l2.cidr
           - vm_l2.network_name | length > 0
-          - evpn.fabric_mode in ['fabric-router', 'external', 'self-managed-vxlan']
+          - evpn.fabric_mode in ['embedded-router', 'external', 'self-managed-vxlan']
           - evpn.fabric_mode != 'self-managed-vxlan' or evpn.transport.vni | int != evpn.vni | int
           - evpn.fabric_mode != 'self-managed-vxlan' or evpn.transport.udp_port | int > 0
           - evpn.fabric_mode != 'self-managed-vxlan' or evpn.transport.udp_port | int <= 65535
           - evpn.fabric_mode != 'self-managed-vxlan' or evpn.transport.udp_port | int != 4789
           - evpn.fabric_mode != 'self-managed-vxlan' or evpn.vm_mtu | int <= (evpn.transport.mtu | int - 50)
           - evpn.fabric_mode != 'self-managed-vxlan' or evpn.transport.addresses.sw1 != evpn.transport.addresses.c1
-          - evpn.fabric_mode != 'fabric-router' or evpn.fabric_router.asn | int > 0
-          - evpn.fabric_mode != 'fabric-router' or evpn.fabric_router.auto_select.max_hourly_price | float > 0
-          - evpn.fabric_mode != 'fabric-router' or evpn.fabric_router.auto_select.max_hourly_price | float <= 0.30
-          - evpn.fabric_mode != 'fabric-router' or evpn.fabric_router.auto_provision | bool or evpn.fabric_router.address | length > 0
-          - evpn.fabric_mode != 'fabric-router' or evpn.fabric_router.auto_provision | bool or not (evpn.bgp_auth.enabled | bool) or evpn.fabric_router.password | length > 0
-          - evpn.addressing.sw1.default_gateway != evpn.addressing.c1.default_gateway
-          - evpn.addressing.sw1.infrastructure_subnet != evpn.addressing.c1.infrastructure_subnet
-          - evpn.addressing.sw1.reserved_subnets != evpn.addressing.c1.reserved_subnets
+          - evpn.fabric_mode != 'embedded-router' or evpn.embedded_router.enabled | bool
+          - evpn.fabric_mode != 'embedded-router' or evpn.embedded_router.site in sites.keys()
+          - evpn.fabric_mode != 'embedded-router' or evpn.embedded_router.asn | int > 0
+          - evpn.fabric_mode != 'embedded-router' or evpn.embedded_router.asn | int != sites.sw1.bgp_asn | int
+          - evpn.fabric_mode != 'embedded-router' or evpn.embedded_router.asn | int != sites.c1.bgp_asn | int
+          - evpn.fabric_mode != 'embedded-router' or evpn.embedded_router.listener_port | int > 1024
+          - evpn.fabric_mode != 'embedded-router' or evpn.embedded_router.listener_port | int <= 16384
+          - evpn.fabric_mode != 'embedded-router' or evpn.embedded_router.image | length > 0
+          - evpn.fabric_mode != 'embedded-router' or evpn.embedded_router.service_name | length > 0
+          - evpn.fabric_mode != 'embedded-router' or evpn.embedded_router.namespace | length > 0
           - sites.sw1.bgp_asn | int != sites.c1.bgp_asn | int
+          - not (evpn_test_vms.enabled | bool) or evpn_test_vms.ips.sw1 | length > 0
+          - not (evpn_test_vms.enabled | bool) or evpn_test_vms.ips.c1 | length > 0
+          - not (evpn_test_vms.enabled | bool) or evpn_test_vms.ips.sw1 != evpn_test_vms.ips.c1
+          - not (evpn_test_vms.enabled | bool) or evpn_test_vms.macs.sw1 != evpn_test_vms.macs.c1
+          - not (evpn_test_vms.enabled | bool) or evpn_test_vms.storage_class == ('lvms-' ~ lvm_storage.device_class)
+          - not (evpn_test_vms.enabled | bool) or evpn.addressing.sw1.default_gateway | length > 0
+          - not (evpn_test_vms.enabled | bool) or evpn.addressing.c1.default_gateway | length > 0
+          - not (evpn_test_vms.enabled | bool) or evpn.addressing.sw1.infrastructure_subnet | length > 0
+          - not (evpn_test_vms.enabled | bool) or evpn.addressing.c1.infrastructure_subnet | length > 0
+          - not (evpn_test_vms.enabled | bool) or evpn.addressing.sw1.reserved_subnets | length > 0
+          - not (evpn_test_vms.enabled | bool) or evpn.addressing.c1.reserved_subnets | length > 0
         fail_msg: "Review inventories/lab/group_vars/all.yml."
 
     - name: Explain EVPN deployment behavior
       ansible.builtin.debug:
         msg: >-
           EVPN platform_apply={{ evpn.platform_apply | default(true) }},
+          requested_fabric_mode={{ evpn.requested_fabric_mode | default(evpn.fabric_mode) }},
           fabric_mode={{ evpn.fabric_mode }},
           fabric_required={{ evpn.fabric_required | default(false) }}.
-          {% if evpn.fabric_mode == 'fabric-router' %}
-          SW1 and C1 will actively dial one FRR EVPN fabric router (AS{{ evpn.fabric_router.asn }}).
-          The fabric router carries only MP-BGP control-plane traffic; OpenShift VNI
-          {{ evpn.vni }} uses direct UDP/4789 between the SNO public VTEPs.
-          auto_provision={{ evpn.fabric_router.auto_provision | bool }}.
+          {% if (evpn.requested_fabric_mode | default(evpn.fabric_mode)) == 'fabric-router' %}
+          Legacy EVPN_FABRIC_MODE=fabric-router was detected and normalized to
+          embedded-router; no third phoenixNAP server will be created.
+          {% endif %}
+          {% if evpn.fabric_mode == 'embedded-router' %}
+          SW1 and C1 actively dial an FRR EVPN route-server pod running on the existing
+          {{ evpn.embedded_router.site | upper }} SNO (AS{{ evpn.embedded_router.asn }}).
+          The local SNO reaches it through a ClusterIP Service; the remote SNO reaches
+          TCP/{{ evpn.embedded_router.listener_port }} on the hosting SNO public IP.
+          The route server carries MP-BGP EVPN control-plane traffic only; OpenShift
+          VNI {{ evpn.vni }} VXLAN stays direct between the SNO public VTEPs. No third
+          phoenixNAP server is provisioned.
           {% elif evpn.fabric_mode == 'self-managed-vxlan' %}
           LEGACY mode: build a {{ sites.sw1.location }}<->{{ sites.c1.location }} outer
           VXLAN carrier over UDP/{{ evpn.transport.udp_port }}. This mode is retained

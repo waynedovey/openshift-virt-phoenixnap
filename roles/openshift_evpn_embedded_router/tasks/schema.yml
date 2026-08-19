@@ -1,0 +1,49 @@
+---
+- name: Read live FRRConfiguration CRD schema on {{ schema_site.key }}
+  kubernetes.core.k8s_info:
+    kubeconfig: "artifacts/kubeconfigs/{{ schema_site.value.cluster_name }}.kubeconfig"
+    api_version: apiextensions.k8s.io/v1
+    kind: CustomResourceDefinition
+    name: frrconfigurations.frrk8s.metallb.io
+  register: evpn_embedded_schema_crd
+
+- name: Require FRRConfiguration CRD on {{ schema_site.key }}
+  ansible.builtin.assert:
+    that:
+      - evpn_embedded_schema_crd.resources | length == 1
+      - >-
+        (evpn_embedded_schema_crd.resources[0].spec.versions
+          | selectattr('served', 'equalto', true)
+          | list | length) > 0
+    fail_msg: >-
+      {{ schema_site.key }} does not expose a served FRRConfiguration CRD.
+      Refusing to replace a working EVPN peer.
+
+- name: Select served FRRConfiguration schema on {{ schema_site.key }}
+  ansible.builtin.set_fact:
+    evpn_embedded_served_schema: >-
+      {{ evpn_embedded_schema_crd.resources[0].spec.versions
+         | selectattr('served', 'equalto', true)
+         | list | first }}
+
+# Use bracket notation for every OpenAPI map lookup. In Jinja/Ansible, dotted
+# access to the literal key `items` resolves to the Python dict.items method,
+# which caused `object of type 'method' has no attribute 'properties'` on the
+# live FRRConfiguration schema.
+- name: Publish live FRR neighbor properties on {{ schema_site.key }}
+  ansible.builtin.set_fact:
+    evpn_embedded_neighbor_properties: >-
+      {{ evpn_embedded_served_schema['schema']['openAPIV3Schema']['properties']['spec']['properties']['bgp']['properties']['routers']['items']['properties']['neighbors']['items']['properties'] }}
+
+- name: Require custom BGP port and source address on {{ schema_site.key }}
+  ansible.builtin.assert:
+    that:
+      - "'port' in evpn_embedded_neighbor_properties"
+      - "'sourceaddress' in evpn_embedded_neighbor_properties"
+      - evpn_embedded_neighbor_properties['port']['type'] | default('') == 'integer'
+      - evpn_embedded_neighbor_properties['sourceaddress']['type'] | default('') == 'string'
+    fail_msg: >-
+      {{ schema_site.key }} live FRRConfiguration CRD does not expose the
+      neighbor.port + neighbor.sourceaddress combination required by the
+      embedded route-server migration. The canonical working EVPN peer has not
+      been changed and the legacy third server must remain running.

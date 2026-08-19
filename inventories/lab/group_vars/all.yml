@@ -41,7 +41,7 @@ phoenixnap:
     enabled: true
     # Strictly less than this amount per server, per hour. Pricing is read live
     # from the phoenixNAP Billing /products endpoint at execution time.
-    max_hourly_price: 0.30
+    max_hourly_price: 0.40
     # Hard minimum for this OpenShift Virtualization lab.
     min_ram_gb: 64
     min_cores: 6
@@ -56,6 +56,11 @@ phoenixnap:
     prefer_common_sku: true
     require_common_sku: false
     show_top_candidates: 8
+    # Treat the native-iPXE-capable phoenixNAP regions as a capacity pool.
+    # If a configured/default region is out of stock, try every supported region
+    # before failing. The two SNOs must still land in different regions.
+    try_all_supported_locations: true
+    min_distinct_locations: 2
   # Public management/iPXE plus an explicit site-local private L2 VLAN.
   # The private network list itself is USER_DEFINED in networkConfiguration.
   network_type: PUBLIC_AND_PRIVATE
@@ -73,6 +78,10 @@ phoenixnap:
       - PHX
       - ASH
       - NLD
+    location_labels:
+      PHX: "US SW1"
+      ASH: "US E1"
+      NLD: "EU W1"
     configure_lacp_bond: true
     bond_name: bond0
     bond_mode: 802.3ad
@@ -129,7 +138,7 @@ sites:
     host_prefix: 23
     service_network: 172.30.0.0/16
     bgp_asn: 65011
-    # Legacy/external-provider dummy VTEP. fabric-router mode derives the public IP instead.
+    # Legacy/external-provider dummy VTEP. embedded-router mode derives the public IP instead.
     vtep_ip: 10.255.50.11
     private_l2:
       name: ocp-sw1-vm-l2
@@ -148,7 +157,7 @@ sites:
     host_prefix: 23
     service_network: 172.31.0.0/16
     bgp_asn: 65021
-    # Legacy/external-provider dummy VTEP. fabric-router mode derives the public IP instead.
+    # Legacy/external-provider dummy VTEP. embedded-router mode derives the public IP instead.
     vtep_ip: 10.255.50.21
     private_l2:
       name: ocp-c1-vm-l2
@@ -233,54 +242,59 @@ vm_l2:
 
 # OpenShift EVPN platform enablement is part of `make deploy`.
 #
-# The default fabric mode is now an external eBGP EVPN fabric router. Live
-# testing proved two important constraints in this lab:
-#   * phoenixNAP BGP Peer Groups establish IPv4 BGP but do not negotiate
-#     L2VPN EVPN.
-#   * OpenShift FRR-K8s starts bgpd with -p 0, so two FRR-K8s speakers cannot
-#     be used as each other's passive TCP/179 fabric peer.
+# OpenShift FRR-K8s is an active BGP dialer and its bgpd is intentionally
+# started without a passive TCP/179 listener. That means the two SNO FRR-K8s
+# speakers cannot simply be pointed at each other as direct BGP servers.
 #
-# A small FRR fabric router solves the control-plane problem while the actual
-# OpenShift VXLAN data plane stays direct between the two SNO public IPs on
-# UDP/4789. It is intentionally a normal eBGP transit router, not a transparent
-# transparent route-server semantics: AS65000 is prepended, while the EVPN next-hop is preserved.
+# The default lab therefore keeps the small EVPN rendezvous function, but runs
+# it as an FRR pod on the existing SW1 SNO instead of provisioning a third
+# phoenixNAP server. Both OpenShift speakers actively dial that embedded FRR
+# listener; VNI 5050 VXLAN data traffic remains direct PHX<->ASH on UDP/4789.
 evpn:
   enabled: true
   platform_apply: true
   fabric_required: true
-  fabric_mode: "{{ lookup('env', 'EVPN_FABRIC_MODE') | default('fabric-router', true) }}"
+  # Backward compatibility: older checkouts commonly left
+  # EVPN_FABRIC_MODE=fabric-router or direct-peering in the user's shell/.env.
+  # Both older experiments are normalized to embedded-router so an in-place
+  # upgrade cannot recreate a third server or retry the non-listening TCP/179 path.
+  requested_fabric_mode: "{{ lookup('env', 'EVPN_FABRIC_MODE') | default('embedded-router', true) }}"
+  fabric_mode: >-
+    {{ 'embedded-router'
+       if (lookup('env', 'EVPN_FABRIC_MODE') | default('embedded-router', true)) in ['fabric-router', 'direct-peering']
+       else (lookup('env', 'EVPN_FABRIC_MODE') | default('embedded-router', true)) }}
 
   namespace: evpn-vms
   network_name: evpn-vm-net
   vm_subnet: 10.50.50.0/24
   vm_mtu: 1400
 
-  # OpenShift EVPN data plane. In fabric-router mode the existing public
-  # br-ex IPv4 address on each SNO is used as the unmanaged VTEP, with an
-  # exact /32 VTEP CIDR. Red Hat documents the dummy-interface pattern as a
-  # recommendation for redundant fabric peering, not a requirement.
+  # The SNO public br-ex IPv4 addresses remain the unmanaged VTEPs. The
+  # embedded FRR pod is control-plane only and never becomes a VXLAN endpoint.
   vni: 5050
   route_target: "65000:5050"
   legacy_vtep_cidr: 10.255.50.0/24
 
-  # Default lab fabric. The fabric router carries only MP-BGP EVPN
-  # control-plane traffic. VXLAN VNI 5050 / UDP 4789 remains direct PHX<->ASH.
-  fabric_router:
-    auto_provision: "{{ lookup('env', 'EVPN_FR_AUTO_PROVISION') | default('false', true) | bool }}"
-    address: "{{ lookup('env', 'EVPN_FR_ADDRESS') | default('', true) }}"
-    asn: "{{ lookup('env', 'EVPN_FR_ASN') | default('65000', true) | int }}"
-    router_id: "{{ lookup('env', 'EVPN_FR_ROUTER_ID') | default('10.255.255.1', true) }}"
-    hostname: "{{ lookup('env', 'EVPN_FR_HOSTNAME') | default('evpn-fr.' ~ base_domain, true) }}"
-    location: "{{ lookup('env', 'EVPN_FR_LOCATION') | default('PHX', true) }}"
-    os: "{{ lookup('env', 'EVPN_FR_OS') | default('ubuntu/jammy', true) }}"
-    password: "{{ lookup('env', 'EVPN_FR_BGP_PASSWORD') | default('', true) }}"
-    auto_select:
-      max_hourly_price: "{{ lookup('env', 'EVPN_FR_MAX_HOURLY_PRICE') | default('0.30', true) | float }}"
-      min_ram_gb: 8
-      min_cores: 2
-      preferred_ram_gb: 16
-      preferred_cores: 2
-      show_top_candidates: 5
+  # Default two-site control plane. A small FRR route-server pod runs on the
+  # selected existing SNO instead of a third phoenixNAP server. The hosting
+  # Both FRR-K8s speakers dial the hosting SNO public IP on TCP/1179 from their
+  # own public VTEP addresses. The route-server pod uses hostNetwork so BGP
+  # TCP-MD5 does not cross Kubernetes Service/hostPort NAT. A ClusterIP Service
+  # is retained only for health/discovery, not as a BGP peer endpoint. The live
+  # 4.22 FRRConfiguration CRD
+  # is checked for both `port` and `sourceaddress` before any working legacy peer
+  # is replaced.
+  embedded_router:
+    enabled: true
+    site: "{{ lookup('env', 'EVPN_EMBEDDED_ROUTER_SITE') | default('sw1', true) }}"
+    namespace: evpn-fabric-system
+    name: evpn-route-server
+    asn: "{{ lookup('env', 'EVPN_EMBEDDED_ROUTER_ASN') | default('65000', true) | int }}"
+    router_id: "{{ lookup('env', 'EVPN_EMBEDDED_ROUTER_ID') | default('10.255.255.1', true) }}"
+    service_name: evpn-route-server
+    listener_port: "{{ lookup('env', 'EVPN_EMBEDDED_ROUTER_PORT') | default('1179', true) | int }}"
+    image: "{{ lookup('env', 'EVPN_EMBEDDED_ROUTER_IMAGE') | default('quay.io/frrouting/frr:10.4.1', true) }}"
+    retire_legacy_server: "{{ lookup('env', 'EVPN_RETIRE_LEGACY_FR_SERVER') | default('true', true) | bool }}"
 
   bgp_auth:
     enabled: "{{ lookup('env', 'EVPN_BGP_AUTH_ENABLED') | default('true', true) | bool }}"
@@ -307,20 +321,59 @@ evpn:
       sw1: 192.168.254.1
       c1: 192.168.254.2
 
-  # Each cluster has its own OVN IPAM database. Keep one shared /24 and split
-  # automatic allocations/gateway infrastructure by site to prevent duplicate
-  # addresses while preserving one Layer-2 EVPN segment.
+  # A primary Layer2 CUDN requires OVN IPAM in OpenShift 4.22. Both clusters
+  # therefore keep the same stretched /24, but each independent IPAM database
+  # is constrained to exactly one proof-VM address. infrastructure_subnet keeps
+  # OVN's internal addresses out of the workload pool; reserved_subnets excludes
+  # every other workload address (including the opposite site's half). With
+  # lifecycle=Persistent, rhel9-sw1 is deterministically allocated .50 and
+  # rhel9-c1 .150 and those allocations survive VM restarts/live migration.
   addressing:
     sw1:
       default_gateway: 10.50.50.1
       infrastructure_subnet: 10.50.50.0/28
       reserved_subnets:
+        - 10.50.50.16/28
+        - 10.50.50.32/28
+        - 10.50.50.48/31
+        - 10.50.50.51/32
+        - 10.50.50.52/30
+        - 10.50.50.56/29
+        - 10.50.50.64/26
         - 10.50.50.128/25
     c1:
       default_gateway: 10.50.50.129
       infrastructure_subnet: 10.50.50.128/28
       reserved_subnets:
         - 10.50.50.0/25
+        - 10.50.50.144/30
+        - 10.50.50.148/31
+        - 10.50.50.151/32
+        - 10.50.50.152/29
+        - 10.50.50.160/27
+        - 10.50.50.192/26
+
+evpn_test_vms:
+  enabled: "{{ lookup('env', 'EVPN_TEST_VMS_ENABLED') | default('true', true) | bool }}"
+  apply: "{{ lookup('env', 'EVPN_TEST_VMS_APPLY') | default('true', true) | bool }}"
+  # Bump when first-boot/cloud-init content changes. Existing proof VMs are disposable
+  # and will be recreated automatically so the new cloud-init actually runs.
+  bootstrap_revision: "2"
+  console_user: cloud-user
+  console_password: "{{ lookup('env', 'EVPN_TEST_VM_PASSWORD') | default('redhat', true) }}"
+  ips:
+    sw1: 10.50.50.50/24
+    c1: 10.50.50.150/24
+  macs:
+    sw1: "02:50:50:00:00:11"
+    c1: "02:50:50:00:00:21"
+  storage_class: lvms-vg1
+  image_datasource: rhel9
+  image_namespace: openshift-virtualization-os-images
+  disk_size: 40Gi
+  cpu_cores: 2
+  memory: 4Gi
+  peer_check_seconds: 15
 
 wait:
   server_seconds: 1800

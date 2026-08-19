@@ -7,7 +7,7 @@ ANSIBLE_GALAXY := $(VENV)/bin/ansible-galaxy
 ANSIBLE_LINT := $(VENV)/bin/ansible-lint
 PROJECT_VERSION := $(shell cat VERSION 2>/dev/null || echo unknown)
 
-.PHONY: version bootstrap validate availability preflight prepare-hub private-networks bgp replace-servers replace-site provision dns install storage virt nmstate vm-l2 evpn-fabric-router evpn status deploy destroy lint clean-venv
+.PHONY: version bootstrap validate availability preflight prepare-hub private-networks bgp replace-servers replace-site provision dns install storage virt nmstate vm-l2 evpn-router evpn evpn-migrate evpn-retire-legacy test-vms status deploy destroy lint clean-venv
 
 $(ANSIBLE_PLAYBOOK): requirements.txt requirements.yml
 	$(PYTHON) -m venv $(VENV)
@@ -70,11 +70,25 @@ nmstate: $(ANSIBLE_PLAYBOOK)
 vm-l2: $(ANSIBLE_PLAYBOOK)
 	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) playbooks/07c_vm_localnet.yml
 
-evpn-fabric-router: $(ANSIBLE_PLAYBOOK)
-	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) playbooks/07d_evpn_fabric_router.yml
+evpn-router: $(ANSIBLE_PLAYBOOK)
+	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) playbooks/07d_evpn_embedded_router.yml
 
 evpn: $(ANSIBLE_PLAYBOOK)
+	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) playbooks/07d_evpn_embedded_router.yml
 	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) playbooks/08_evpn.yml
+
+evpn-retire-legacy: $(ANSIBLE_PLAYBOOK)
+	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) playbooks/08b_retire_legacy_fabric_router.yml
+
+evpn-migrate: $(ANSIBLE_PLAYBOOK)
+	@echo "Migrating EVPN control plane off the third phoenixNAP server..."
+	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) playbooks/07d_evpn_embedded_router.yml
+	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) playbooks/08_evpn.yml
+	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) playbooks/08b_retire_legacy_fabric_router.yml
+	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) playbooks/09_status.yml
+
+test-vms: $(ANSIBLE_PLAYBOOK)
+	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) playbooks/08a_test_vms.yml
 
 status: $(ANSIBLE_PLAYBOOK)
 	$(ANSIBLE_PLAYBOOK) -i $(INVENTORY) playbooks/09_status.yml

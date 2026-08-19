@@ -12,6 +12,7 @@ write_files:
       hostname evpn-fabric-router
       log syslog informational
       service integrated-vtysh-config
+      ip nht resolve-via-default
       !
       router bgp {{ evpn.fabric_router.asn | int }}
        bgp router-id {{ evpn.fabric_router.router_id }}

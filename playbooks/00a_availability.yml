@@ -47,10 +47,10 @@
       ansible.builtin.debug:
         msg: >-
           {% if pnap_selected_skus[item.key].reusedExisting | default(false) | bool %}
-          {{ item.key | upper }}: REUSE {{ pnap_selected_skus[item.key].productCode }} already deployed in {{ item.value.location }}.
+          {{ item.key | upper }}: REUSE {{ pnap_selected_skus[item.key].productCode }} already deployed in {{ pnap_selected_skus[item.key].location }}.
           {% else %}
           {{ item.key | upper }}: SELECT {{ pnap_selected_skus[item.key].productCode }} @
-          ${{ '%.3f' | format(pnap_selected_skus[item.key].hourlyPrice | float) }}/h in {{ item.value.location }}.
+          ${{ '%.3f' | format(pnap_selected_skus[item.key].hourlyPrice | float) }}/h in {{ pnap_selected_skus[item.key].location }}.
           {% endif %}
       loop: "{{ sites | dict2items }}"
       loop_control:

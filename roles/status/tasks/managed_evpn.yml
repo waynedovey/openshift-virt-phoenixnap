@@ -52,7 +52,7 @@
       ansible.builtin.debug:
         msg: >-
           {{ site_item.key }} EVPN:
-          transit={{ ('legacy-cleanup-policy' if status_evpn_transit.resources | length else 'not-required') if evpn.fabric_mode == 'fabric-router' else ('present' if status_evpn_transit.resources | length else 'missing') }},
+          transit={{ ('legacy-cleanup-policy' if status_evpn_transit.resources | length else 'not-required') if evpn.fabric_mode == 'embedded-router' else ('present' if status_evpn_transit.resources | length else 'missing') }},
           VTEP={{ (status_evpn_vtep.resources[0].status.conditions | default([])
             | selectattr('type', 'equalto', 'Accepted')
             | map(attribute='status') | first | default('unknown')) if status_evpn_vtep.resources | length else 'missing' }},

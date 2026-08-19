@@ -105,5 +105,30 @@ class SelectorStoragePolicyTests(unittest.TestCase):
         self.assertEqual(candidates[0]["storageDeviceCount"], 2)
 
 
+class MultiRegionSelectorTests(unittest.TestCase):
+    def test_parse_site_accepts_region_pool(self):
+        name, locations = select_pnap_sku.parse_site("c1=ASH,NLD,PHX,ASH")
+        self.assertEqual(name, "c1")
+        self.assertEqual(locations, ["ASH", "NLD", "PHX"])
+
+    def test_choose_distinct_regions_prefers_common_sku(self):
+        candidates = {
+            "sw1": [
+                {"productCode": "common", "location": "PHX", "hourlyPrice": 0.20, "ramInGb": 64, "cores": 8},
+                {"productCode": "other", "location": "ASH", "hourlyPrice": 0.18, "ramInGb": 64, "cores": 8},
+            ],
+            "c1": [
+                {"productCode": "common", "location": "ASH", "hourlyPrice": 0.21, "ramInGb": 64, "cores": 8},
+                {"productCode": "other", "location": "PHX", "hourlyPrice": 0.17, "ramInGb": 64, "cores": 8},
+            ],
+        }
+        selected, used_common = select_pnap_sku.choose_distinct_combo(
+            ["sw1", "c1"], candidates, 64, 8, True, False
+        )
+        self.assertTrue(used_common)
+        self.assertEqual(selected["sw1"]["productCode"], selected["c1"]["productCode"])
+        self.assertNotEqual(selected["sw1"]["location"], selected["c1"]["location"])
+
+
 if __name__ == "__main__":
     unittest.main()

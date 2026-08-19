@@ -5,24 +5,108 @@
     evpn_peer_address: >-
       {{ evpn.transport.addresses['c1' if site_item.key == 'sw1' else 'sw1']
          if evpn.fabric_mode == 'self-managed-vxlan'
-         else (evpn_fabric_router_address
-               if evpn.fabric_mode == 'fabric-router'
+         else ((evpn_embedded_router_local_address
+                if site_item.key == evpn.embedded_router.site
+                else evpn_embedded_router_public_address)
+               if evpn.fabric_mode == 'embedded-router'
                else evpn.peers[site_item.key]) }}
     evpn_peer_asn_effective: >-
       {{ sites['c1' if site_item.key == 'sw1' else 'sw1'].bgp_asn
          if evpn.fabric_mode == 'self-managed-vxlan'
-         else (evpn.fabric_router.asn
-               if evpn.fabric_mode == 'fabric-router'
+         else (evpn.embedded_router.asn
+               if evpn.fabric_mode == 'embedded-router'
                else evpn.peer_asn) }}
     evpn_effective_vtep_ip: >-
       {{ evpn_site_public_ips[site_item.key]
-         if evpn.fabric_mode == 'fabric-router'
+         if evpn.fabric_mode == 'embedded-router'
          else site_item.value.vtep_ip }}
     evpn_effective_vtep_cidr: >-
       {{ evpn_site_public_ips[site_item.key] ~ '/32'
-         if evpn.fabric_mode == 'fabric-router'
+         if evpn.fabric_mode == 'embedded-router'
          else evpn.legacy_vtep_cidr }}
     evpn_site_addressing: "{{ evpn.addressing[site_item.key] }}"
+
+- name: Read existing EVPN ClusterUserDefinedNetwork before immutable reconciliation
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: k8s.ovn.org/v1
+    kind: ClusterUserDefinedNetwork
+    name: "{{ evpn.network_name }}"
+  register: evpn_existing_cudn
+
+- name: Publish existing immutable EVPN CUDN fields
+  ansible.builtin.set_fact:
+    evpn_existing_network: >-
+      {{ evpn_existing_cudn.resources[0].spec.network
+         if evpn_existing_cudn.resources | length == 1 else {} }}
+    evpn_existing_layer2: >-
+      {{ evpn_existing_cudn.resources[0].spec.network.layer2
+         if evpn_existing_cudn.resources | length == 1 else {} }}
+    evpn_existing_evpn: >-
+      {{ evpn_existing_cudn.resources[0].spec.network.evpn
+         if evpn_existing_cudn.resources | length == 1 else {} }}
+
+- name: Detect immutable EVPN CUDN drift
+  ansible.builtin.set_fact:
+    evpn_cudn_requires_recreate: >-
+      {{
+        evpn_existing_cudn.resources | length == 1 and
+        (
+          evpn_existing_network.get('topology', '') != 'Layer2' or
+          evpn_existing_network.get('transport', '') != 'EVPN' or
+          evpn_existing_layer2.get('role', '') != 'Primary' or
+          (evpn_existing_layer2.get('mtu', 0) | int) != (evpn.vm_mtu | int) or
+          evpn_existing_layer2.get('subnets', []) != [evpn.vm_subnet] or
+          (evpn_existing_layer2.get('ipam', {}).get('mode', 'Enabled')) != 'Enabled' or
+          (evpn_existing_layer2.get('ipam', {}).get('lifecycle', '')) != 'Persistent' or
+          evpn_existing_layer2.get('defaultGatewayIPs', []) != [evpn_site_addressing.default_gateway] or
+          evpn_existing_layer2.get('infrastructureSubnets', []) != [evpn_site_addressing.infrastructure_subnet] or
+          evpn_existing_layer2.get('reservedSubnets', []) != evpn_site_addressing.reserved_subnets or
+          evpn_existing_evpn.get('vtep', '') != 'evpn-vtep' or
+          (evpn_existing_evpn.get('macVRF', {}).get('vni', 0) | int) != (evpn.vni | int) or
+          evpn_existing_evpn.get('macVRF', {}).get('routeTarget', '') != evpn.route_target
+        )
+      }}
+
+- name: Read EVPN VMs before replacing immutable drifted CUDN
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: kubevirt.io/v1
+    kind: VirtualMachine
+    namespace: "{{ evpn.namespace }}"
+  register: evpn_existing_vms_before_cudn_recreate
+  when: evpn_cudn_requires_recreate | bool
+
+- name: Read running EVPN VMIs before replacing immutable drifted CUDN
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: kubevirt.io/v1
+    kind: VirtualMachineInstance
+    namespace: "{{ evpn.namespace }}"
+  register: evpn_existing_vmis_before_cudn_recreate
+  when: evpn_cudn_requires_recreate | bool
+
+- name: Require EVPN namespace to be empty before immutable CUDN replacement
+  ansible.builtin.assert:
+    that:
+      - evpn_existing_vms_before_cudn_recreate.resources | length == 0
+      - evpn_existing_vmis_before_cudn_recreate.resources | length == 0
+    fail_msg: >-
+      {{ evpn.network_name }} has immutable addressing/EVPN fields that differ from
+      the desired OpenShift 4.22 primary-CUDN layout, but {{ evpn.namespace }} contains
+      VMs/VMIs. Stop and remove the EVPN proof workloads first, then rerun make evpn.
+  when: evpn_cudn_requires_recreate | bool
+
+- name: Delete immutable drifted EVPN CUDN before recreation
+  kubernetes.core.k8s:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: k8s.ovn.org/v1
+    kind: ClusterUserDefinedNetwork
+    name: "{{ evpn.network_name }}"
+    state: absent
+    wait: true
+    wait_timeout: 300
+  when: evpn_cudn_requires_recreate | bool
 
 - name: Create shared Layer2 EVPN ClusterUserDefinedNetwork
   kubernetes.core.k8s:
@@ -133,6 +217,8 @@
       cudn: {{ evpn.network_name }}
       vm_subnet: {{ evpn.vm_subnet }}
       vm_mtu: {{ evpn.vm_mtu }}
+      ipam_mode: Enabled
+      ipam_lifecycle: Persistent
       default_gateway: {{ evpn_site_addressing.default_gateway }}
       infrastructure_subnet: {{ evpn_site_addressing.infrastructure_subnet }}
       reserved_subnets: {{ evpn_site_addressing.reserved_subnets | to_json }}

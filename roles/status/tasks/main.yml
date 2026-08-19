@@ -17,29 +17,74 @@
       {{ ((status_servers.json | selectattr('hostname', 'equalto', item.value.node_hostname) | list | first).status) | default('not-found') }}
   loop: "{{ sites | dict2items }}"
 
-- name: Check auto-provisioned EVPN fabric-router artifact
+- name: Check legacy third EVPN server ownership artifact
   ansible.builtin.stat:
     path: artifacts/evpn/fabric-router.yml
-  register: status_evpn_fr_artifact
-  when:
-    - evpn.enabled | bool
-    - evpn.fabric_mode == 'fabric-router'
-    - evpn.fabric_router.auto_provision | bool
+  register: status_evpn_legacy_fr_artifact
+  when: evpn.enabled | bool
 
-- name: Read auto-provisioned EVPN fabric-router state
+- name: Read legacy third EVPN server ownership state
   ansible.builtin.set_fact:
-    status_evpn_fr_state: "{{ lookup('ansible.builtin.file', 'artifacts/evpn/fabric-router.yml') | from_yaml }}"
+    status_evpn_legacy_fr_state: "{{ lookup('ansible.builtin.file', 'artifacts/evpn/fabric-router.yml') | from_yaml }}"
   when:
-    - status_evpn_fr_artifact.stat.exists | default(false) | bool
+    - status_evpn_legacy_fr_artifact.stat.exists | default(false) | bool
 
-- name: Show auto-provisioned EVPN fabric-router state
+- name: Show legacy third EVPN server state when ownership artifact remains
   ansible.builtin.debug:
     msg: >-
-      EVPN fabric router: {{ status_evpn_fr_state.hostname }} =
-      {{ ((status_servers.json | selectattr('id', 'equalto', status_evpn_fr_state.id) | list | first).status) | default('not-found') }},
-      public_ip={{ status_evpn_fr_state.public_ip }}, AS{{ status_evpn_fr_state.asn }}.
+      LEGACY EVPN third server: {{ status_evpn_legacy_fr_state.hostname }} =
+      {{ ((status_servers.json | selectattr('id', 'equalto', status_evpn_legacy_fr_state.id) | list | first).status) | default('not-found') }},
+      public_ip={{ status_evpn_legacy_fr_state.public_ip }}. In embedded-router mode
+      this server is no longer required; `make evpn-migrate` retires it only after
+      the replacement EVPN path is verified.
   when:
-    - status_evpn_fr_artifact.stat.exists | default(false) | bool
+    - status_evpn_legacy_fr_artifact.stat.exists | default(false) | bool
+
+- name: Read embedded EVPN route-server Deployment
+  kubernetes.core.k8s_info:
+    kubeconfig: "artifacts/kubeconfigs/{{ sites[evpn.embedded_router.site].cluster_name }}.kubeconfig"
+    api_version: apps/v1
+    kind: Deployment
+    namespace: "{{ evpn.embedded_router.namespace }}"
+    name: "{{ evpn.embedded_router.name }}"
+  register: status_evpn_embedded_deployment
+  when:
+    - evpn.enabled | bool
+    - evpn.fabric_mode == 'embedded-router'
+
+- name: Read embedded EVPN route-server Service
+  kubernetes.core.k8s_info:
+    kubeconfig: "artifacts/kubeconfigs/{{ sites[evpn.embedded_router.site].cluster_name }}.kubeconfig"
+    api_version: v1
+    kind: Service
+    namespace: "{{ evpn.embedded_router.namespace }}"
+    name: "{{ evpn.embedded_router.service_name }}"
+  register: status_evpn_embedded_service
+  when:
+    - evpn.enabled | bool
+    - evpn.fabric_mode == 'embedded-router'
+
+- name: Read embedded route-server hosting SNO state
+  ansible.builtin.set_fact:
+    status_evpn_embedded_host_state: >-
+      {{ lookup('ansible.builtin.file', 'artifacts/servers/' ~ evpn.embedded_router.site ~ '.yml') | from_yaml }}
+  when:
+    - evpn.enabled | bool
+    - evpn.fabric_mode == 'embedded-router'
+
+- name: Show embedded EVPN route-server state
+  ansible.builtin.debug:
+    msg: >-
+      Embedded EVPN route server: site={{ evpn.embedded_router.site }},
+      AS{{ evpn.embedded_router.asn }},
+      available={{ (status_evpn_embedded_deployment.resources[0].status.availableReplicas | default(0) | int) if status_evpn_embedded_deployment.resources | length else 0 }},
+      health-Service={{ (status_evpn_embedded_service.resources[0].spec.clusterIP | default('missing')) if status_evpn_embedded_service.resources | length else 'missing' }}:{{ evpn.embedded_router.listener_port }},
+      bgp-listener={{ status_evpn_embedded_host_state.public_ip }}:{{ evpn.embedded_router.listener_port }},
+      allow-martian-nexthop=enabled-for-hosting-VTEP.
+      No third phoenixNAP server is used by the active EVPN design.
+  when:
+    - evpn.enabled | bool
+    - evpn.fabric_mode == 'embedded-router'
 
 - name: List optional phoenixNAP IPv4 BGP peer groups
   ansible.builtin.uri:
@@ -75,15 +120,16 @@
   loop: "{{ sites | dict2items }}"
   register: status_aci
 
-- name: Explain fabric-router EVPN state
+- name: Explain embedded-router EVPN state
   ansible.builtin.debug:
     msg: >-
       EVPN platform_apply={{ evpn.platform_apply | default(true) }},
-      fabric_mode=fabric-router, fabric-router={{ evpn.fabric_router.address if evpn.fabric_router.address | length > 0 else 'auto-provisioned' }}
-      AS{{ evpn.fabric_router.asn }}, shared VM subnet={{ evpn.vm_subnet }}, VNI={{ evpn.vni }}.
-      MP-BGP EVPN uses the fabric router for control-plane exchange; VXLAN UDP/4789
-      remains direct between the SNO public VTEPs.
-  when: evpn.fabric_mode == 'fabric-router'
+      fabric_mode=embedded-router, route-server={{ evpn.embedded_router.site }} SNO,
+      AS{{ evpn.embedded_router.asn }}, TCP/{{ evpn.embedded_router.listener_port }},
+      shared VM subnet={{ evpn.vm_subnet }}, VNI={{ evpn.vni }}. MP-BGP EVPN uses
+      the embedded FRR pod for control-plane exchange; VXLAN UDP/4789 remains
+      direct between the SNO public VTEPs.
+  when: evpn.fabric_mode == 'embedded-router'
 
 - name: Explain legacy self-managed EVPN state
   ansible.builtin.debug:

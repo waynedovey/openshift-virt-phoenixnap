@@ -1,30 +1,33 @@
 ---
+- name: Determine whether EVPN proof VMs should be created
+  ansible.builtin.set_fact:
+    evpn_test_vms_ready: >-
+      {{
+        (evpn_test_vms.enabled | bool) and
+        (evpn_test_vms.apply | bool) and
+        (evpn.enabled | bool) and
+        (
+          evpn.fabric_mode in ['embedded-router', 'self-managed-vxlan'] or
+          (evpn.fabric_mode == 'external' and (evpn.fabric_confirmed | bool))
+        )
+      }}
+
 - name: Explain EVPN proof VM gate
   ansible.builtin.debug:
     msg: >-
-      RHEL 9 EVPN proof VMs are staged but not created because the shared
-      {{ evpn.vm_subnet }} network is not active. The two phoenixNAP Localnet VLANs
-      are site-local and cannot prove PHX-to-ASH Layer2 connectivity. Set
-      evpn.apply=true, evpn.fabric_confirmed=true and valid EVPN peers before the
-      proof VMs are created.
-  when: >-
-    not (evpn_test_vms.apply | bool and evpn.apply | bool and
-         evpn.fabric_confirmed | bool)
+      RHEL 9 EVPN proof VMs are disabled or the selected EVPN fabric is not ready.
+      enabled={{ evpn_test_vms.enabled }}, apply={{ evpn_test_vms.apply }},
+      fabric_mode={{ evpn.fabric_mode }}, external_confirmed={{ evpn.fabric_confirmed }}.
+  when: not (evpn_test_vms_ready | bool)
 
 - name: Read SSH public key for RHEL 9 proof VMs
   ansible.builtin.set_fact:
     evpn_test_vm_ssh_key: "{{ lookup('file', ssh_public_key.path) | trim }}"
-  when:
-    - evpn_test_vms.apply | bool
-    - evpn.apply | bool
-    - evpn.fabric_confirmed | bool
+  when: evpn_test_vms_ready | bool
 
 - name: Create EVPN proof VM per site
   ansible.builtin.include_tasks: site.yml
   loop: "{{ sites | dict2items }}"
   loop_control:
     loop_var: site_item
-  when:
-    - evpn_test_vms.apply | bool
-    - evpn.apply | bool
-    - evpn.fabric_confirmed | bool
+  when: evpn_test_vms_ready | bool

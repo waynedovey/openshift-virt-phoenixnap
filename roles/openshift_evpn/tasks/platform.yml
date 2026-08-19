@@ -112,11 +112,11 @@
   ansible.builtin.set_fact:
     evpn_effective_vtep_ip: >-
       {{ evpn_site_public_ips[site_item.key]
-         if evpn.fabric_mode == 'fabric-router'
+         if evpn.fabric_mode == 'embedded-router'
          else site_item.value.vtep_ip }}
     evpn_effective_vtep_cidr: >-
       {{ (evpn_site_public_ips[site_item.key] ~ '/32')
-         if evpn.fabric_mode == 'fabric-router'
+         if evpn.fabric_mode == 'embedded-router'
          else evpn.legacy_vtep_cidr }}
 
 - name: Remove legacy dummy VTEP interface when the public SNO address is the VTEP
@@ -135,7 +135,7 @@
             - name: evpn-vtep0
               type: dummy
               state: absent
-  when: evpn.fabric_mode == 'fabric-router'
+  when: evpn.fabric_mode == 'embedded-router'
 
 - name: Create dummy VTEP interface for provider/legacy fabric modes
   kubernetes.core.k8s:
@@ -161,7 +161,7 @@
                 dhcp: false
               ipv6:
                 enabled: false
-  when: evpn.fabric_mode != 'fabric-router'
+  when: evpn.fabric_mode != 'embedded-router'
 
 - name: Wait for VTEP interface policy reconciliation
   kubernetes.core.k8s_info:
@@ -213,7 +213,7 @@
   ansible.builtin.debug:
     msg: >-
       {{ site_item.key }} VTEP={{ evpn_effective_vtep_ip }} CIDR={{ evpn_effective_vtep_cidr }}.
-      {% if evpn.fabric_mode == 'fabric-router' %}
+      {% if evpn.fabric_mode == 'embedded-router' %}
       This is the existing public br-ex primary IPv4 address; OpenShift VXLAN UDP/4789
       can therefore travel directly between PHX and ASH without a nested carrier.
       {% else %}

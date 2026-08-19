@@ -1,0 +1,137 @@
+---
+- name: Set embedded BGP canary facts for site
+  ansible.builtin.set_fact:
+    evpn_canary_kubeconfig: "artifacts/kubeconfigs/{{ canary_site.value.cluster_name }}.kubeconfig"
+    # Both leaves dial the hosting public IP directly. This is the NAT-free
+    # TCP-MD5 path already proven by the authenticated v1.4.36 canaries.
+    evpn_canary_peer: "{{ evpn_embedded_public_endpoint }}"
+
+- name: Create separate BGP password Secret for migration canary
+  kubernetes.core.k8s:
+    kubeconfig: "{{ evpn_canary_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: evpn-embedded-canary-bgp-auth
+        namespace: openshift-frr-k8s
+      type: kubernetes.io/basic-auth
+      stringData:
+        username: evpn
+        password: "{{ evpn_embedded_bgp_password }}"
+  no_log: true
+  when: evpn.bgp_auth.enabled | bool
+
+- name: Build embedded BGP migration canary neighbor
+  ansible.builtin.set_fact:
+    evpn_canary_neighbor_base:
+      address: "{{ evpn_canary_peer }}"
+      asn: "{{ evpn.embedded_router.asn | int }}"
+      ebgpMultiHop: true
+      sourceaddress: "{{ evpn_embedded_public_ips[canary_site.key] }}"
+      port: "{{ evpn.embedded_router.listener_port | int }}"
+
+- name: Add authentication to embedded BGP migration canary neighbor
+  ansible.builtin.set_fact:
+    evpn_canary_neighbor: >-
+      {{ evpn_canary_neighbor_base
+         | combine({'passwordSecret': {'name': 'evpn-embedded-canary-bgp-auth'}})
+         if evpn.bgp_auth.enabled | bool
+         else evpn_canary_neighbor_base }}
+
+- name: Add embedded BGP canary without replacing working legacy peer
+  kubernetes.core.k8s:
+    kubeconfig: "{{ evpn_canary_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: frrk8s.metallb.io/v1beta1
+      kind: FRRConfiguration
+      metadata:
+        name: evpn-embedded-canary
+        namespace: openshift-frr-k8s
+      spec:
+        nodeSelector: {}
+        bgp:
+          routers:
+            - asn: "{{ canary_site.value.bgp_asn | int }}"
+              id: "{{ evpn_embedded_public_ips[canary_site.key] }}"
+              neighbors: "{{ [evpn_canary_neighbor] }}"
+
+- name: Read FRR-K8s pods for embedded BGP canary
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ evpn_canary_kubeconfig }}"
+    api_version: v1
+    kind: Pod
+    namespace: openshift-frr-k8s
+  register: evpn_canary_frr_pods
+
+- name: Build running FRR-K8s pod list for embedded BGP canary
+  ansible.builtin.set_fact:
+    evpn_canary_running_frr_pods: >-
+      {{ evpn_canary_frr_pods.resources
+         | rejectattr('metadata.name', 'search', 'statuscleaner')
+         | selectattr('status.phase', 'equalto', 'Running')
+         | list }}
+
+- name: Require running FRR-K8s daemon for embedded BGP canary
+  ansible.builtin.assert:
+    that:
+      - evpn_canary_running_frr_pods | length > 0
+
+- name: Wait for embedded BGP canary to establish
+  kubernetes.core.k8s_exec:
+    kubeconfig: "{{ evpn_canary_kubeconfig }}"
+    namespace: openshift-frr-k8s
+    pod: "{{ (evpn_canary_running_frr_pods | first).metadata.name }}"
+    container: frr
+    command: "vtysh -c 'show bgp neighbors {{ evpn_canary_peer }}'"
+  register: evpn_canary_bgp
+  until: "'BGP state = Established' in (evpn_canary_bgp.stdout | default(''))"
+  retries: 60
+  delay: 5
+  changed_when: false
+  failed_when: false
+
+- name: Extract embedded BGP canary diagnostics
+  ansible.builtin.set_fact:
+    evpn_canary_bgp_state_summary: >-
+      {{ (evpn_canary_bgp.stdout | default('')
+          | regex_search('BGP state = [^\n]+'))
+         | default('BGP state unavailable', true) }}
+    evpn_canary_bgp_reset_summary: >-
+      {{ (evpn_canary_bgp.stdout | default('')
+          | regex_search('Last reset [^\n]+'))
+         | default('Last reset unavailable', true) }}
+
+- name: Require embedded BGP canary before replacing working legacy peer
+  ansible.builtin.assert:
+    that:
+      - "'BGP state = Established' in (evpn_canary_bgp.stdout | default(''))"
+    fail_msg: >-
+      {{ canary_site.key }} could not establish the non-disruptive BGP canary to
+      {{ evpn_canary_peer }}:{{ evpn.embedded_router.listener_port }} using source
+      {{ evpn_embedded_public_ips[canary_site.key] }}.
+      {{ evpn_canary_bgp_state_summary }}; {{ evpn_canary_bgp_reset_summary }}.
+      The existing canonical evpn-fabric peer has not been replaced and the
+      legacy third server remains.
+
+- name: Remove successful embedded BGP canary before canonical migration
+  kubernetes.core.k8s:
+    kubeconfig: "{{ evpn_canary_kubeconfig }}"
+    state: absent
+    api_version: frrk8s.metallb.io/v1beta1
+    kind: FRRConfiguration
+    name: evpn-embedded-canary
+    namespace: openshift-frr-k8s
+    wait: true
+
+- name: Remove embedded BGP canary password Secret
+  kubernetes.core.k8s:
+    kubeconfig: "{{ evpn_canary_kubeconfig }}"
+    state: absent
+    api_version: v1
+    kind: Secret
+    name: evpn-embedded-canary-bgp-auth
+    namespace: openshift-frr-k8s
+  when: evpn.bgp_auth.enabled | bool

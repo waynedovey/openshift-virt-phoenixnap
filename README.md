@@ -5,7 +5,7 @@
 
 GitHub-ready Ansible automation for a two-region OpenShift Virtualization lab on phoenixNAP Bare Metal Cloud.
 
-### Dynamic server selection under $0.30/hour
+### Dynamic server selection under $0.40/hour
 
 The lab now selects the server shape at runtime instead of hard-coding a SKU. It combines
 phoenixNAP's live product catalog, hourly pricing and live stock for PHX and ASH.
@@ -17,7 +17,7 @@ phoenixnap:
   pricing_model: HOURLY
   auto_select:
     enabled: true
-    max_hourly_price: 0.30   # strict: selected price must be < $0.30/h
+    max_hourly_price: 0.40   # strict: selected price must be < $0.40/h
     min_ram_gb: 64
     min_cores: 6
     min_storage_devices: 2  # boot disk + dedicated LVMS disk
@@ -59,7 +59,7 @@ SKU can still be used by setting `phoenixnap.auto_select.enabled: false` and con
 > DNS name, ASN, VTEP, and OpenShift networks. Exact CHI placement requires a different
 > bootstrap path (for example a RAM-resident Ubuntu/kexec workflow) and is intentionally
 > not guessed by this production-style path.
-- dynamically selected phoenixNAP server below **$0.30/hour per site**, billed **HOURLY**
+- dynamically selected phoenixNAP server below **$0.40/hour per site**, billed **HOURLY**
 - RHACM Host Inventory / Assisted Installer `InfraEnv` per site
 - phoenixNAP iPXE boot directly from the RHACM InfraEnv boot artifact
 - OpenShift Container Platform **4.22** Single Node OpenShift at each site
@@ -69,11 +69,11 @@ SKU can still be used by setting `phoenixnap.auto_select.enabled: false` and con
 - phoenixNAP private Layer-2 VLAN in each region for OpenShift Virtualization VMs
 - secondary OVN-Kubernetes Localnet CUDN backed by that private VLAN
 - optional phoenixNAP IPv4 BGP Peer Group creation (disabled by default; not used for EVPN)
-- complete two-site OpenShift 4.22 EVPN lab fabric built by `make deploy` once a fabric-router path is explicitly selected
+- complete two-site OpenShift 4.22 EVPN lab using an embedded FRR route-server pod on an existing SNO
 
 > **RHACM release-image self-heal:** if the hub does not currently contain an OpenShift 4.22 `ClusterImageSet`, `make deploy` creates `openshift-4.22.0-auto` automatically. Set `OPENSHIFT_RELEASE_IMAGE` only if you need a mirrored registry or a different 4.22.z payload.
 
-- external FRR eBGP EVPN fabric-router control plane, with optional guarded auto-provisioning of a third hourly phoenixNAP server
+- embedded FRR eBGP/MP-BGP EVPN control plane with **no third phoenixNAP server**
 - explicit, guarded teardown of hourly resources
 
 ## Deliberate safety decisions
@@ -101,29 +101,31 @@ The OpenShift side maps that VLAN into a secondary OVN Localnet CUDN. PHX and AS
 networks are separate L2 broadcast domains; the EVPN layer remains responsible for the shared
 `10.50.50.0/24` cross-site VM subnet. See `docs/private-l2.md`.
 
-### 3. `make deploy` now builds the PHX↔ASH EVPN lab fabric end to end
+### 3. `make deploy` builds EVPN without a third phoenixNAP server
 
-The tested phoenixNAP BGP Peer Groups establish ordinary IPv4 BGP, but the PHX/ASH service did not negotiate the L2VPN EVPN address family. OpenShift FRR-K8s also runs `bgpd` with `-p 0`, so the two SNO FRR instances are active dialers and cannot be used as each other's passive TCP/179 fabric peer.
+Live testing showed that phoenixNAP BGP Peer Groups negotiate ordinary IPv4 BGP but not the required L2VPN EVPN AFI/SAFI. OpenShift FRR-K8s also operates as an active BGP client rather than providing the passive listener required for a simple two-leaf direct session.
 
-Version 1.4.18 therefore defaults to `EVPN_FABRIC_MODE=fabric-router`. Both SNO clusters establish eBGP/MP-BGP EVPN to a small external FRR fabric router (AS65000 by default). The fabric router uses normal eBGP re-advertisement, prepends AS65000, and preserves the originating EVPN next-hop with `attribute-unchanged next-hop`; it carries control-plane traffic only, not VM traffic.
-
-The actual OpenShift EVPN data plane remains direct between the SNO public addresses:
+Version 1.4.38 defaults to `EVPN_FABRIC_MODE=embedded-router` and transparently maps the removed legacy values `fabric-router` and `direct-peering` to `embedded-router`. A small FRR route-server pod (AS65000) runs with host networking on the existing hosting SNO. Both FRR-K8s speakers peer to the hosting SNO public IP on TCP/1179 and explicitly source BGP from their own public VTEP addresses, keeping TCP-MD5 NAT-free. Because the hosting leaf advertises an EVPN next-hop that is also local to the host-network route-server, the embedded FRR enables `bgp allow-martian-nexthop`; this permits that control-plane route while `attribute-unchanged next-hop` preserves the originating VTEP for the opposite leaf. The route server accepts dynamic eBGP clients only from the two known public VTEP /32s, and the public SNO addresses remain the VXLAN VTEPs.
 
 ```text
-                 FRR EVPN fabric router / AS65000
-                         TCP/179
-                       /         \
-                SW1 AS65011    C1 AS65021
-                VTEP public    VTEP public
-                     \           /
-                      \ UDP/4789/
-                       VNI 5050
-                    10.50.50.0/24
+                  SW1 / PHX SNO
+                  AS65011 / public VTEP
+                         |
+                 public-IP TCP/1179
+                         |
+                 FRR route-server pod
+                       AS65000
+                         |
+          C1 -> SW1 public TCP/1179
+                         |
+                  C1 / ASH SNO
+                  AS65021 / public VTEP
+
+        SW1 <======== VXLAN UDP/4789 ========> C1
+                    VNI 5050 / 10.50.50.0/24
 ```
 
-The live PHX↔ASH tests confirmed bidirectional UDP/4789 between the public SNO IPs. The old nested VNI4090/UDP4790 carrier remains only as an explicit legacy diagnostic mode and is not the default.
-
-For safety, automatic fabric-router provisioning is **off by default** because it creates a third billable hourly server. To let the repo create it, set `EVPN_FR_AUTO_PROVISION=true`. Otherwise provide an existing fabric router with `EVPN_FR_ADDRESS` and `EVPN_FR_BGP_PASSWORD`. See `docs/evpn.md`.
+The pod is control-plane only; it is not in the VM data path. On an existing 1.4.25 lab, `make evpn-migrate` deploys and verifies this replacement first and only then deprovisions the repository-owned legacy `evpn-fr` server. See `docs/evpn.md`.
 
 ### 4. phoenixNAP dual NICs are bonded before installation
 
@@ -157,10 +159,9 @@ cp .env.example .env
 # edit .env
 source .env
 
-# Choose ONE fabric-router path before deploy:
-# A) explicit opt-in to a third phoenixNAP hourly server
-export EVPN_FR_AUTO_PROVISION=true
-# B) or keep auto provisioning false and set EVPN_FR_ADDRESS / EVPN_FR_BGP_PASSWORD
+# Default EVPN mode uses an embedded FRR route-server pod on SW1.
+# No third phoenixNAP server is provisioned.
+export EVPN_FABRIC_MODE=embedded-router
 
 make bootstrap
 make preflight
@@ -179,7 +180,7 @@ make install
 make virt
 make nmstate
 make vm-l2
-make evpn-fabric-router   # only acts when EVPN_FR_AUTO_PROVISION=true
+make evpn-router          # embedded FRR route-server on existing SNO
 make evpn
 make status
 ```
@@ -228,22 +229,22 @@ See `docs/private-l2.md`.
 ## EVPN target
 
 ```text
-                                EVPN fabric router
-                                   AS65000
-                                  TCP/179
-                                /         \
-                               /           \
-PHX / SW1                    /             \                    ASH / C1
-131.153.236.243             /               \              103.67.202.133
-FRR-K8s AS65011 -----------+                 +----------- FRR-K8s AS65021
-VTEP 131.153.236.243/32                               VTEP 103.67.202.133/32
-          \                                                   /
-           +========== OpenShift EVPN VNI 5050 / UDP 4789 =====+
+PHX / SW1                                                ASH / C1
+125.253.82.93                                            103.67.202.133
+FRR-K8s AS65011                                          FRR-K8s AS65021
+public VTEP                                              public VTEP
+      |                                                        |
+      | public-IP TCP/1179                                    |
+      v                                                        |
+FRR route-server pod / AS65000 <--------- TCP/1179 ------------+
+(on the existing SW1 SNO)
+
+      +========== OpenShift EVPN VNI 5050 / UDP 4789 ==========+
                               10.50.50.0/24
                               RT 65000:5050
 ```
 
-The fabric router exchanges EVPN reachability only. VXLAN traffic does **not** hairpin through it; data flows directly PHX↔ASH over UDP/4789. Automatic IP allocation is split by site so the two independent OVN IPAM databases cannot hand out the same VM address.
+The embedded route server exchanges EVPN reachability only. VXLAN traffic does **not** hairpin through it; data flows directly PHX↔ASH over UDP/4789. Automatic IP allocation is split by site so the two independent OVN IPAM databases cannot hand out the same VM address.
 
 ## Publish to GitHub
 
@@ -263,7 +264,7 @@ Hourly infrastructure costs money. Tear the lab down when finished:
 make destroy
 ```
 
-The destroy playbook deprovisions the two configured SNO servers and, when `artifacts/evpn/fabric-router.yml` proves repository ownership, the auto-provisioned EVPN fabric router as well. It deletes a BGP peer group only when this repository recorded that it created that group; pre-existing regional peer groups are left intact. Review `playbooks/99_destroy.yml` before first use in a shared phoenixNAP account. Destroy is safe to rerun: phoenixNAP `deleting` state and temporary HTTP 409 lifecycle conflicts are retried/waited through, and teardown waits for BMC server objects to disappear before continuing.
+The destroy playbook deprovisions the two configured SNO servers. The legacy fabric-router teardown helper remains only to remove an older repository-owned `evpn-fr` server when `artifacts/evpn/fabric-router.yml` proves ownership; current deployments never provision a third EVPN server. It deletes a BGP peer group only when this repository recorded that it created that group; pre-existing regional peer groups are left intact. Review `playbooks/99_destroy.yml` before first use in a shared phoenixNAP account. Destroy is safe to rerun: phoenixNAP `deleting` state and temporary HTTP 409 lifecycle conflicts are retried/waited through, and teardown waits for BMC server objects to disappear before continuing.
 
 ## Repository layout
 
@@ -277,16 +278,15 @@ docs/                                 # design and operations notes
 
 ## EVPN deployment behavior
 
-`make deploy` uses `EVPN_FABRIC_MODE=fabric-router` by default. It cleans up the earlier diagnostic direct peers/nested carrier, configures the SNO public IPv4 addresses as unmanaged VTEPs, points each OpenShift `FRRConfiguration` at the external FRR fabric router, creates the EVPN CUDN and `RouteAdvertisements`, and does not return success until base BGP and MP-BGP L2VPN EVPN are negotiated.
+`make deploy` uses `EVPN_FABRIC_MODE=embedded-router` by default. It deploys a small FRR route-server pod on the existing SW1 SNO, validates that both SNOs can reach its BGP listener, configures the public SNO IPv4 addresses as unmanaged VTEPs, reconciles the OpenShift `FRRConfiguration`, CUDN and `RouteAdvertisements`, and requires base BGP plus MP-BGP L2VPN EVPN to negotiate successfully.
 
-The fabric router can be supplied externally or provisioned by this repo. Auto-provisioning is deliberately opt-in because it adds a third hourly server:
+For an existing checkout that still owns the old third server:
 
 ```bash
-export EVPN_FR_AUTO_PROVISION=true
-make deploy
+make evpn-migrate
 ```
 
-`make destroy` removes a fabric router only when the repository-owned `artifacts/evpn/fabric-router.yml` ownership file exists.
+The migration does not delete the legacy server until the embedded path has BGP Established, the remote Type-3 VTEP route is present, and VNI 5050 has a remote VTEP on both clusters. Keep the existing `artifacts/` directory so the repo can prove which phoenixNAP server it owns.
 
 ## macOS / Python interpreter note
 
@@ -343,9 +343,9 @@ The resulting public network is DHCP on `bond0` in `802.3ad` mode. Site-local pr
 
 ## Two-site EVPN lab fabric
 
-Version 1.4.18 defaults to `EVPN_FABRIC_MODE=fabric-router`. OpenShift FRR-K8s on SW1 and C1 actively dials an external FRR fabric router. The router re-advertises L2VPN EVPN routes with AS65000 prepended and the originating VTEP next-hop unchanged; the VNI5050 VXLAN data path stays direct over UDP/4789.
+Version 1.4.38 defaults to `EVPN_FABRIC_MODE=embedded-router` and transparently maps the removed legacy values `fabric-router` and `direct-peering` to `embedded-router`. Both OpenShift FRR-K8s speakers actively dial the host-network route server on the hosting public IP at TCP/1179. The route server enables `bgp allow-martian-nexthop` so the hosting leaf's public VTEP next-hop is accepted even though that address is local to the route-server host, then re-advertises L2VPN EVPN routes with AS65000 prepended and the originating VTEP next-hop unchanged; VNI5050 VXLAN stays direct over UDP/4789.
 
-The old `self-managed-vxlan` VNI4090/UDP4790 design is retained only as an explicit diagnostic mode because the tested PHX↔ASH carrier did not pass traffic. See `docs/evpn.md` for the fabric-router configuration, safe auto-provision option and verification flow.
+The old `self-managed-vxlan` VNI4090/UDP4790 design is retained only as an explicit diagnostic mode because the tested PHX↔ASH carrier did not pass traffic. See `docs/evpn.md` for the no-third-server topology and guarded migration workflow.
 
 ### phoenixNAP OAuth token refresh
 
@@ -353,7 +353,7 @@ phoenixNAP access tokens are short-lived. Long `make deploy` runs automatically 
 
 ### Legacy self-managed transit mode
 
-`EVPN_FABRIC_MODE=self-managed-vxlan` is retained for diagnostics only. It still creates `evpn-transit0` and validates the remote `192.168.254.x` route before BGP, but it is not recommended for the tested PHX/ASH path. The default fabric-router design removes this nested carrier entirely.
+`EVPN_FABRIC_MODE=self-managed-vxlan` is retained for diagnostics only. It still creates `evpn-transit0` and validates the remote `192.168.254.x` route before BGP, but it is not recommended for the tested PHX/ASH path. The default embedded-router design removes this nested carrier entirely.
 
 
 ## LVM Storage

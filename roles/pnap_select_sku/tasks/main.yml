@@ -21,6 +21,7 @@
     pnap_existing_storage_info_by_site: {}
     pnap_sites_needing_capacity: []
     pnap_selector_site_argv: []
+    pnap_selector_blocked_argv: []
     pnap_forced_capacity_sites: >-
       {{ pnap_force_capacity_sites
          | default((sites.keys() | list)
@@ -40,20 +41,80 @@
   loop_control:
     label: "{{ item.key }}={{ item.value.node_hostname }}"
 
-- name: Require an existing hostname to remain in its configured physical site
+# On older deployments phoenixNAP's live server hostname can differ from the
+# configured FQDN even though this repository still owns the same server ID.
+# The exact-hostname match above is preferred, but recover by the persisted
+# server_id only when the artifact exists AND that ID is still present in the
+# current live /servers response. This avoids a false "site needs capacity"
+# decision on an idempotent rerun without trusting a stale local artifact.
+- name: Check repository server ownership artifacts for capacity reconciliation
+  ansible.builtin.stat:
+    path: "artifacts/servers/{{ item.key }}.yml"
+  loop: "{{ sites | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  register: pnap_capacity_server_artifact_stats
+
+- name: Initialize repository server ownership map
+  ansible.builtin.set_fact:
+    pnap_server_artifacts_by_site: {}
+
+- name: Read repository-owned server IDs for capacity reconciliation
+  ansible.builtin.set_fact:
+    pnap_server_artifacts_by_site: >-
+      {{ pnap_server_artifacts_by_site | combine({
+        item.item.key: (lookup('ansible.builtin.file', item.stat.path) | from_yaml)
+      }) }}
+  loop: "{{ pnap_capacity_server_artifact_stats.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.key | default('unknown') }}"
+  when:
+    - item.stat.exists | default(false) | bool
+
+- name: Recover existing phoenixNAP server by repository-owned server ID
+  ansible.builtin.set_fact:
+    pnap_existing_servers_by_site: >-
+      {{ pnap_existing_servers_by_site | combine({
+        item.key: (
+          pnap_existing_servers_for_capacity.json | default([])
+          | selectattr('id', 'equalto', pnap_server_artifacts_by_site[item.key].server_id)
+          | list | first | default({})
+        )
+      }) }}
+  loop: "{{ sites | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  when:
+    - pnap_existing_servers_by_site[item.key] | length == 0
+    - item.key in pnap_server_artifacts_by_site
+    - pnap_server_artifacts_by_site[item.key].server_id | default('') | length > 0
+
+- name: Report phoenixNAP existing-server reconciliation source
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.key | upper }}: {% if pnap_existing_servers_by_site[item.key] | length > 0 %}
+      reusing live server id={{ pnap_existing_servers_by_site[item.key].id | default('unknown') }},
+      provider-hostname={{ pnap_existing_servers_by_site[item.key].hostname | default('unknown') }},
+      configured-hostname={{ item.value.node_hostname }}.
+      {% else %}no live server matched configured hostname or repository-owned server ID;
+      live capacity selection is required.{% endif %}
+  loop: "{{ sites | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Require reusable existing servers to remain in a native-iPXE-supported region
   ansible.builtin.assert:
     that:
       - >-
         (pnap_existing_servers_by_site[item.key] | length == 0)
-        or ((pnap_existing_servers_by_site[item.key].location | default(item.value.location)) == item.value.location)
+        or ((pnap_existing_servers_by_site[item.key].location | default('')) in phoenixnap.ipxe_network.supported_locations)
     fail_msg: >-
       Existing {{ item.value.node_hostname }} is in phoenixNAP location
-      {{ pnap_existing_servers_by_site[item.key].location | default('unknown') }}, but the lab now requests
-      {{ item.value.location }}. A server cannot move regions in place. Use `make destroy` for a full topology
-      change or explicitly reconcile the server before rerunning deploy.
+      {{ pnap_existing_servers_by_site[item.key].location | default('unknown') }}, which is outside this lab's
+      native-iPXE-supported region pool {{ phoenixnap.ipxe_network.supported_locations | join(', ') }}.
   loop: "{{ sites | dict2items }}"
   loop_control:
-    label: "{{ item.key }}@{{ item.value.location }}"
+    label: "{{ item.key }}@{{ pnap_existing_servers_by_site[item.key].location | default(item.value.location) }}"
   when: item.key not in pnap_forced_capacity_sites
 
 - name: Parse physical storage count for reusable existing servers
@@ -153,16 +214,90 @@
   when:
     - phoenixnap.auto_select.enabled | bool
 
-- name: Build selector site arguments only for sites that need a new server
+- name: Require existing SNOs to occupy distinct supported phoenixNAP regions
+  ansible.builtin.assert:
+    that:
+      - >-
+        (pnap_existing_server_reuse_rows | dict2items
+         | map(attribute='value.location') | list | unique | length)
+        == (pnap_existing_server_reuse_rows | length)
+      - >-
+        (pnap_existing_server_reuse_rows | dict2items
+         | map(attribute='value.location') | list
+         | difference(phoenixnap.ipxe_network.supported_locations) | length) == 0
+    fail_msg: >-
+      Existing SNO servers must occupy distinct native-iPXE-supported regions.
+      Existing locations={{ pnap_existing_server_reuse_rows | dict2items | map(attribute='value.location') | list }},
+      supported={{ phoenixnap.ipxe_network.supported_locations | join(', ') }}.
+  when:
+    - phoenixnap.auto_select.enabled | bool
+    - pnap_existing_server_reuse_rows | length > 0
+
+- name: Adopt live region for reusable existing SNOs
+  ansible.builtin.set_fact:
+    sites: >-
+      {{ sites | combine({
+        item.key: sites[item.key] | combine({'location': item.value.location})
+      }, recursive=true) }}
+  loop: "{{ pnap_existing_server_reuse_rows | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}={{ item.value.location }}"
+
+- name: Build occupied region list from reusable existing SNOs
+  ansible.builtin.set_fact:
+    pnap_occupied_locations: >-
+      {{ pnap_existing_server_reuse_rows | dict2items | map(attribute='value.location') | list | unique }}
+
+- name: Build allowed phoenixNAP region pool for missing sites
+  ansible.builtin.set_fact:
+    pnap_capacity_region_pool: >-
+      {{
+        (phoenixnap.ipxe_network.supported_locations
+         if (phoenixnap.auto_select.try_all_supported_locations | default(true) | bool)
+         else (pnap_sites_needing_capacity | map('extract', sites) | map(attribute='location') | list))
+        | unique | list
+      }}
+
+- name: Require enough regions to maintain the two-site topology
+  ansible.builtin.assert:
+    that:
+      - >-
+        ((pnap_occupied_locations | default([]))
+         + (pnap_capacity_region_pool | difference(pnap_occupied_locations | default([]))))
+        | unique | length
+        >= (phoenixnap.auto_select.min_distinct_locations | default(2) | int)
+    fail_msg: >-
+      Fewer than {{ phoenixnap.auto_select.min_distinct_locations | default(2) }} usable phoenixNAP regions
+      are configured. Supported region pool={{ pnap_capacity_region_pool | join(', ') }},
+      occupied={{ pnap_occupied_locations | default([]) | join(', ') }}.
+  when:
+    - phoenixnap.auto_select.enabled | bool
+    - pnap_sites_needing_capacity | length > 0
+
+- name: Build selector site arguments across every allowed region
   ansible.builtin.set_fact:
     pnap_selector_site_argv: >-
-      {{ pnap_selector_site_argv + ['--site', item ~ '=' ~ sites[item].location] }}
+      {{ pnap_selector_site_argv + [
+        '--site',
+        item ~ '=' ~ (pnap_capacity_region_pool | join(','))
+      ] }}
   loop: "{{ pnap_sites_needing_capacity }}"
   when:
     - phoenixnap.auto_select.enabled | bool
     - pnap_sites_needing_capacity | length > 0
 
-- name: Build phoenixNAP dynamic SKU selector command
+- name: Block regions already occupied by reusable SNOs from new placement
+  ansible.builtin.set_fact:
+    pnap_selector_blocked_argv: >-
+      {{ pnap_selector_blocked_argv + ['--blocked-location', item] }}
+  loop: "{{ pnap_occupied_locations | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+  when:
+    - phoenixnap.auto_select.enabled | bool
+    - pnap_sites_needing_capacity | length > 0
+
+- name: Build phoenixNAP dynamic multi-region SKU selector command
   ansible.builtin.set_fact:
     pnap_selector_argv: >-
       {{
@@ -172,6 +307,7 @@
           '--api-base', phoenixnap.api_base
         ]
         + pnap_selector_site_argv
+        + pnap_selector_blocked_argv
         + [
           '--max-hourly-price', phoenixnap.auto_select.max_hourly_price | string,
           '--min-ram-gb', phoenixnap.auto_select.min_ram_gb | string,
@@ -181,6 +317,7 @@
           '--preferred-cores', phoenixnap.auto_select.preferred_cores | string,
           '--top', phoenixnap.auto_select.show_top_candidates | string
         ]
+        + (['--distinct-locations'] if (pnap_sites_needing_capacity | length > 1) else [])
         + (['--prefer-common'] if (phoenixnap.auto_select.prefer_common_sku | bool and pnap_sites_needing_capacity | length > 1) else [])
         + (['--require-common'] if (phoenixnap.auto_select.require_common_sku | bool and pnap_sites_needing_capacity | length > 1) else [])
       }}
@@ -188,7 +325,7 @@
     - phoenixnap.auto_select.enabled | bool
     - pnap_sites_needing_capacity | length > 0
 
-- name: Select live phoenixNAP SKUs only for missing servers
+- name: Select live phoenixNAP SKUs across all supported regions for missing servers
   ansible.builtin.command:
     argv: "{{ pnap_selector_argv }}"
   environment:
@@ -201,7 +338,7 @@
     - phoenixnap.auto_select.enabled | bool
     - pnap_sites_needing_capacity | length > 0
 
-- name: Parse sanitized phoenixNAP SKU selection
+- name: Parse sanitized phoenixNAP multi-region SKU selection
   ansible.builtin.set_fact:
     pnap_sku_selection: "{{ pnap_selector_raw.stdout | from_json }}"
   when:
@@ -215,16 +352,39 @@
       commonSkuSelected: false
       sites: {}
       candidates: {}
+      regionCandidates: {}
       existingSites: "{{ pnap_existing_server_reuse_rows.keys() | list }}"
   when:
     - phoenixnap.auto_select.enabled | bool
     - pnap_sites_needing_capacity | length == 0
 
-- name: Require live capacity selection to succeed when a server is actually missing
+- name: Display live phoenixNAP hourly capacity checked in every region
+  ansible.builtin.debug:
+    msg: >-
+      {{ phoenixnap.ipxe_network.location_labels.get(item.key, item.key) }} ({{ item.key }}):
+      {% if item.value | length == 0 %}no live HOURLY SKU meets the hardware minimums.
+      {% else %}{% for c in item.value %}
+      {{ c.productCode }}=${{ '%.3f' | format(c.hourlyPrice | float) }}/h
+      [{{ 'UNDER CAP' if (c.withinBudget | default(false) | bool) else 'OVER CAP' }}],
+      {{ c.ramInGb }}GB/{{ c.cores }} cores, disks={{ c.storageDeviceCount | default('?') }},
+      stock={{ c.availableQuantity }}{% if not loop.last %};{% endif %}
+      {% endfor %}{% endif %}
+  loop: "{{ pnap_sku_selection.regionCandidates | default({}) | dict2items }}"
+  loop_control:
+    label: "{{ phoenixnap.ipxe_network.location_labels.get(item.key, item.key) }} / {{ item.key }}"
+  when:
+    - phoenixnap.auto_select.enabled | bool
+    - pnap_sites_needing_capacity | length > 0
+
+- name: Require live capacity selection to succeed only after all regions were tried
   ansible.builtin.assert:
     that:
       - pnap_sku_selection.ok | bool
-    fail_msg: "{{ pnap_sku_selection.error | default('No phoenixNAP SKU satisfied the configured budget/sizing policy.') }}"
+    fail_msg: >-
+      {{ pnap_sku_selection.error | default('No phoenixNAP SKU satisfied the configured budget/sizing policy.') }}.
+      Regions checked={{ pnap_sku_selection.searchedLocations | default(pnap_capacity_region_pool) | join(', ') }}.
+      Review the live hourly-rate table immediately above; raise phoenixnap.auto_select.max_hourly_price
+      only if the available hardware is acceptable.
   when:
     - phoenixnap.auto_select.enabled | bool
     - pnap_sites_needing_capacity | length > 0
@@ -234,8 +394,9 @@
     that:
       - item in (pnap_sku_selection.sites | default({}))
       - pnap_sku_selection.sites[item].productCode | default('') | length > 0
+      - pnap_sku_selection.sites[item].location | default('') | length > 0
     fail_msg: >-
-      phoenixNAP dynamic selection did not return a safe SKU for {{ item }} even though that site
+      phoenixNAP dynamic selection did not return a safe SKU and region for {{ item }} even though that site
       requires a new server.
   loop: "{{ pnap_sites_needing_capacity }}"
   loop_control:
@@ -249,12 +410,37 @@
          | combine(pnap_existing_server_reuse_rows | default({}), recursive=true) }}
   when: phoenixnap.auto_select.enabled | bool
 
-- name: Report dynamically selected shapes for sites requiring new servers
+- name: Adopt dynamically selected physical regions for missing logical sites
+  ansible.builtin.set_fact:
+    sites: >-
+      {{ sites | combine({
+        item: sites[item] | combine({'location': pnap_selected_skus[item].location})
+      }, recursive=true) }}
+  loop: "{{ pnap_sites_needing_capacity }}"
+  loop_control:
+    label: "{{ item }}={{ pnap_selected_skus[item].location | default('unselected') }}"
+  when:
+    - phoenixnap.auto_select.enabled | bool
+    - pnap_sites_needing_capacity | length > 0
+
+- name: Require final SNO placement to use distinct physical regions
+  ansible.builtin.assert:
+    that:
+      - >-
+        (sites | dict2items | map(attribute='value.location') | list | unique | length)
+        >= (phoenixnap.auto_select.min_distinct_locations | default(2) | int)
+    fail_msg: >-
+      Dynamic capacity selection did not preserve the required two-region topology.
+      Effective locations={{ sites | dict2items | map(attribute='value.location') | list }}.
+  when: phoenixnap.auto_select.enabled | bool
+
+- name: Report dynamically selected shapes and physical regions
   ansible.builtin.debug:
     msg: >-
       {{ item | upper }}: selected {{ pnap_selected_skus[item].productCode }} @
-      ${{ '%.3f' | format(pnap_selected_skus[item].hourlyPrice | float) }}/h in {{ sites[item].location }}
-      ({{ pnap_selected_skus[item].ramInGb }}GB/{{ pnap_selected_skus[item].cores }} cores,
+      ${{ '%.3f' | format(pnap_selected_skus[item].hourlyPrice | float) }}/h in
+      {{ phoenixnap.ipxe_network.location_labels.get(pnap_selected_skus[item].location, pnap_selected_skus[item].location) }}
+      ({{ pnap_selected_skus[item].location }}; {{ pnap_selected_skus[item].ramInGb }}GB/{{ pnap_selected_skus[item].cores }} cores,
       disks={{ pnap_selected_skus[item].storageDeviceCount | default('?') }},
       storage={{ pnap_selected_skus[item].storage | default('unknown') }},
       stock={{ pnap_selected_skus[item].availableQuantity }}).

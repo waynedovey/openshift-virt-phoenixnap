@@ -12,7 +12,7 @@ A candidate must have a `HOURLY` plan with `priceUnit=HOUR`, a price strictly be
 `metadata.cpuCount * metadata.coresPerCpu`.
 
 The default policy is 64 GB / 6 cores minimum and 128 GB / 8 cores preferred, with a strict
-`< $0.30/hour` per-server cap. The preferred target is used to avoid picking a tiny server simply
+`< $0.40/hour` per-server cap. The preferred target is used to avoid picking a tiny server simply
 because it is cheapest. Once candidates have equivalent sizing suitability, lower hourly cost wins.
 
 A common SKU across PHX and ASH is preferred for repeatable lab behavior. If there is no common SKU,

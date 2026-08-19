@@ -1,0 +1,9 @@
+---
+- name: Deploy embedded FRR EVPN route server on an existing SNO
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - role: openshift_evpn_embedded_router
+      when:
+        - evpn.enabled | bool
+        - evpn.fabric_mode == 'embedded-router'

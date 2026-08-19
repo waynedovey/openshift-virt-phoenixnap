@@ -70,6 +70,22 @@
   ansible.builtin.set_fact:
     evpn_fr_ssh_public_key: "{{ lookup('ansible.builtin.file', ssh_public_key.path) | trim }}"
 
+- name: Check SSH private key used to reconcile the EVPN fabric router
+  ansible.builtin.stat:
+    path: "{{ evpn.fabric_router.ssh_private_key }}"
+  register: evpn_fr_ssh_private_key_stat
+
+- name: Require SSH private key for idempotent fabric-router reconciliation
+  ansible.builtin.assert:
+    that:
+      - evpn_fr_ssh_private_key_stat.stat.exists | bool
+      - evpn_fr_ssh_private_key_stat.stat.isreg | bool
+      - evpn_fr_ssh_private_key_stat.stat.readable | bool
+    fail_msg: >-
+      Cannot reconcile {{ evpn.fabric_router.hostname }} because SSH private key
+      {{ evpn.fabric_router.ssh_private_key }} is missing or unreadable. Set
+      EVPN_FR_SSH_PRIVATE_KEY to the private key matching {{ ssh_public_key.path }}.
+
 - name: Check existing repository ownership state for EVPN fabric router
   ansible.builtin.stat:
     path: artifacts/evpn/fabric-router.yml
@@ -339,6 +355,58 @@
   ansible.builtin.set_fact:
     evpn_fr_public_ip: "{{ evpn_fr_live.json.publicIpAddresses | first }}"
     evpn_fr_effective_type: "{{ evpn_fr_live.json.type }}"
+
+- name: Wait for SSH on EVPN fabric router
+  ansible.builtin.wait_for:
+    host: "{{ evpn_fr_public_ip }}"
+    port: 22
+    state: started
+    timeout: 600
+
+- name: Wait for FRR vtysh on EVPN fabric router
+  ansible.builtin.command:
+    argv:
+      - ssh
+      - -i
+      - "{{ evpn.fabric_router.ssh_private_key }}"
+      - -o
+      - BatchMode=yes
+      - -o
+      - StrictHostKeyChecking=no
+      - -o
+      - ConnectTimeout=10
+      - "{{ evpn.fabric_router.ssh_user }}@{{ evpn_fr_public_ip }}"
+      - "sudo vtysh -c 'show version'"
+  register: evpn_fr_vtysh_ready
+  changed_when: false
+  failed_when: false
+  until: evpn_fr_vtysh_ready.rc | default(1) | int == 0
+  retries: 60
+  delay: 5
+
+- name: Reconcile and persist critical FRR EVPN transit settings
+  ansible.builtin.command:
+    argv:
+      - ssh
+      - -i
+      - "{{ evpn.fabric_router.ssh_private_key }}"
+      - -o
+      - BatchMode=yes
+      - -o
+      - StrictHostKeyChecking=no
+      - "{{ evpn.fabric_router.ssh_user }}@{{ evpn_fr_public_ip }}"
+      - >-
+        sudo vtysh
+        -c 'configure terminal'
+        -c 'ip nht resolve-via-default'
+        -c 'router bgp {{ evpn.fabric_router.asn | int }}'
+        -c 'address-family l2vpn evpn'
+        -c 'neighbor {{ evpn_fr_sw1_public_ip }} attribute-unchanged next-hop'
+        -c 'neighbor {{ evpn_fr_c1_public_ip }} attribute-unchanged next-hop'
+        -c 'end'
+        -c 'write memory'
+  register: evpn_fr_reconcile
+  changed_when: true
 
 - name: Save non-secret EVPN fabric-router state
   ansible.builtin.copy:

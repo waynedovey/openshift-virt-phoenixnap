@@ -1,0 +1,444 @@
+---
+- name: Require embedded route-server mode
+  ansible.builtin.assert:
+    that:
+      - evpn.fabric_mode == 'embedded-router'
+      - evpn.embedded_router.enabled | bool
+      - evpn.embedded_router.site in sites.keys()
+    fail_msg: >-
+      The embedded EVPN route-server role is only valid when
+      EVPN_FABRIC_MODE=embedded-router and embedded_router.site is sw1 or c1.
+
+- name: Check managed kubeconfigs for embedded route-server migration
+  ansible.builtin.stat:
+    path: "artifacts/kubeconfigs/{{ item.value.cluster_name }}.kubeconfig"
+  loop: "{{ sites | dict2items }}"
+  register: evpn_embedded_kubeconfig_stats
+
+- name: Require both managed kubeconfigs before embedded route-server migration
+  ansible.builtin.assert:
+    that:
+      - evpn_embedded_kubeconfig_stats.results | length == 2
+      - evpn_embedded_kubeconfig_stats.results | map(attribute='stat.exists') | min
+    fail_msg: >-
+      Embedded EVPN routing requires both managed cluster kubeconfigs. Run the
+      cluster install/export stages before `make evpn-migrate`.
+
+- name: Check SNO server state artifacts for public EVPN identities
+  ansible.builtin.stat:
+    path: "artifacts/servers/{{ item }}.yml"
+  loop:
+    - sw1
+    - c1
+  register: evpn_embedded_server_stats
+
+- name: Require SNO server state artifacts for embedded EVPN routing
+  ansible.builtin.assert:
+    that:
+      - evpn_embedded_server_stats.results | map(attribute='stat.exists') | min
+    fail_msg: >-
+      artifacts/servers/sw1.yml and artifacts/servers/c1.yml are required so the
+      embedded route server can identify the public OpenShift VTEPs.
+
+- name: Read current SNO public addresses for embedded EVPN routing
+  ansible.builtin.set_fact:
+    evpn_embedded_server_state:
+      sw1: "{{ lookup('ansible.builtin.file', 'artifacts/servers/sw1.yml') | from_yaml }}"
+      c1: "{{ lookup('ansible.builtin.file', 'artifacts/servers/c1.yml') | from_yaml }}"
+
+- name: Publish public OpenShift VTEP identities
+  ansible.builtin.set_fact:
+    evpn_embedded_public_ips:
+      sw1: "{{ evpn_embedded_server_state.sw1.public_ip }}"
+      c1: "{{ evpn_embedded_server_state.c1.public_ip }}"
+    evpn_embedded_site_kubeconfig: >-
+      artifacts/kubeconfigs/{{ sites[evpn.embedded_router.site].cluster_name }}.kubeconfig
+
+- name: Require valid embedded route-server settings
+  ansible.builtin.assert:
+    that:
+      - evpn_embedded_public_ips.sw1 | length > 0
+      - evpn_embedded_public_ips.c1 | length > 0
+      - evpn_embedded_public_ips.sw1 != evpn_embedded_public_ips.c1
+      - evpn.embedded_router.asn | int > 0
+      - evpn.embedded_router.listener_port | int > 1024
+      - evpn.embedded_router.listener_port | int <= 16384
+      - evpn.embedded_router.image | length > 0
+      - evpn.embedded_router.service_name | length > 0
+    fail_msg: "Review evpn.embedded_router settings in inventories/lab/group_vars/all.yml."
+
+- name: Check for legacy third-server ownership before migration safety checks
+  ansible.builtin.stat:
+    path: artifacts/evpn/fabric-router.yml
+  register: evpn_embedded_legacy_artifact
+
+# Inspect the actual served OpenAPI schema. `oc explain` returned false
+# negatives for these nested array fields on the live OpenShift 4.22 clusters.
+# This check is deliberately before any canonical peer replacement.
+- name: Verify live FRR-K8s neighbor schema on both clusters
+  ansible.builtin.include_tasks: schema.yml
+  loop: "{{ sites | dict2items }}"
+  loop_control:
+    loop_var: schema_site
+
+- name: Read node on embedded route-server SNO
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ evpn_embedded_site_kubeconfig }}"
+    api_version: v1
+    kind: Node
+  register: evpn_embedded_nodes
+
+- name: Require exactly one node on embedded route-server SNO
+  ansible.builtin.assert:
+    that:
+      - evpn_embedded_nodes.resources | length == 1
+    fail_msg: >-
+      Expected a single node on {{ evpn.embedded_router.site }} because this lab
+      uses SNO. Refusing to guess where to expose the embedded BGP listener.
+
+- name: Publish embedded route-server node and public BGP endpoint
+  ansible.builtin.set_fact:
+    evpn_embedded_node_name: "{{ evpn_embedded_nodes.resources[0].metadata.name }}"
+    evpn_embedded_public_endpoint: "{{ evpn_embedded_public_ips[evpn.embedded_router.site] }}"
+
+- name: Create local directory for embedded EVPN secret
+  ansible.builtin.file:
+    path: artifacts/secrets
+    state: directory
+    mode: '0700'
+
+- name: Generate or reuse embedded EVPN BGP password
+  ansible.builtin.set_fact:
+    evpn_embedded_bgp_password: >-
+      {{ lookup('ansible.builtin.password',
+          'artifacts/secrets/evpn-bgp-password',
+          length=32,
+          chars=['ascii_letters', 'digits']) }}
+  no_log: true
+  when: evpn.bgp_auth.enabled | bool
+
+- name: Publish empty embedded BGP password when authentication is disabled
+  ansible.builtin.set_fact:
+    evpn_embedded_bgp_password: ''
+  when: not (evpn.bgp_auth.enabled | bool)
+
+- name: Render embedded FRR configuration
+  ansible.builtin.set_fact:
+    evpn_embedded_frr_config: "{{ lookup('ansible.builtin.template', 'frr.conf.j2') }}"
+    evpn_embedded_daemons_config: "{{ lookup('ansible.builtin.template', 'daemons.j2') }}"
+    evpn_embedded_vtysh_config: "{{ lookup('ansible.builtin.template', 'vtysh.conf.j2') }}"
+  no_log: true
+
+- name: Create embedded EVPN route-server namespace
+  kubernetes.core.k8s:
+    kubeconfig: "{{ evpn_embedded_site_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ evpn.embedded_router.namespace }}"
+        labels:
+          pod-security.kubernetes.io/enforce: privileged
+          pod-security.kubernetes.io/audit: privileged
+          pod-security.kubernetes.io/warn: privileged
+
+- name: Create embedded EVPN route-server service account
+  kubernetes.core.k8s:
+    kubeconfig: "{{ evpn_embedded_site_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: "{{ evpn.embedded_router.name }}"
+        namespace: "{{ evpn.embedded_router.namespace }}"
+
+- name: Allow embedded route-server service account to use privileged SCC
+  kubernetes.core.k8s:
+    kubeconfig: "{{ evpn_embedded_site_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: RoleBinding
+      metadata:
+        name: "{{ evpn.embedded_router.name }}-privileged"
+        namespace: "{{ evpn.embedded_router.namespace }}"
+      subjects:
+        - kind: ServiceAccount
+          name: "{{ evpn.embedded_router.name }}"
+          namespace: "{{ evpn.embedded_router.namespace }}"
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: system:openshift:scc:privileged
+
+- name: Store embedded FRR configuration
+  kubernetes.core.k8s:
+    kubeconfig: "{{ evpn_embedded_site_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: "{{ evpn.embedded_router.name }}-config"
+        namespace: "{{ evpn.embedded_router.namespace }}"
+      type: Opaque
+      stringData:
+        frr.conf: "{{ evpn_embedded_frr_config }}"
+        daemons: "{{ evpn_embedded_daemons_config }}"
+        vtysh.conf: "{{ evpn_embedded_vtysh_config }}"
+  no_log: true
+
+- name: Create optional ClusterIP Service for embedded route-server health and discovery
+  kubernetes.core.k8s:
+    kubeconfig: "{{ evpn_embedded_site_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: "{{ evpn.embedded_router.service_name }}"
+        namespace: "{{ evpn.embedded_router.namespace }}"
+        labels:
+          digitaldovey.net/evpn-route-server: 'true'
+      spec:
+        selector:
+          app.kubernetes.io/name: "{{ evpn.embedded_router.name }}"
+        ports:
+          - name: bgp
+            protocol: TCP
+            port: "{{ evpn.embedded_router.listener_port | int }}"
+            targetPort: bgp
+
+- name: Deploy embedded FRR EVPN route server on existing SNO
+  kubernetes.core.k8s:
+    kubeconfig: "{{ evpn_embedded_site_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: "{{ evpn.embedded_router.name }}"
+        namespace: "{{ evpn.embedded_router.namespace }}"
+        labels:
+          app.kubernetes.io/name: "{{ evpn.embedded_router.name }}"
+          digitaldovey.net/evpn-route-server: 'true'
+      spec:
+        replicas: 1
+        strategy:
+          type: Recreate
+        selector:
+          matchLabels:
+            app.kubernetes.io/name: "{{ evpn.embedded_router.name }}"
+        template:
+          metadata:
+            labels:
+              app.kubernetes.io/name: "{{ evpn.embedded_router.name }}"
+            annotations:
+              digitaldovey.net/config-hash: >-
+                {{ (evpn_embedded_frr_config ~ evpn_embedded_daemons_config ~ evpn_embedded_vtysh_config) | hash('sha256') }}
+          spec:
+            # FRR-K8s on OpenShift is an active-only BGP client. Run the
+            # embedded route-server in the SNO host network. The hosting leaf
+            # dials loopback and the remote leaf dials the public IP, keeping
+            # both TCP-MD5 protected BGP paths NAT-free.
+            hostNetwork: true
+            dnsPolicy: ClusterFirstWithHostNet
+            serviceAccountName: "{{ evpn.embedded_router.name }}"
+            nodeSelector:
+              kubernetes.io/hostname: "{{ evpn_embedded_node_name }}"
+            initContainers:
+              - name: prepare-frr-config
+                image: "{{ evpn.embedded_router.image }}"
+                imagePullPolicy: IfNotPresent
+                securityContext:
+                  runAsUser: 0
+                command:
+                  - /bin/sh
+                  - -c
+                  - >-
+                    cp /config-src/frr.conf /etc/frr/frr.conf &&
+                    cp /config-src/daemons /etc/frr/daemons &&
+                    cp /config-src/vtysh.conf /etc/frr/vtysh.conf &&
+                    chmod 0644 /etc/frr/frr.conf /etc/frr/daemons /etc/frr/vtysh.conf
+                volumeMounts:
+                  - name: frr-config-source
+                    mountPath: /config-src
+                    readOnly: true
+                  - name: frr-config
+                    mountPath: /etc/frr
+            containers:
+              - name: frr
+                image: "{{ evpn.embedded_router.image }}"
+                imagePullPolicy: IfNotPresent
+                securityContext:
+                  privileged: true
+                  runAsUser: 0
+                command:
+                  - /usr/lib/frr/docker-start
+                ports:
+                  - name: bgp
+                    containerPort: "{{ evpn.embedded_router.listener_port | int }}"
+                    protocol: TCP
+                volumeMounts:
+                  - name: frr-config
+                    mountPath: /etc/frr
+                readinessProbe:
+                  exec:
+                    command:
+                      - /bin/sh
+                      - -c
+                      - vtysh -c 'show bgp summary' >/dev/null 2>&1
+                  initialDelaySeconds: 5
+                  periodSeconds: 5
+                  failureThreshold: 12
+                livenessProbe:
+                  exec:
+                    command:
+                      - /bin/sh
+                      - -c
+                      - vtysh -c 'show version' >/dev/null 2>&1
+                  initialDelaySeconds: 15
+                  periodSeconds: 15
+                  failureThreshold: 4
+            volumes:
+              - name: frr-config-source
+                secret:
+                  secretName: "{{ evpn.embedded_router.name }}-config"
+                  defaultMode: 420
+              - name: frr-config
+                emptyDir: {}
+
+- name: Wait for embedded FRR route-server deployment
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ evpn_embedded_site_kubeconfig }}"
+    api_version: apps/v1
+    kind: Deployment
+    namespace: "{{ evpn.embedded_router.namespace }}"
+    name: "{{ evpn.embedded_router.name }}"
+  register: evpn_embedded_deployment
+  until: >-
+    evpn_embedded_deployment.resources | length == 1 and
+    (evpn_embedded_deployment.resources[0].status.availableReplicas | default(0) | int) == 1
+  retries: 60
+  delay: 5
+
+- name: Read embedded route-server Service endpoint
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ evpn_embedded_site_kubeconfig }}"
+    api_version: v1
+    kind: Service
+    namespace: "{{ evpn.embedded_router.namespace }}"
+    name: "{{ evpn.embedded_router.service_name }}"
+  register: evpn_embedded_service
+
+- name: Publish embedded route-server health Service and NAT-free BGP endpoint
+  ansible.builtin.set_fact:
+    evpn_embedded_service_ip: "{{ evpn_embedded_service.resources[0].spec.clusterIP }}"
+    # The Service is health/discovery only. Both leaves dial the hosting public
+    # address directly so TCP-MD5 remains NAT-free. The route-server explicitly
+    # allows the hosting leaf's public EVPN next-hop even though that address is
+    # local to the host network namespace.
+    evpn_embedded_local_endpoint: "{{ evpn_embedded_public_endpoint }}"
+
+- name: Read SNO node names for pre-migration reachability probes
+  kubernetes.core.k8s_info:
+    kubeconfig: "artifacts/kubeconfigs/{{ item.value.cluster_name }}.kubeconfig"
+    api_version: v1
+    kind: Node
+  loop: "{{ sites | dict2items }}"
+  register: evpn_embedded_probe_nodes
+
+- name: Require exactly one SNO node for each pre-migration probe
+  ansible.builtin.assert:
+    that:
+      - item.resources | length == 1
+    fail_msg: "Expected one SNO node for {{ item.item.key }}."
+  loop: "{{ evpn_embedded_probe_nodes.results }}"
+  loop_control:
+    label: "{{ item.item.key }}"
+
+- name: Publish SNO node names used by pre-migration probes
+  ansible.builtin.set_fact:
+    evpn_embedded_node_names: >-
+      {{ (evpn_embedded_node_names | default({}))
+         | combine({item.item.key: item.resources[0].metadata.name}) }}
+  loop: "{{ evpn_embedded_probe_nodes.results }}"
+  loop_control:
+    label: "{{ item.item.key }}"
+
+# Do not use an unauthenticated /dev/tcp probe against a TCP-MD5 protected
+# BGP listener: the kernel correctly rejects SYNs that do not carry the MD5
+# option. First prove the listener exists in the hosting node network namespace.
+# When authentication is disabled for diagnostics, a normal remote TCP probe is
+# also useful. With authentication enabled, the authenticated BGP canaries below
+# are the end-to-end reachability test.
+- name: Check embedded route-server listener on hosting SNO
+  ansible.builtin.command:
+    argv:
+      - oc
+      - --kubeconfig
+      - "artifacts/kubeconfigs/{{ sites[evpn.embedded_router.site].cluster_name }}.kubeconfig"
+      - debug
+      - "node/{{ evpn_embedded_node_names[evpn.embedded_router.site] }}"
+      - --
+      - chroot
+      - /host
+      - bash
+      - -c
+      - >-
+        ss -lnt | grep -q ':{{ evpn.embedded_router.listener_port | int }} '
+  register: evpn_embedded_listener_probe
+  changed_when: false
+  failed_when: false
+
+- name: Probe public BGP listener from remote SNO when authentication is disabled
+  ansible.builtin.command:
+    argv:
+      - oc
+      - --kubeconfig
+      - "artifacts/kubeconfigs/{{ sites['c1' if evpn.embedded_router.site == 'sw1' else 'sw1'].cluster_name }}.kubeconfig"
+      - debug
+      - "node/{{ evpn_embedded_node_names['c1' if evpn.embedded_router.site == 'sw1' else 'sw1'] }}"
+      - --
+      - chroot
+      - /host
+      - bash
+      - -c
+      - >-
+        timeout 5 bash -c '</dev/tcp/{{ evpn_embedded_public_endpoint }}/{{ evpn.embedded_router.listener_port | int }}'
+  register: evpn_embedded_remote_probe
+  changed_when: false
+  failed_when: false
+  when: not (evpn.bgp_auth.enabled | bool)
+
+- name: Require embedded route-server listener before BGP migration
+  ansible.builtin.assert:
+    that:
+      - evpn_embedded_listener_probe.rc | int == 0
+      - >-
+        (evpn.bgp_auth.enabled | bool) or
+        (evpn_embedded_remote_probe.rc | default(1) | int == 0)
+    fail_msg: >-
+      Embedded route-server preflight failed on TCP/{{ evpn.embedded_router.listener_port }}.
+      No OpenShift FRRConfiguration peer has been changed and the legacy fabric
+      router has not been deprovisioned. When BGP authentication is enabled,
+      plain TCP probes are intentionally skipped because TCP-MD5 rejects
+      unauthenticated SYNs; the authenticated canaries are the reachability gate.
+
+- name: Prove embedded BGP listener alongside the working legacy peer
+  ansible.builtin.include_tasks: canary.yml
+  loop: "{{ sites | dict2items }}"
+  loop_control:
+    loop_var: canary_site
+  when: evpn_embedded_legacy_artifact.stat.exists | bool
+
+- name: Report embedded EVPN route-server readiness
+  ansible.builtin.debug:
+    msg: >-
+      Embedded FRR route server is ready on {{ evpn.embedded_router.site }}:
+      local peer endpoint={{ evpn_embedded_local_endpoint }}:{{ evpn.embedded_router.listener_port }},
+      remote peer endpoint={{ evpn_embedded_public_endpoint }}:{{ evpn.embedded_router.listener_port }},
+      AS{{ evpn.embedded_router.asn }}. Existing external EVPN peer remains untouched
+      until the following OpenShift EVPN stage succeeds.

@@ -3,11 +3,17 @@
 
 Uses the phoenixNAP Billing API only. The bearer token is read from PNAP_ACCESS_TOKEN and
 is never printed. Output is sanitized JSON suitable for Ansible's from_json filter.
+
+A logical site can be given more than one physical location, for example:
+  --site sw1=PHX,ASH,NLD --site c1=PHX,ASH,NLD --distinct-locations
+This lets a two-site lab survive temporary regional stock shortages while still ensuring
+that the two OpenShift clusters land in separate phoenixNAP regions.
 """
 
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import os
 import sys
@@ -30,14 +36,19 @@ def api_get(base: str, path: str, token: str, params: dict[str, Any]) -> Any:
         return json.loads(response.read().decode("utf-8"))
 
 
-def parse_site(value: str) -> tuple[str, str]:
+def parse_site(value: str) -> tuple[str, list[str]]:
     if "=" not in value:
-        raise argparse.ArgumentTypeError("site must be NAME=LOCATION, for example sw1=PHX")
-    name, location = value.split("=", 1)
-    name, location = name.strip(), location.strip().upper()
-    if not name or not location:
-        raise argparse.ArgumentTypeError("site must contain both NAME and LOCATION")
-    return name, location
+        raise argparse.ArgumentTypeError("site must be NAME=LOCATION[,LOCATION...], for example sw1=PHX,ASH,NLD")
+    name, raw_locations = value.split("=", 1)
+    name = name.strip()
+    locations = []
+    for raw in raw_locations.split(","):
+        location = raw.strip().upper()
+        if location and location not in locations:
+            locations.append(location)
+    if not name or not locations:
+        raise argparse.ArgumentTypeError("site must contain a name and at least one location")
+    return name, locations
 
 
 def candidate_shortfall(c: dict[str, Any], preferred_ram: float, preferred_cores: float) -> float:
@@ -47,15 +58,13 @@ def candidate_shortfall(c: dict[str, Any], preferred_ram: float, preferred_cores
 
 
 def candidate_sort_key(c: dict[str, Any], preferred_ram: float, preferred_cores: float):
-    # First choose the smallest sizing shortfall, then the lowest price. If candidates have the
-    # same suitability and cost, prefer more RAM and CPU. This avoids spending up to the entire
-    # cap just because a much larger server exists.
     return (
         candidate_shortfall(c, preferred_ram, preferred_cores),
         float(c["hourlyPrice"]),
         -float(c["ramInGb"]),
         -float(c["cores"]),
         c["productCode"],
+        c.get("location", ""),
     )
 
 
@@ -89,15 +98,15 @@ def sanitize_product(product: dict[str, Any], plan: dict[str, Any], available_qu
     }
 
 
-def site_candidates(
+def live_location_candidates(
     api_base: str,
     token: str,
     location: str,
-    max_hourly_price: float,
     min_ram_gb: float,
     min_cores: float,
     min_storage_devices: int,
 ) -> list[dict[str, Any]]:
+    """Return all live HOURLY candidates that meet hardware minimums, regardless of budget."""
     products = api_get(
         api_base,
         "/billing/v1/products",
@@ -147,7 +156,6 @@ def site_candidates(
             and p.get("pricingModel") == "HOURLY"
             and p.get("priceUnit") == "HOUR"
             and float(p.get("price") or 0) > 0
-            and float(p.get("price") or 0) < max_hourly_price
         ]
         if not hourly_plans:
             continue
@@ -157,10 +165,84 @@ def site_candidates(
     return candidates
 
 
+def site_candidates(
+    api_base: str,
+    token: str,
+    location: str,
+    max_hourly_price: float,
+    min_ram_gb: float,
+    min_cores: float,
+    min_storage_devices: int,
+) -> list[dict[str, Any]]:
+    """Backward-compatible single-location budget-qualified selector used by tests."""
+    return [
+        c
+        for c in live_location_candidates(
+            api_base,
+            token,
+            location,
+            min_ram_gb,
+            min_cores,
+            min_storage_devices,
+        )
+        if float(c["hourlyPrice"]) < max_hourly_price
+    ]
+
+
+def combo_sort_key(
+    combo: tuple[dict[str, Any], ...], preferred_ram: float, preferred_cores: float
+) -> tuple[Any, ...]:
+    # Prefer the pair with the least aggregate sizing shortfall, then the lowest
+    # aggregate hourly cost. Deterministic location/product tie breakers keep
+    # repeated preflight/deploy runs stable while stock remains unchanged.
+    return (
+        sum(candidate_shortfall(c, preferred_ram, preferred_cores) for c in combo),
+        sum(float(c["hourlyPrice"]) for c in combo),
+        tuple(c["productCode"] for c in combo),
+        tuple(c["location"] for c in combo),
+    )
+
+
+def choose_distinct_combo(
+    names: list[str],
+    candidates_by_site: dict[str, list[dict[str, Any]]],
+    preferred_ram: float,
+    preferred_cores: float,
+    prefer_common: bool,
+    require_common: bool,
+) -> tuple[dict[str, dict[str, Any]] | None, bool]:
+    combos = []
+    for combo in itertools.product(*(candidates_by_site[name] for name in names)):
+        if len({c["location"] for c in combo}) != len(combo):
+            continue
+        combos.append(combo)
+
+    if not combos:
+        return None, False
+
+    common = [combo for combo in combos if len({c["productCode"] for c in combo}) == 1]
+    if prefer_common and common:
+        combos = common
+        used_common = True
+    elif require_common:
+        if not common:
+            return None, False
+        combos = common
+        used_common = True
+    else:
+        used_common = False
+
+    combos.sort(key=lambda combo: combo_sort_key(combo, preferred_ram, preferred_cores))
+    best = combos[0]
+    return {name: row for name, row in zip(names, best)}, used_common
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--api-base", default="https://api.phoenixnap.com")
     parser.add_argument("--site", action="append", type=parse_site, required=True)
+    parser.add_argument("--blocked-location", action="append", default=[])
+    parser.add_argument("--distinct-locations", action="store_true")
     parser.add_argument("--max-hourly-price", type=float, required=True)
     parser.add_argument("--min-ram-gb", type=float, default=64)
     parser.add_argument("--min-cores", type=float, default=6)
@@ -178,80 +260,110 @@ def main() -> int:
         return 0
 
     try:
-        candidates_by_site: dict[str, list[dict[str, Any]]] = {}
-        locations: dict[str, str] = {}
-        for name, location in args.site:
-            locations[name] = location
-            candidates = site_candidates(
+        blocked = {x.strip().upper() for x in args.blocked_location if x.strip()}
+        site_locations: dict[str, list[str]] = {}
+        all_locations: list[str] = []
+        for name, locations in args.site:
+            allowed = [loc for loc in locations if loc not in blocked]
+            site_locations[name] = allowed
+            for loc in locations:
+                if loc not in all_locations:
+                    all_locations.append(loc)
+
+        # Query each region only once. regionCandidates intentionally includes
+        # live shapes above the configured budget so failure output can show the
+        # actual current hourly rate instead of hiding useful provider data.
+        region_candidates: dict[str, list[dict[str, Any]]] = {}
+        for location in all_locations:
+            rows = live_location_candidates(
                 args.api_base,
                 token,
                 location,
-                args.max_hourly_price,
                 args.min_ram_gb,
                 args.min_cores,
                 args.min_storage_devices,
             )
-            candidates.sort(key=lambda c: candidate_sort_key(c, args.preferred_ram_gb, args.preferred_cores))
-            candidates_by_site[name] = candidates
+            rows.sort(key=lambda c: candidate_sort_key(c, args.preferred_ram_gb, args.preferred_cores))
+            for row in rows:
+                row["withinBudget"] = float(row["hourlyPrice"]) < args.max_hourly_price
+            region_candidates[location] = rows
+
+        candidates_by_site: dict[str, list[dict[str, Any]]] = {}
+        for name, locations in site_locations.items():
+            rows = [
+                dict(c)
+                for location in locations
+                for c in region_candidates.get(location, [])
+                if float(c["hourlyPrice"]) < args.max_hourly_price
+            ]
+            rows.sort(key=lambda c: candidate_sort_key(c, args.preferred_ram_gb, args.preferred_cores))
+            candidates_by_site[name] = rows
 
         empty = [name for name, items in candidates_by_site.items() if not items]
         if empty:
+            searched = sorted({loc for locs in site_locations.values() for loc in locs})
             print(
                 json.dumps(
                     {
                         "ok": False,
                         "error": (
-                            "No live HOURLY server below ${:.2f}/hour met min {} GB RAM / {} cores / {} physical storage devices in: {}"
+                            "No live HOURLY server below ${:.2f}/hour met min {} GB RAM / {} cores / {} physical storage devices "
+                            "for site(s): {} after trying all allowed regions: {}"
                         ).format(
                             args.max_hourly_price,
                             int(args.min_ram_gb),
                             int(args.min_cores),
                             int(args.min_storage_devices),
                             ", ".join(empty),
+                            ", ".join(searched) or "none",
                         ),
                         "sites": {},
                         "candidates": {k: v[: args.top] for k, v in candidates_by_site.items()},
-                    }
+                        "regionCandidates": {k: v[: args.top] for k, v in region_candidates.items()},
+                        "searchedLocations": searched,
+                        "blockedLocations": sorted(blocked),
+                    },
+                    sort_keys=True,
                 )
             )
             return 0
 
         names = list(candidates_by_site)
-        common_codes = set(c["productCode"] for c in candidates_by_site[names[0]])
-        for name in names[1:]:
-            common_codes &= {c["productCode"] for c in candidates_by_site[name]}
-
         selected: dict[str, dict[str, Any]] = {}
         used_common = False
-        if args.prefer_common and common_codes:
-            # Score common SKUs against the worst location price, while preserving the
-            # preferred sizing target. The metadata is product-wide, but prices are location-specific.
-            common_options = []
-            for code in common_codes:
-                rows = [next(c for c in candidates_by_site[n] if c["productCode"] == code) for n in names]
-                representative = dict(rows[0])
-                representative["hourlyPrice"] = max(float(r["hourlyPrice"]) for r in rows)
-                common_options.append((representative, rows))
-            common_options.sort(
-                key=lambda pair: candidate_sort_key(pair[0], args.preferred_ram_gb, args.preferred_cores)
+
+        if args.distinct_locations and len(names) > 1:
+            selected_combo, used_common = choose_distinct_combo(
+                names,
+                candidates_by_site,
+                args.preferred_ram_gb,
+                args.preferred_cores,
+                args.prefer_common,
+                args.require_common,
             )
-            _, rows = common_options[0]
-            for name, row in zip(names, rows):
-                selected[name] = row
-            used_common = True
-        elif args.require_common:
-            print(
-                json.dumps(
-                    {
-                        "ok": False,
-                        "error": "No common live SKU met the budget/sizing policy across all requested sites",
-                        "sites": {},
-                        "candidates": {k: v[: args.top] for k, v in candidates_by_site.items()},
-                    }
+            if selected_combo is None:
+                print(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "error": (
+                                "Live qualifying capacity exists, but no selection can place all missing sites in distinct regions"
+                                + (" with a common SKU" if args.require_common else "")
+                            ),
+                            "sites": {},
+                            "candidates": {k: v[: args.top] for k, v in candidates_by_site.items()},
+                            "regionCandidates": {k: v[: args.top] for k, v in region_candidates.items()},
+                            "searchedLocations": sorted({loc for locs in site_locations.values() for loc in locs}),
+                            "blockedLocations": sorted(blocked),
+                        },
+                        sort_keys=True,
+                    )
                 )
-            )
-            return 0
+                return 0
+            selected = selected_combo
         else:
+            # One missing site, or explicit fixed-location mode. Prefer a common
+            # SKU only has meaning when selecting multiple sites.
             for name in names:
                 selected[name] = candidates_by_site[name][0]
 
@@ -267,15 +379,19 @@ def main() -> int:
                         "minStorageDevices": args.min_storage_devices,
                         "preferredRamGb": args.preferred_ram_gb,
                         "preferredCores": args.preferred_cores,
+                        "distinctLocations": args.distinct_locations,
                     },
                     "sites": selected,
                     "candidates": {k: v[: args.top] for k, v in candidates_by_site.items()},
+                    "regionCandidates": {k: v[: args.top] for k, v in region_candidates.items()},
+                    "searchedLocations": sorted({loc for locs in site_locations.values() for loc in locs}),
+                    "blockedLocations": sorted(blocked),
                 },
                 sort_keys=True,
             )
         )
         return 0
-    except Exception as exc:  # Return only a sanitized message; never echo request headers/token.
+    except Exception as exc:
         print(json.dumps({"ok": False, "error": f"phoenixNAP SKU selection failed: {type(exc).__name__}: {exc}"}))
         return 0
 

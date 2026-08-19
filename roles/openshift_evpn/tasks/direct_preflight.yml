@@ -1,0 +1,60 @@
+---
+- name: Set direct-peering preflight facts
+  ansible.builtin.set_fact:
+    managed_kubeconfig: "artifacts/kubeconfigs/{{ site_item.value.cluster_name }}.kubeconfig"
+    evpn_direct_remote_site: "{{ 'c1' if site_item.key == 'sw1' else 'sw1' }}"
+    evpn_direct_remote_ip: "{{ evpn_site_public_ips['c1' if site_item.key == 'sw1' else 'sw1'] }}"
+
+- name: Read SNO node for direct-peering preflight
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ managed_kubeconfig }}"
+    api_version: v1
+    kind: Node
+  register: evpn_direct_nodes
+
+- name: Require exactly one SNO node for direct-peering preflight
+  ansible.builtin.assert:
+    that:
+      - evpn_direct_nodes.resources | length == 1
+    fail_msg: >-
+      Expected one node on {{ site_item.key }}. Refusing to modify the working
+      EVPN peer because the direct BGP source node cannot be identified safely.
+
+- name: Verify route and TCP/179 reachability to remote FRR-K8s before peer replacement
+  ansible.builtin.command:
+    argv:
+      - oc
+      - --kubeconfig
+      - "{{ managed_kubeconfig }}"
+      - debug
+      - "node/{{ evpn_direct_nodes.resources[0].metadata.name }}"
+      - --
+      - chroot
+      - /host
+      - /bin/bash
+      - -lc
+      - >-
+        ip route get {{ evpn_direct_remote_ip }} >/dev/null &&
+        timeout 5 bash -c '</dev/tcp/{{ evpn_direct_remote_ip }}/179'
+  register: evpn_direct_tcp179_probe
+  changed_when: false
+  failed_when: false
+
+- name: Require direct FRR-K8s BGP listener reachability before replacing canonical peer
+  ansible.builtin.assert:
+    that:
+      - evpn_direct_tcp179_probe.rc | int == 0
+    fail_msg: >-
+      {{ site_item.key }} cannot open TCP/179 to {{ evpn_direct_remote_site }}
+      at {{ evpn_direct_remote_ip }}. Direct FRR-K8s peering cannot be used on
+      this provider path yet. The canonical evpn-fabric FRRConfiguration has not
+      been changed, and the legacy external fabric router has not been retired.
+      Check public-network ACL/firewall behavior and confirm bgpd is listening on
+      TCP/179 on the remote SNO.
+
+- name: Report proven direct BGP transport
+  ansible.builtin.debug:
+    msg: >-
+      {{ site_item.key }} -> {{ evpn_direct_remote_site }}
+      {{ evpn_direct_remote_ip }}:179 is reachable from the SNO node network.
+      It is safe to attempt direct eBGP EVPN peer reconciliation.

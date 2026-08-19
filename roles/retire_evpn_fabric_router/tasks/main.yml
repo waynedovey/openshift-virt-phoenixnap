@@ -1,0 +1,73 @@
+---
+- name: Check repository ownership artifact for legacy third EVPN server
+  ansible.builtin.stat:
+    path: artifacts/evpn/fabric-router.yml
+  register: retire_evpn_fr_artifact
+
+- name: Report no legacy third EVPN server ownership artifact
+  ansible.builtin.debug:
+    msg: >-
+      No artifacts/evpn/fabric-router.yml ownership record exists in this checkout.
+      There is no repository-owned third EVPN server that can be safely removed
+      automatically. If you moved to a new checkout, copy the artifacts directory
+      from the working checkout before running `make evpn-retire-legacy`.
+  when: not (retire_evpn_fr_artifact.stat.exists | bool)
+
+- name: Verify embedded EVPN fabric before deleting legacy third server
+  when:
+    - retire_evpn_fr_artifact.stat.exists | bool
+    - evpn.fabric_mode == 'embedded-router'
+    - evpn.embedded_router.retire_legacy_server | bool
+  block:
+    - name: Read SNO public addresses for post-migration EVPN verification
+      ansible.builtin.set_fact:
+        retire_evpn_server_state:
+          sw1: "{{ lookup('ansible.builtin.file', 'artifacts/servers/sw1.yml') | from_yaml }}"
+          c1: "{{ lookup('ansible.builtin.file', 'artifacts/servers/c1.yml') | from_yaml }}"
+
+    - name: Read embedded route-server Service for legacy-server retirement
+      kubernetes.core.k8s_info:
+        kubeconfig: "artifacts/kubeconfigs/{{ sites[evpn.embedded_router.site].cluster_name }}.kubeconfig"
+        api_version: v1
+        kind: Service
+        namespace: "{{ evpn.embedded_router.namespace }}"
+        name: "{{ evpn.embedded_router.service_name }}"
+      register: retire_evpn_embedded_service
+
+    - name: Require embedded route-server Service before legacy-server retirement
+      ansible.builtin.assert:
+        that:
+          - retire_evpn_embedded_service.resources | length == 1
+          - retire_evpn_embedded_service.resources[0].spec.clusterIP | default('') | length > 0
+        fail_msg: >-
+          Embedded route-server Service is missing. Refusing to deprovision the
+          repository-owned legacy EVPN server.
+
+    - name: Publish post-migration EVPN verification facts
+      ansible.builtin.set_fact:
+        retire_evpn_public_ips:
+          sw1: "{{ retire_evpn_server_state.sw1.public_ip }}"
+          c1: "{{ retire_evpn_server_state.c1.public_ip }}"
+        retire_evpn_service_ip: "{{ retire_evpn_embedded_service.resources[0].spec.clusterIP }}"
+
+    - name: Verify each SNO is using the embedded EVPN control plane
+      ansible.builtin.include_tasks: verify_site.yml
+      loop: "{{ sites | dict2items }}"
+      loop_control:
+        loop_var: retire_site_item
+
+    - name: Remove repository-owned legacy third EVPN server after verified migration
+      ansible.builtin.include_role:
+        name: destroy_lab
+        tasks_from: fabric_router.yml
+
+- name: Keep legacy server when automatic retirement is disabled
+  ansible.builtin.debug:
+    msg: >-
+      Repository-owned legacy EVPN server still exists, but automatic retirement
+      is disabled with EVPN_RETIRE_LEGACY_FR_SERVER=false. Run with the default
+      value or use `make evpn-retire-legacy` when ready.
+  when:
+    - retire_evpn_fr_artifact.stat.exists | bool
+    - evpn.fabric_mode == 'embedded-router'
+    - not (evpn.embedded_router.retire_legacy_server | bool)
